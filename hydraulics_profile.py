@@ -5,6 +5,40 @@ import warnings
 from pint import UnitRegistry
 
 ureg = UnitRegistry()
+#need to register standard cubic foot (scf), thousand standard cubic feet (mscf), million standard cubic feet (mmscf), and standard cubic meter (scm) as custom units in the unit registry
+
+# ---------------------------------------------------------------------------
+# Custom standard-volume unit definitions
+# ---------------------------------------------------------------------------
+# Standard conditions:
+#   SCM  : 0 deg C (273.15 K), 101325 Pa  (SI/metric standard)
+#   SCF  : 60 deg F (288.706 K), 14.696 psia (US upstream gas standard)
+#
+# Molar volume at standard conditions via ideal gas law:
+#   V_std = R * T_std / P_std   [m^3/mol]
+#
+# The unit is defined as that molar volume, so 1 scm == V_scm m^3/mol of gas,
+# allowing pint to convert between standard-volume and molar flow rates.
+# ---------------------------------------------------------------------------
+
+_R = 8.31446261815324  # J/(mol*K) -- exact CODATA 2018 value
+
+# SCM: 0 degC, 101325 Pa
+_T_scm = 273.15        # K
+_P_scm = 101325.0      # Pa
+_V_scm = _R * _T_scm / _P_scm   # m^3/mol  (~0.022414)
+
+# SCF: 60 degF, 14.696 psia
+_T_scf = (60.0 - 32.0) * 5.0 / 9.0 + 273.15   # K (~288.706)
+_P_scf = 14.696 * 6894.757293168               # Pa (14.696 psi is not quite exactly 101325 Pa)
+_V_scf = ureg.Quantity(_R * _T_scf / _P_scf, 'm^3')                  # m^3/mol  (~0.028317 * 1/1000 adjusted)
+_V_scf = _V_scf.to("ft^3")
+_V_scf = _V_scf.magnitude
+
+ureg.define(f'scm  = 1.0 * mol / {_V_scm}')
+ureg.define(f'scf  = 1.0 * mol / {_V_scf} ')
+ureg.define(f'mscf = {1e3}  *   mol / {_V_scf}')
+ureg.define(f'mmscf = {1e6} *  mol / {_V_scf}')
 
 
 # ---------------------------------------------------------------------------
@@ -380,6 +414,65 @@ def _fanning_friction(Re, eps, d_h):
     else:
         return 16.0 / Re, "laminar"
 
+def viscosity_LGE(T, mol_wt, density):
+    """
+    Lee, Gonzalez, and Eakin correlation for hydrocarbon gas viscosity
+    T = pint quantity with temperature units
+    mol_wt = gas molecular weight, kg/kmol
+    density = pint quantity with mass/vol units
+    """
+    T = T.to("degR").magnitude
+    density = density.to("g/cm^3").magnitude
+    
+    #Temperature input to equation is in degrees R, density input is g/cm^3, returns centipoise. Good gravy those are some ridiculous units.
+
+    x = 3.5+986/(T)+0.01*mol_wt
+    k = (9.4+0.02*mol_wt)*((T)**1.5)/(209+19*mol_wt+T)
+    y = 2.4 - 0.2 * x
+    
+    mu = k * math.exp(x * density ** y)/10000.0
+
+    return ureg.Quantity(mu, "cP")
+
+def isothermal_ideal_gas_hydraulics(mol_wt, Z, Po, T, k, segment, flow_rate, grav_constant=None):
+    """ Calculate an isothermal ideal gas (plus Z factor compressibility) pressure drop along a pipe segment
+    The calculation is performed one profile step at a time so that a point-by-point pressure profile is generated.
+    The friction per unit length will change as the gas expands, so a step by step process is necessary.
+
+    Args:
+        mol_wt         : Molar weight of the fluid (kg/kmol).
+        Z             : Ideal gas compressibility factor. Defaults to 1 if omitted.
+        Pd_o          : pint Quantity or plain float. Dynamic pressure at point zero. (dimensions [force]/[area]) If plain float, assumes Pascals
+                        Note that this is not the same as the total/static/reservoir pressure at point zero! If that's what you have, calculate the dynamic pressure on the input to the function.
+        T             : Isothermal gas and line temperature
+        k             : Ratio of specific heats Cp/Cv. Not needed for friction calculation but used for Mach number calculation to determine if flow is choked.
+        segment       : Line_Segment instance.
+        flow_rate     : pint Quantity -- either a volumetric flow rate
+                        (dimensions [length]^3/[time], e.g. m^3/s),
+                        a mass flow rate (dimensions [mass]/[time], e.g. kg/s, lb/min), 
+                        or a molar flow rate (dimensions [moles]/[time], e.g. mol/s, scf/day). 
+                        A plain float or a Quantity with any other dimensions raises ValueError.
+        grav_constant : pint Quantity (acceleration). Defaults to 9.8066 m/s^2.
+        viscosity     : pint Quantity or plain float (Pa*s if float).
+                        Dynamic viscosity of the fluid. If not supplied, uses the Lee, Gonzalez, and Eakin correlation in the viscosity_LGE function
+
+    At each point, calculates the pressure change due to elevation change, pressure change due to velocity change, and pressure change due to friction
+    dp_elevationchange = rho * g * (elev_i - elev_f)  
+    dp_velocitychange = 
+    dp_friction = -4 f/ 2 *(mdot/A)^2 * dx/(D_h * rho)
+    where:
+    f = fanning friciton factor
+    mdot = mass flow rate
+    A = flow area
+    dx = step length
+    D_h = hydraulic diameter
+    rho = density
+
+    """
+    #Calculate
+
+
+
 
 def liquid_hydraulics(fluid, segment, flow_rate, grav_constant=None):
     """Calculate incompressible liquid pressure drop along a pipe segment.
@@ -507,9 +600,8 @@ def liquid_hydraulics(fluid, segment, flow_rate, grav_constant=None):
         "dP_friction_Pa":   dP_friction_total,
         "dP_elevation_Pa":  dP_elevation_total,
         "dP_total_Pa":      dP_total,
-        "profile_results":  profile_results,
+        "profile_results":  profilse_results,
     }
-
 
 # ---------------------------------------------------------------------------
 # Output helpers
@@ -588,7 +680,39 @@ def export_pressure_profile(results, output_path):
 # Example / entry point
 # ---------------------------------------------------------------------------
 
-if __name__ == "__main__":
+def test_p2p():
+    #simple 2 point pressure drop example
+    
+    #pipe segment definition
+    roughness=ureg.Quantity(0.00015, "ft")
+    id_val=ureg.Quantity(3.068, "inch")
+    length = ureg.Quantity(2000.0, "ft")
+    elevation_change = ureg.Quantity(25.0, "ft")
+    segment = Line_Segment(
+            roughness=roughness,
+            id_val=id_val,
+            length = length,
+            elevation_change = elevation_change
+        )
+
+    #fluid definition
+    fluid = Incompressible_Fluid(
+        density=ureg.Quantity(1000.0, "kg/m^3"),
+        viscosity=ureg.Quantity(1.0, "cP"),
+    )
+
+    flow_rate = ureg.Quantity(350, "lb/min")
+    # --- Run calculation ---
+    results = liquid_hydraulics(fluid, segment, flow_rate)
+
+    # --- Display and export ---
+    print_results(results, fluid, segment, flow_rate)
+
+    output_csv = os.path.splitext("simple.csv")[0] + "_pressure_profile.csv"
+    export_pressure_profile(results, output_csv)
+
+def test_csv_profile():
+    #Example with csv file defined profile
     # --- Fluid definition ---
     fluid = Incompressible_Fluid.from_api_gravity(
         api_gravity=50.0,
@@ -597,7 +721,7 @@ if __name__ == "__main__":
 
     # --- Pipe segment loaded from CSV ---
     segment = Line_Segment.from_csv(
-        csv_path="testprofile1.csv",
+        csv_path="testprofile.csv",
         roughness=ureg.Quantity(0.00015, "ft"),
         id_val=ureg.Quantity(3.068, "inch"),
     )
@@ -611,5 +735,11 @@ if __name__ == "__main__":
     # --- Display and export ---
     print_results(results, fluid, segment, flow_rate)
 
-    output_csv = os.path.splitext("testprofile1.csv")[0] + "_pressure_profile.csv"
+    output_csv = os.path.splitext("testprofile.csv")[0] + "_pressure_profile.csv"
     export_pressure_profile(results, output_csv)
+
+if __name__ == "__main__":
+
+    stdvol = ureg.Quantity(1.0, "mol")
+    stdvol = stdvol.to('scf')
+    print(f'1 mol = {stdvol}')
