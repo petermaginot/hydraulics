@@ -949,48 +949,141 @@ def test_comp_hydraulics():
     print(result_g)
 
 def test_compressible_slices():
-    slicecount = 20
-    total_length = ureg.Quantity(100.0,    "feet").to("m").magnitude
-    total_elev_change = ureg.Quantity(100.0,    "feet").to("m").magnitude
-    D_pipe    = ureg.Quantity(4.026, "inch").to("m").magnitude
-    eps_pipe  = ureg.Quantity(0.00015, "ft").to("m").magnitude
-    Q_scfd   = ureg.Quantity(1.0, "mmscf/day")
+    slicecount = 500
+    total_length      = ureg.Quantity(10000.0, "feet").to("m").magnitude
+    total_elev_change = ureg.Quantity(-10000.0, "feet").to("m").magnitude
+    D_pipe  = ureg.Quantity(1.995,  "inch").to("m").magnitude
+    eps_pipe = ureg.Quantity(0.00015, "ft").to("m").magnitude
+    Q_scfd  = ureg.Quantity(1, "mmscf/day")
 
-    dL   = total_length / slicecount
-    dz  = total_elev_change/slicecount
+    dL = total_length      / slicecount
+    dz = total_elev_change / slicecount
 
-    #generate profile assuming uniform slices of length and elevation change
-
+    # Generate profile assuming uniform slices of length and elevation change.
     profile = []
-
     for i in range(slicecount + 1):
         profile.append([i * dL, i * dz])
 
     segment = Line_Segment(
-            roughness=eps_pipe,
-            id_val=D_pipe,
-            profile= profile
-        )
+        roughness=eps_pipe,
+        id_val=D_pipe,
+        profile=profile,
+    )
 
-    #initial conditions
-    P_in    = 790798.0    # Pa
-    T_in    = 299.8    # K
+    # Initial conditions.
+    initial_pressure = ureg.Quantity(1000.0, "psi").to("Pa").magnitude
+    P_in = initial_pressure   # Pa
+    T_in = 300      # K
 
-    A_pipe    = math.pi * D_gas**2 / 4.0
+    A_pipe = math.pi * D_pipe**2 / 4.0
 
     AS_g = AbstractState("HEOS", "Methane")
-    AS_g.update(CP.PT_INPUTS, P_gas, T_gas)
-    rho_in = AS_g.rhomass()
-    S_in = AS_g.smass()
+    AS_g.update(CP.PT_INPUTS, P_in, T_in)
 
-    mdot     = Q_scfd.to("mol/s").magnitude * 16.043e-3   # kg/s from mol wt
+    # Methane molecular weight: 16.043 g/mol = 16.043e-3 kg/mol.
+    mdot = Q_scfd.to("mol/s").magnitude * 16.043e-3   # kg/s
 
-    #loop through and call compressible_hydraulics on each slice of the line segment, using the output of each slice as the inputs for the next
+    # Compute inlet velocity and Mach number for the header row.
+    rho_in = AS_g.rhomass()                    # kg/m^3
+    a_in   = AS_g.speed_sound()                # m/s
+    v_in   = mdot / (rho_in * A_pipe)          # m/s
+    Ma_in  = v_in / a_in
+
+    # Column widths for formatted table output.
+    col_w = 14
+
+    header = (
+        f"{'Point':>{col_w}}"
+        f"{'Dist (ft)':>{col_w}}"
+        f"{'Elev (ft)':>{col_w}}"
+        f"{'P (psia)':>{col_w}}"
+        f"{'T (degF)':>{col_w}}"
+        f"{'v (ft/s)':>{col_w}}"
+        f"{'Ma':>{col_w}}"
+        f"{'q_wall (W)':>{col_w}}"
+    )
+    sep = "-" * len(header)
+
+    print("\n=== Compressible Isothermal Hydraulics -- Slice-by-Slice Results ===")
+    print(f"  Fluid  : Methane (HEOS)")
+    print(f"  Pipe ID: {ureg.Quantity(D_pipe, 'm').to('inch'):.4f~P}")
+    print(f"  Flow   : {Q_scfd:.4f~P}  =  {mdot:.4f} kg/s")
+    print(f"  Slices : {slicecount}")
+    print()
+    print(header)
+    print(sep)
+
+    # Convert helper: Pa -> psia, K -> degF, m -> ft.
+    def pa_to_psia(p):
+        return ureg.Quantity(p, "Pa").to("psi").magnitude
+
+    def k_to_degf(t):
+        return ureg.Quantity(t, "K").to("degF").magnitude
+
+    def m_to_ft(x):
+        return ureg.Quantity(x, "m").to("ft").magnitude
+
+    def ms_to_fts(v):
+        return ureg.Quantity(v, "m/s").to("ft/s").magnitude
+
+    # Print the inlet (point 0) row -- no q_wall yet, so leave that column blank.
+    dist_0, elev_0 = segment.profile[0]
+    print(
+        f"{'0':>{col_w}}"
+        f"{m_to_ft(dist_0):>{col_w}.3f}"
+        f"{m_to_ft(elev_0):>{col_w}.3f}"
+        f"{pa_to_psia(P_in):>{col_w}.3f}"
+        f"{k_to_degf(T_in):>{col_w}.3f}"
+        f"{ms_to_fts(v_in):>{col_w}.4f}"
+        f"{Ma_in:>{col_w}.6f}"
+        f"{'--':>{col_w}}"
+    )
+
+    # Iterate through consecutive profile point pairs (one slice per pair).
+    P_cur = P_in
+    T_cur = T_in
+
+    for i in range(len(segment.profile) - 1):
+        dist_in,  elev_in  = segment.profile[i]
+        dist_out, elev_out = segment.profile[i + 1]
+
+        slice_dL = dist_out - dist_in   # m, along-pipe length of this slice
+        slice_dz = elev_out - elev_in   # m, elevation rise over this slice
+
+        result = compressible_hydraulics(
+            abstract_state=AS_g,
+            P_in=P_cur,
+            T_in=T_cur,
+            mdot=mdot,
+            dL=slice_dL,
+            dz=slice_dz,
+            D_h=D_pipe,
+            roughness=eps_pipe,
+            flow_area=A_pipe,
+            isothermal=False,
+        )
+
+        P_cur = result["P_out"]
+        T_cur = result["T_out"]
+
+        print(
+            f"{i + 1:>{col_w}}"
+            f"{m_to_ft(dist_out):>{col_w}.3f}"
+            f"{m_to_ft(elev_out):>{col_w}.3f}"
+            f"{pa_to_psia(P_cur):>{col_w}.3f}"
+            f"{k_to_degf(T_cur):>{col_w}.3f}"
+            f"{ms_to_fts(result['v_out']):>{col_w}.4f}"
+            f"{result['Ma_out']:>{col_w}.6f}"
+            f"{result['q_wall_actual']:>{col_w}.3f}"
+        )
+
+    print(sep)
+    print()
 
 
 
 if __name__ == "__main__":
 
     # test_p2p()
-    #test_comp_hydraulics():
+    # test_comp_hydraulics()
     test_compressible_slices()
