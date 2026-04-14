@@ -442,79 +442,21 @@ _SINGLE_PHASE_CODES = frozenset([
 # Compressible dL slice hydraulics
 # ---------------------------------------------------------------------------
 
-def compressible_slice_hydraulics(
+def compressible_hydraulics(
     abstract_state,
     P_in,
     T_in,
-    G,
+    mdot,
     dL,
     dz,
     D_h,
     roughness,
     flow_area,
     q_wall=0.0,
-    U_overall=None,
-    T_ambient=None,
-    grav_constant=9.8066,
-    choke_mach_limit=0.95,
-):
-    """Advance fluid state across one small pipe slice using a real-fluid EOS.
-
-    Solves the coupled steady-state 1-D momentum and energy equations for a
-    single differential slice of length dL.  All internal math uses SI units;
-    the caller is responsible for unit conversion before passing arguments.
-
-    Governing equations (steady, 1-D, single-phase):
-
-      Continuity (constant area):
-          G = rho * v = const   [kg/(m^2*s)]
-
-      Momentum (pressure gradient, Pa/m):
-          dP/dx = [ -(f_D * G^2) / (2 * rho * D_h)  -  rho * g * sin(theta) ]
-                  / [ 1 - Ma^2 ]
-          Ref: Modisette, J.L., "Equation of State for Pipe Modeling,"
-               PSIG Paper 0104, 2001.  The (1 - Ma^2) denominator arises from
-               the acceleration term; it is unity for Ma << 1 but must be
-               retained for high-velocity gas lines and near-sonic conditions.
-
-      Energy (temperature gradient, K/m):
-          G * A * d(h + v^2/2 + g*z)/dx = q_wall * Pi * D_h
-          Expanding dh using the thermodynamic identity
-              dh = Cp*dT + [v - T*(dv/dT)_P]*dP
-                 = Cp*dT + (1/rho)*[1 - T*beta]*dP
-          where beta = isobaric expansion coefficient = -(1/rho)*(d rho/dT)_P
-          and rearranging for dT/dx:
-              dT/dx = { [q_wall * Pi * D_h / (G * A)]
-                        - (v^2 / 2) * (d(v^2)/dx) / v^2          <- KE term
-                        - g * (dz/dx)                              <- gravity
-                        - (1/rho) * (1 - T*beta) * (dP/dx) }     <- real-gas
-                      / Cp
-          For an ideal gas beta = 1/T, so the (1 - T*beta) term vanishes and
-          the equation reduces to the familiar ideal-gas form.
-          Ref: Ouyang, L.-B. and Aziz, K., "Steady-State Gas Flow in Pipes,"
-               Journal of Petroleum Science and Engineering 14 (1996) 137-158.
-
-      Friction factor:
-          Darcy-Weisbach via fluids library (_darcy_friction helper).
-          Reynolds number uses local rho and mu from CoolProp.
-
-      Heat transfer boundary condition (two modes):
-          Mode 1 -- specified flux:    q_wall given directly [W/m^2].
-          Mode 2 -- overall U-value:   q_wall = U_overall * (T_ambient - T_in)
-                    where T_ambient is the external (soil/air) temperature.
-          Positive q_wall means heat flows INTO the fluid.
-          Ref: Brill, J.P. and Mukherjee, H., "Multiphase Flow in Wells,"
-               SPE Monograph Vol. 17, 1999, Chapter 3.
-
-    Numerical scheme:
-        First-order explicit (forward Euler) update:
-            P_out = P_in + (dP/dx) * dL
-            T_out = T_in + (dT/dx) * dL
-        Properties are evaluated at inlet conditions (P_in, T_in).
-        For high accuracy over long segments, the caller should use many
-        small slices or wrap this function in an RK4 / solve_ivp scheme.
-        Ref: Press et al., "Numerical Recipes in C," 3rd ed., Ch. 17.
-
+    isothermal = False
+    ):
+    #Inputs
+    """ 
     Args:
         abstract_state  : CoolProp AbstractState instance, pre-configured for
                           the working fluid (e.g. AbstractState('HEOS','Methane')).
@@ -522,74 +464,43 @@ def compressible_slice_hydraulics(
                           each call; it must NOT be shared across threads.
         P_in            : float, inlet pressure [Pa].
         T_in            : float, inlet temperature [K].
-        G               : float, mass flux = rho*v [kg/(m^2*s)].
-                          Constant along the segment by the continuity equation.
-                          Must be positive (flow in the +x direction).
-        dL              : float, slice length [m]. Must be > 0.
+        mdot            : float, mass flow rate (kg/s)
+        dL              : float, pipe segment length [m]
         dz              : float, elevation rise over the slice [m].
                           Positive = uphill; negative = downhill.
         D_h             : float, hydraulic diameter [m].
         roughness       : float, absolute pipe-wall roughness [m].
         flow_area       : float, cross-section flow area [m^2].
-        q_wall          : float, heat flux into fluid [W/m^2] (default 0 =
-                          adiabatic).  Ignored when U_overall is supplied.
-        U_overall       : float or None.  Overall heat transfer coefficient
-                          [W/(m^2*K)] for U-value mode.  When supplied,
-                          q_wall is computed internally as
-                              q_wall = U_overall * (T_ambient - T_in).
-                          T_ambient must also be provided.
-        T_ambient       : float or None.  External temperature [K].
-                          Required when U_overall is not None.
-        grav_constant   : float, gravitational acceleration [m/s^2]
-                          (default 9.8066).
-        choke_mach_limit: float, Mach number at or above which a
-                          RuntimeError is raised to signal choked / near-choked
-                          flow (default 0.95).  Set to 1.0 to disable.
+        q_wall          : float, heat flow into fluid [W] (default 0 =
+                          adiabatic).
+        isothermal      : boolean, if True then properties are evaluated isothermally (ignoring q_wall if supplied). If false, uses q_wall.
 
-    Returns:
-        dict with keys:
-            'P_out'         : float, outlet pressure [Pa].
-            'T_out'         : float, outlet temperature [K].
-            'rho_in'        : float, inlet density [kg/m^3].
-            'v_in'          : float, inlet velocity [m/s].
-            'Ma_in'         : float, inlet Mach number [-].
-            'Re_in'         : float, inlet Reynolds number [-].
-            'f_darcy'       : float, Darcy friction factor [-].
-            'flow_regime'   : str,   'laminar' or 'turbulent'.
-            'phase'         : int,   CoolProp phase code at inlet.
-            'dP_friction'   : float, friction pressure drop over slice [Pa]
-                              (<= 0, i.e. always a loss).
-            'dP_gravity'    : float, gravity pressure drop over slice [Pa]
-                              (negative when climbing, positive when descending).
-            'dP_accel'      : float, acceleration pressure change [Pa]
-                              (negative when fluid accelerates / density drops).
-            'dP_total'      : float, total pressure change P_out - P_in [Pa].
-            'dT_total'      : float, temperature change T_out - T_in [K].
-            'q_wall_used'   : float, heat flux actually applied [W/m^2].
+        Calculated:
+        rho             : float, mass density [kg/m^3]
+        v            : float, flow velocity in direction of flow [m/s]
+        mu              : float, kinematic viscosity [Pa*s], from CoolProp
+        a               : float, speed of sound [m/s], from CoolProp
+        f_darcy          : float, Darcy friction factor, from fluids library correlation
+        Ma              : float, Mach number [dimensionless] Ma = v/a
+        Re              : float, Reynolds number [dimensionless] Re = rho * v * D_h/mu
 
-    Raises:
-        ValueError  : if G <= 0, dL <= 0, or required arguments are missing.
-        RuntimeError: if the inlet Mach number exceeds choke_mach_limit, or
-                      if the fluid is in the two-phase region at inlet.
     """
+    grav_constant=9.8066
+    choke_mach_limit = 0.98
     # ------------------------------------------------------------------
     # Input validation
     # ------------------------------------------------------------------
-    if G <= 0.0:
+    if mdot <= 0.0:
         raise ValueError(
-            f"compressible_slice_hydraulics: mass flux G must be positive "
-            f"(received G={G:.6g} kg/(m^2*s))."
+            f"compressible_slice_hydraulics: mass flow rate mdot must be positive "
+            f"(received G={mdot:.6g} kg/s)."
         )
     if dL <= 0.0:
         raise ValueError(
             f"compressible_slice_hydraulics: slice length dL must be positive "
             f"(received dL={dL:.6g} m)."
         )
-    if U_overall is not None and T_ambient is None:
-        raise ValueError(
-            "compressible_slice_hydraulics: T_ambient must be supplied when "
-            "U_overall is provided."
-        )
+    #need to validate P, T, roughness, flow area too. I feel like this can be done with a short pythonic loop through all of the inputs that need to be positive, raising an error message that mentions all of the invalid inputs.
 
     # ------------------------------------------------------------------
     # CoolProp state update at inlet conditions
@@ -607,20 +518,18 @@ def compressible_slice_hydraulics(
 
     rho   = AS.rhomass()                  # kg/m^3
     Cp    = AS.cpmass()                   # J/(kg*K)
-    c     = AS.speed_sound()              # m/s  (isentropic speed of sound)
+    a     = AS.speed_sound()              # m/s  (isentropic speed of sound)
     mu    = AS.viscosity()                # Pa*s
-    beta  = AS.isobaric_expansion_coefficient()  # 1/K  = -(1/rho)*(d rho/dT)_P
+    S_in = AS.smass() #specific entropy in J/kg K
+    H_in = AS.hmass() #specific enthalpy in J/kg
 
-    # ------------------------------------------------------------------
-    # Velocity and Mach number
-    # ------------------------------------------------------------------
-    v  = G / rho     # m/s
-    Ma = v / c       # Mach number
+    v  = mdot / (rho*flow_area)     # m/s
+    Ma = v / a       # Mach number
 
     if Ma >= choke_mach_limit:
         raise RuntimeError(
-            f"compressible_slice_hydraulics: inlet Mach number Ma={Ma:.4f} "
-            f">= choke limit {choke_mach_limit}.  Flow is choked or near-choked. "
+            f"compressible_hydraulics: inlet Mach number Ma={Ma:.4f} "
+            f"Flow is sonic or near-sonic at inlet conditions already. This program really isn't intended for sonic conditions."
             f"Reduce flow rate or check segment geometry."
         )
 
@@ -630,110 +539,74 @@ def compressible_slice_hydraulics(
     Re = fluids_Reynolds(V=v, D=D_h, rho=rho, mu=mu)
     f_darcy, flow_regime = _darcy_friction(Re, roughness, D_h)
 
-    # ------------------------------------------------------------------
-    # Heat flux boundary condition
-    # ------------------------------------------------------------------
-    if U_overall is not None:
-        q_wall = U_overall * (T_ambient - T_in)
+    #calculate the change in pressure - individual contributions for troubleshooting.
+    dP_contrib_friction = -f_darcy * dL * v**2/(2 * D_h) * rho
+    dP_contrib_elevation = - grav_constant * dz * rho
 
-    # ------------------------------------------------------------------
-    # Pipe geometry derived quantities
-    # ------------------------------------------------------------------
-    g         = grav_constant
-    sin_theta = dz / dL              # local inclination (dz/dx), dimensionless
-    perimeter = flow_area / D_h * 4  # Pi * D_h for circular; 4*A/D_h for any shape
+    #and overall change in pressure
+    dP = (rho/(1-Ma**2)) * (-f_darcy * dL * v**2/(2 * D_h) - grav_constant * dz)
 
-    # ------------------------------------------------------------------
-    # Momentum equation: dP/dx
-    # ------------------------------------------------------------------
-    # Numerator: friction + gravity terms (both in Pa/m).
-    # Friction gradient is always a loss (negative in the flow direction).
-    #   (dP/dx)_friction = -(f_D * G^2) / (2 * rho * D_h)
-    #   (dP/dx)_gravity  = -rho * g * sin(theta)
-    #
-    # Denominator: compressibility correction.
-    #   For Ma << 1 this is effectively 1.0.
-    #   Approaches zero as Ma -> 1 (choked flow).
+    #Euler method to find pressure at outlet
+    P_out = P_in + dP
+    
+    
+    if isothermal:
+        T_out = T_in
 
-    dPdx_friction = -(f_darcy * G**2) / (2.0 * rho * D_h)
-    dPdx_gravity  = -rho * g * sin_theta
-    dPdx          = (dPdx_friction + dPdx_gravity) / (1.0 - Ma**2)
+        
+    else:
+        #calculate the change in entropy by using Euler method
+        # change in entropy = change in entropy due to heat transfer (q_wall/(mdot * T)) + change in entropy due to friction (f_darcy * v^2/(2*D_h * Tin))
+        #Assumes temperature is relatively constant over this slice. If significant temperature changes occur, need to cut down the length slice.
+        dS = (q_wall/mdot +f_darcy*v**2 * dL / (2*D_h))/T_in
+        
+        S_out = S_in + dS
 
-    # ------------------------------------------------------------------
-    # Energy equation: dT/dx
-    # ------------------------------------------------------------------
-    # Energy balance per unit length:
-    #   G * A * d(h + v^2/2 + g*z)/dx = q_wall * perimeter
-    #
-    # Expanding the enthalpy differential using the thermodynamic identity:
-    #   dh = Cp*dT + (1/rho)*(1 - T*beta)*dP
-    #
-    # Kinetic energy term:
-    #   d(v^2/2)/dx = v * dv/dx = v * d(G/rho)/dx
-    #               = -(G/rho^2) * drho/dx
-    # From continuity, drho/dx = rho * dv/dx / (-v) = -G/v * (1/rho) * drho/dx... 
-    # Simpler: d(v^2/2)/dx = v * (-G/rho^2) * drho/dx
-    # But we can express this purely in terms of dP/dx using the EOS:
-    #   drho/dx = (drho/dP)_T * dPdx + (drho/dT)_P * dTdx
-    # This makes the system implicit. For a single forward-Euler step we
-    # approximate d(v^2/2)/dx using only dP/dx from the momentum equation
-    # (the T-dependence of drho is a higher-order correction):
-    #   (drho/dP)_T = 1 / (dP/drho)_T  from CoolProp
-    #   d(v^2/2)/dx ~= -(G^2 / rho^2) * (1/(dP/drho)_T) * dPdx
-    #
-    # Rearranging the energy balance for dT/dx:
-    #   Cp * dT/dx = q_wall * perimeter / (G * A)
-    #                - (1/rho) * (1 - T*beta) * dPdx
-    #                - d(v^2/2)/dx
-    #                - g * sin_theta
-    #
-    # Reference: Ouyang & Aziz (1996), eq. 15-18.
+    #next, update the abstract state with the now known outlet specific entropy (or temperature if isothermal) and pressure. Use this to calculate other variables.
+    try:
+        
+        if isothermal:
+            AS.update(CP.PT_INPUTS, P_out, T_out)
+            S_out = AS.smass()
+            
 
-    dPdrho_T = AS.first_partial_deriv(CP.iP, CP.iDmass, CP.iT)  # Pa/(kg/m^3)
+        else:
+            AS.update(CP.PSmass_INPUTS, P_out, S_out)
+            T_out = AS.T()
+        H_out = AS.hmass()
+        phase_out = AS.phase()
+       
+        if phase_out == _CP_PHASE_TWOPHASE:
+            raise RuntimeError(
+                f"compressible_hydraulics: fluid enters two-phase region at "
+                f"outlet (P_out={P_out:.4g} Pa, T_out={T_out:.4g} K).  "
+                f"Reduce step size dL={dL:.4g} m or check operating conditions."
+            )
+        rho_out = AS.rhomass()
+        a_out   = AS.speed_sound()
+        v_out   = mdot / (rho_out*flow_area)
+        Ma_out  = v_out / a_out
+        #Energy balance - calculate actual heat leaving wall (Watts). For adiabadic case, should = 0.
+        q_wall_actual = ((H_out - H_in) + (v_out**2 - v**2) / 2 + grav_constant*dz)*mdot
+        # if isothermal:
+        #     q_wall_actual = ((H_out - H_in) + (v_out**2 - v**2) / 2 + grav_constant*dz)*mdot
+        # else:
+        #     q_wall_actual = q_wall   
+    except RuntimeError:
+        raise   # re-raise our own RuntimeErrors as-is
+    except Exception as exc:
+        raise RuntimeError(
+            f"compressible_hydraulics: CoolProp failed to evaluate outlet "
+            f"state (P_out={P_out:.4g} Pa, S_out={S_out:.4g} J/kg*k).  "
+            f"Try a smaller step size? dL={dL:.4g} m is likely too large.  Detail: {exc}"
+        ) from exc
 
-    # Kinetic energy gradient (approximate; first-order accurate for small dL).
-    dKEdx = -(G**2 / rho**2) * (1.0 / dPdrho_T) * dPdx
-
-    # Enthalpy real-gas correction term: (1/rho) * (1 - T*beta) * dP/dx
-    # For an ideal gas beta = 1/T, so this term is exactly zero.
-    real_gas_enthalpy_term = (1.0 / rho) * (1.0 - T_in * beta) * dPdx
-
-    # Heat input per unit mass flux per unit length [J/(kg*m)]
-    q_mass_length = (q_wall * perimeter) / (G * flow_area)
-
-    dTdx = (q_mass_length - real_gas_enthalpy_term - dKEdx - g * sin_theta) / Cp
-
-    # ------------------------------------------------------------------
-    # Forward Euler integration over dL
-    # ------------------------------------------------------------------
-    dP_total = dPdx * dL
-    dT_total = dTdx * dL
-
-    P_out = P_in + dP_total
-    T_out = T_in + dT_total
-
-    # ------------------------------------------------------------------
-    # Decompose dP into physical contributions (for output / diagnostics)
-    # ------------------------------------------------------------------
-    # The momentum equation is:
-    #   dP/dx = dP/dx|_friction + dP/dx|_gravity + dP/dx|_accel
-    #
-    # The acceleration term arises because a pressure drop causes the gas to
-    # expand, which increases velocity.  Using the isentropic relation
-    # drho/dx = (1/c^2)*dP/dx and d(v^2/2)/dx = -G^2/rho^2 * drho/dx:
-    #   dP/dx|_accel = Ma^2 * dP/dx|_total
-    #
-    # The friction and gravity terms are their unmodified physical gradients
-    # (without the compressibility denominator); the (1 - Ma^2) denominator
-    # comes from rearranging after substituting the accel term back in, so it
-    # is already implicitly captured in dP_total:
-    #   dP_friction + dP_gravity + dP_accel = dP_total   (identity, always)
-    #
-    # For Ma << 1: dP_accel ~ 0, dP_friction and dP_gravity dominate.
-    # For Ma -> 1: dP_accel -> dP_total (all pressure change goes to acceleration).
-    dP_friction = dPdx_friction * dL        # physical friction contribution [Pa]
-    dP_gravity  = dPdx_gravity  * dL        # physical gravity contribution [Pa]
-    dP_accel    = Ma**2 * dP_total          # acceleration (kinetic energy) [Pa]
+    if Ma_out >= choke_mach_limit:
+        raise RuntimeError(
+            f"compressible_hydraulics: outlet Mach number Ma_out={Ma_out:.4f} "
+            f">= choke limit {choke_mach_limit}.  Flow choked within this slice "
+            f"(dL={dL:.4g} m).  Use smaller steps."
+        )
 
     # ------------------------------------------------------------------
     # Return results
@@ -741,21 +614,20 @@ def compressible_slice_hydraulics(
     return {
         "P_out":        P_out,
         "T_out":        T_out,
-        "rho_in":       rho,
-        "v_in":         v,
-        "Ma_in":        Ma,
+        "rho_out":      rho_out,
+        "v_in":          v,
+        "v_out":         v_out,
+        "Ma_in":         Ma,
+        "Ma_out":        Ma_out,
         "Re_in":        Re,
         "f_darcy":      f_darcy,
         "flow_regime":  flow_regime,
         "phase":        phase,
-        "dP_friction":  dP_friction,
-        "dP_gravity":   dP_gravity,
-        "dP_accel":     dP_accel,
-        "dP_total":     dP_total,
-        "dT_total":     dT_total,
-        "q_wall_used":  q_wall,
+        "dP friction":  dP_contrib_friction,
+        "dP gravity":   dP_contrib_elevation,
+        "S_out"     :   S_out,
+        "q_wall_actual" : q_wall_actual,    
     }
-
 
 def viscosity_LGE(T, mol_wt, density):
     """
@@ -776,46 +648,6 @@ def viscosity_LGE(T, mol_wt, density):
     mu = k * math.exp(x * density ** y)/10000.0
 
     return ureg.Quantity(mu, "cP")
-
-def isothermal_ideal_gas_hydraulics(mol_wt, Z, Po, T, k, segment, flow_rate, grav_constant=None):
-    """ Calculate an isothermal ideal gas (plus Z factor compressibility) pressure drop along a pipe segment
-    The calculation is performed one profile step at a time so that a point-by-point pressure profile is generated.
-    The friction per unit length will change as the gas expands, so a step by step process is necessary.
-
-    Args:
-        mol_wt         : Molar weight of the fluid (kg/kmol).
-        Z             : Ideal gas compressibility factor. Defaults to 1 if omitted.
-        Pd_o          : pint Quantity or plain float. Dynamic pressure at point zero. (dimensions [force]/[area]) If plain float, assumes Pascals
-                        Note that this is not the same as the total/static/reservoir pressure at point zero! If that's what you have, calculate the dynamic pressure on the input to the function.
-        T             : Isothermal gas and line temperature
-        k             : Ratio of specific heats Cp/Cv. Not needed for friction calculation but used for Mach number calculation to determine if flow is choked.
-        segment       : Line_Segment instance.
-        flow_rate     : pint Quantity -- either a volumetric flow rate
-                        (dimensions [length]^3/[time], e.g. m^3/s),
-                        a mass flow rate (dimensions [mass]/[time], e.g. kg/s, lb/min), 
-                        or a molar flow rate (dimensions [moles]/[time], e.g. mol/s, scf/day). 
-                        A plain float or a Quantity with any other dimensions raises ValueError.
-        grav_constant : pint Quantity (acceleration). Defaults to 9.8066 m/s^2.
-        viscosity     : pint Quantity or plain float (Pa*s if float).
-                        Dynamic viscosity of the fluid. If not supplied, uses the Lee, Gonzalez, and Eakin correlation in the viscosity_LGE function
-
-    At each point, calculates the pressure change due to elevation change, pressure change due to velocity change, and pressure change due to friction
-    dp_elevationchange = rho * g * (elev_i - elev_f)  
-    dp_velocitychange = 
-    dp_friction = -(f_D / 2) * (mdot/A)^2 * dx / (D_h * rho)
-    where:
-    f_D = Darcy friction factor
-    mdot = mass flow rate
-    A = flow area
-    dx = step length
-    D_h = hydraulic diameter
-    rho = density
-
-    """
-    #Calculate
-
-
-
 
 def liquid_hydraulics(fluid, segment, flow_rate, grav_constant=None):
     """Calculate incompressible liquid pressure drop along a pipe segment.
@@ -1080,170 +912,85 @@ def test_csv_profile():
     output_csv = os.path.splitext("testprofile.csv")[0] + "_pressure_profile.csv"
     export_pressure_profile(results, output_csv)
 
-def test_compressible_slice():
-    """Validation test for compressible_slice_hydraulics().
+    
+def test_comp_hydraulics():
 
-    Two sub-tests are run:
-
-    1. Adiabatic, near-incompressible (low-velocity) case.
-       At Ma << 1 and for a liquid-like fluid, the compressible slice should
-       reproduce the liquid_hydraulics() result to within ~1%.
-
-    2. Adiabatic methane gas at representative pipeline conditions.
-       Checks that pressure drops, Mach number, and friction factor are
-       physically reasonable, and that the sum of friction + gravity +
-       acceleration equals the reported dP_total.
-    """
-    print("\n=== Test: compressible_slice_hydraulics ===")
-
-    # ------------------------------------------------------------------
-    # Sub-test 1: low-velocity liquid water -- compare to liquid_hydraulics
-    # ------------------------------------------------------------------
-    # print("\n--- Sub-test 1: liquid water, low velocity ---")
-
-    # # Liquid water at 20 degC, 5 bar (~72.5 psia)
-    # P0   = 5e5      # Pa
-    # T0   = 293.15   # K
-    # AS_w = AbstractState("HEOS", "Water")
-    # AS_w.update(CP.PT_INPUTS, P0, T0)
-    # rho0 = AS_w.rhomass()
-
-    # D_h    = ureg.Quantity(3.068, "inch").to("m").magnitude
-    # A      = math.pi * D_h**2 / 4.0
-    # eps    = ureg.Quantity(0.00015, "ft").to("m").magnitude
-    # Q      = ureg.Quantity(2000.0, "oil_bbl/day").to("m^3/s").magnitude
-    # v0     = Q / A
-    # G      = rho0 * v0
-
-    # dL     = ureg.Quantity(2000.0, "ft").to("m").magnitude
-    # dz     = ureg.Quantity(25.0,   "ft").to("m").magnitude
-
-    # result = compressible_slice_hydraulics(
-    #     abstract_state=AS_w,
-    #     P_in=P0,
-    #     T_in=T0,
-    #     G=G,
-    #     dL=dL,
-    #     dz=dz,
-    #     D_h=D_h,
-    #     roughness=eps,
-    #     flow_area=A,
-    #     q_wall=0.0,
-    # )
-
-    # # Reproduce with liquid_hydraulics for direct comparison.
-    # fluid_w = Incompressible_Fluid(
-    #     density=ureg.Quantity(rho0, "kg/m^3"),
-    #     viscosity=ureg.Quantity(AS_w.viscosity(), "Pa*s"),
-    # )
-    # seg_w = Line_Segment(
-    #     roughness=ureg.Quantity(eps, "m"),
-    #     id_val=ureg.Quantity(D_h, "m"),
-    #     length=ureg.Quantity(dL, "m"),
-    #     elevation_change=ureg.Quantity(dz, "m"),
-    # )
-    # liq_result = liquid_hydraulics(fluid_w, seg_w, ureg.Quantity(Q, "m^3/s"))
-
-    # dP_comp = result["dP_total"]
-    # dP_liq  = liq_result["dP_total_Pa"]
-
-    # dP_comp_psi = ureg.Quantity(dP_comp, "Pa").to("psi").magnitude
-    # dP_liq_psi  = ureg.Quantity(dP_liq,  "Pa").to("psi").magnitude
-
-    # print(f"  Ma_in (compressible)  = {result['Ma_in']:.6f}  (expect << 1)")
-    # print(f"  Re_in                 = {result['Re_in']:.1f}")
-    # print(f"  f_darcy               = {result['f_darcy']:.6f}")
-    # print(f"  dP total (compressible) = {dP_comp_psi:.4f} psi  ({dP_comp:.2f} Pa)")
-    # print(f"  dP total (liquid_hyd)   = {dP_liq_psi:.4f} psi  ({dP_liq:.2f} Pa)")
-    # pct_diff = abs(dP_comp - dP_liq) / abs(dP_liq) * 100.0
-    # print(f"  Difference            = {pct_diff:.4f}%  (expect < 1%)")
-    # assert pct_diff < 1.0, (
-    #     f"Sub-test 1 FAILED: compressible and liquid results differ by "
-    #     f"{pct_diff:.2f}% (> 1% tolerance)"
-    # )
-    # print("  Sub-test 1 PASSED")
-
-    # ------------------------------------------------------------------
-    # Sub-test 2: methane gas at pipeline conditions
-    # ------------------------------------------------------------------
-    print("\n--- Sub-test 2: methane gas, pipeline conditions ---")
-
-    # Methane at ~1015 psia (7 MPa), ~44 degF (280 K).
-    # Flow: 100 MMSCFD through a 16-inch (ID ~15.25 inch) pipe.
-    P_gas    = 7.0e6    # Pa
-    T_gas    = 300.0    # K
+    P_gas    = 790798.0    # Pa
+    T_gas    = 299.8    # K
     D_gas    = ureg.Quantity(4.026, "inch").to("m").magnitude
     A_gas    = math.pi * D_gas**2 / 4.0
     eps_gas  = ureg.Quantity(0.00015, "ft").to("m").magnitude
-    dL_gas   = ureg.Quantity(1.0,    "mile").to("m").magnitude
-    dz_gas   = ureg.Quantity(-1.0,    "mile").to("m").magnitude  # horizontal for this sub-test
-
+    dL_gas   = ureg.Quantity(100.0,    "feet").to("m").magnitude
+    dz_gas   = ureg.Quantity(-100.0,    "feet").to("m").magnitude
     AS_g = AbstractState("HEOS", "Methane")
     AS_g.update(CP.PT_INPUTS, P_gas, T_gas)
     rho_gas = AS_g.rhomass()
-
-    # 100 MMSCFD converted to mass flow rate.
-    # 1 scf of methane at 60 degF / 14.696 psia:
-    #   mol_mass_methane = 16.043 g/mol
-    #   molar volume at scf conditions already encoded in ureg (scf unit)
-    Q_scfd   = ureg.Quantity(100.0, "mmscf/day")
-    mdot     = Q_scfd.to("mol/s").magnitude * 16.043e-3   # kg/s
+    S_in = AS_g.smass()
+    Q_scfd   = ureg.Quantity(1.0, "mmscf/day")
+    mdot     = Q_scfd.to("mol/s").magnitude * 16.043e-3   # kg/s from mol wt
     G_gas    = mdot / A_gas
 
-    result_g = compressible_slice_hydraulics(
+    print('\n')
+    print(f'inputs: P = {P_gas}, Smass_in= {S_in}')
+    print('\n')
+    result_g = compressible_hydraulics(
         abstract_state=AS_g,
         P_in=P_gas,
         T_in=T_gas,
-        G=G_gas,
+        mdot = mdot,
         dL=dL_gas,
         dz=dz_gas,
         D_h=D_gas,
         roughness=eps_gas,
         flow_area=A_gas,
-        q_wall=0.0,
+        isothermal = True,
     )
 
-    dP_fric_psi  = ureg.Quantity(result_g["dP_friction"], "Pa").to("psi").magnitude
-    dP_grav_psi  = ureg.Quantity(result_g["dP_gravity"],  "Pa").to("psi").magnitude
-    dP_accel_psi = ureg.Quantity(result_g["dP_accel"],    "Pa").to("psi").magnitude
-    dP_tot_psi   = ureg.Quantity(result_g["dP_total"],    "Pa").to("psi").magnitude
+    print(result_g)
 
-    print(f"  Mass flux G           = {G_gas:.4f} kg/(m^2*s)")
-    print(f"  Inlet velocity        = {result_g['v_in']:.4f} m/s  "
-          f"({ureg.Quantity(result_g['v_in'],'m/s').to('ft/s').magnitude:.4f} ft/s)")
-    print(f"  Inlet density         = {result_g['rho_in']:.4f} kg/m^3")
-    print(f"  Mach number (inlet)   = {result_g['Ma_in']:.6f}")
-    print(f"  Reynolds number       = {result_g['Re_in']:.0f}")
-    print(f"  Darcy friction        = {result_g['f_darcy']:.6f}  ({result_g['flow_regime']})")
-    print(f"  dP friction           = {dP_fric_psi:.4f} psi  ({result_g['dP_friction']:.2f} Pa)")
-    print(f"  dP gravity            = {dP_grav_psi:.4f} psi  ({result_g['dP_gravity']:.2f} Pa)")
-    print(f"  dP acceleration       = {dP_accel_psi:.6f} psi  ({result_g['dP_accel']:.4f} Pa)")
-    print(f"  dP total              = {dP_tot_psi:.4f} psi  ({result_g['dP_total']:.2f} Pa)")
-    print(f"  dT                    = {result_g['dT_total']:.6f} K")
-    print(f"  P_out                 = {ureg.Quantity(result_g['P_out'],'Pa').to('psi').magnitude:.4f} psia")
-    print(f"  T_out                 = {result_g['T_out']:.4f} K")
+def test_compressible_slices():
+    slicecount = 20
+    total_length = ureg.Quantity(100.0,    "feet").to("m").magnitude
+    total_elev_change = ureg.Quantity(100.0,    "feet").to("m").magnitude
+    D_pipe    = ureg.Quantity(4.026, "inch").to("m").magnitude
+    eps_pipe  = ureg.Quantity(0.00015, "ft").to("m").magnitude
+    Q_scfd   = ureg.Quantity(1.0, "mmscf/day")
 
-    # Sanity checks.
-    assert result_g["dP_friction"] < 0.0, "Friction dP must be negative (loss)"
-    # assert result_g["dP_accel"] < 0.0, (
-    #     "Acceleration dP must be negative (gas expands as pressure drops, "
-    #     "so kinetic energy increases at the expense of pressure)"
-    # )
-    assert result_g["Ma_in"] < 0.95, "Mach number should be well below choke limit"
-    # dP_total must equal the sum of components.
-    # Identity: dP_friction + dP_gravity + Ma^2*dP_total = dP_total
-    # => dP_friction + dP_gravity = (1-Ma^2)*dP_total  -- exact by construction.
-    component_sum = (result_g["dP_friction"]
-                     + result_g["dP_gravity"]
-                     + result_g["dP_accel"])
-    assert abs(component_sum - result_g["dP_total"]) < 1e-6, (
-        "dP components do not sum to dP_total"
-    )
-    print("  Sub-test 2 PASSED")
-    print("\n=== All compressible slice tests PASSED ===\n")
+    dL   = total_length / slicecount
+    dz  = total_elev_change/slicecount
+
+    #generate profile assuming uniform slices of length and elevation change
+
+    profile = []
+
+    for i in range(slicecount + 1):
+        profile.append([i * dL, i * dz])
+
+    segment = Line_Segment(
+            roughness=eps_pipe,
+            id_val=D_pipe,
+            profile= profile
+        )
+
+    #initial conditions
+    P_in    = 790798.0    # Pa
+    T_in    = 299.8    # K
+
+    A_pipe    = math.pi * D_gas**2 / 4.0
+
+    AS_g = AbstractState("HEOS", "Methane")
+    AS_g.update(CP.PT_INPUTS, P_gas, T_gas)
+    rho_in = AS_g.rhomass()
+    S_in = AS_g.smass()
+
+    mdot     = Q_scfd.to("mol/s").magnitude * 16.043e-3   # kg/s from mol wt
+
+    #loop through and call compressible_hydraulics on each slice of the line segment, using the output of each slice as the inputs for the next
+
 
 
 if __name__ == "__main__":
 
-    test_p2p()
-    test_compressible_slice()
+    # test_p2p()
+    #test_comp_hydraulics():
+    test_compressible_slices()
