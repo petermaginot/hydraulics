@@ -35,14 +35,14 @@ _V_scm = _R * _T_scm / _P_scm   # m^3/mol  (~0.022414)
 # SCF: 60 degF, 14.696 psia
 _T_scf = (60.0 - 32.0) * 5.0 / 9.0 + 273.15   # K (~288.706)
 _P_scf = 14.696 * 6894.757293168               # Pa (14.696 psi is not quite exactly 101325 Pa)
-_V_scf = ureg.Quantity(_R * _T_scf / _P_scf, 'm^3')                  # m^3/mol  (~0.028317 * 1/1000 adjusted)
+_V_scf = ureg.Quantity(_R * _T_scf / _P_scf, 'm^3')          #1 scf = 1.20 moles, but let the calculation be done in case you need to use some oddball standard conditions
 _V_scf = _V_scf.to("ft^3")
 _V_scf = _V_scf.magnitude
 
-ureg.define(f'scm  = 1.0 * mol / {_V_scm}')
-ureg.define(f'scf  = 1.0 * mol / {_V_scf} ')
-ureg.define(f'mscf = {1e3}  *   mol / {_V_scf}')
-ureg.define(f'mmscf = {1e6} *  mol / {_V_scf}')
+ureg.define(f'scm  = {1.0/_V_scm} * mol ')
+ureg.define(f'scf  = {1.0/_V_scf} * mol ')
+ureg.define(f'mscf = {1e3/_V_scf}  *   mol ')
+ureg.define(f'mmscf = {1e6/_V_scf}*  mol ')
 
 
 # ---------------------------------------------------------------------------
@@ -478,7 +478,7 @@ def compressible_hydraulics(
         Calculated:
         rho             : float, mass density [kg/m^3]
         v            : float, flow velocity in direction of flow [m/s]
-        mu              : float, kinematic viscosity [Pa*s], from CoolProp
+        mu              : float, dynamic viscosity [Pa*s], from CoolProp
         a               : float, speed of sound [m/s], from CoolProp
         f_darcy          : float, Darcy friction factor, from fluids library correlation
         Ma              : float, Mach number [dimensionless] Ma = v/a
@@ -493,7 +493,7 @@ def compressible_hydraulics(
     if mdot <= 0.0:
         raise ValueError(
             f"compressible_slice_hydraulics: mass flow rate mdot must be positive "
-            f"(received G={mdot:.6g} kg/s)."
+            f"(received mdot={mdot:.6g} kg/s)."
         )
     if dL <= 0.0:
         raise ValueError(
@@ -549,31 +549,36 @@ def compressible_hydraulics(
     #Euler method to find pressure at outlet
     P_out = P_in + dP
     
-    
+    #Now we have P but need one more thermodynamic state variable to be able to calculate everything else.
     if isothermal:
+        #Easy peasy for the isothermal case
         T_out = T_in
-
         
     else:
-        #calculate the change in entropy by using Euler method
+        #Ideally we would just calculate the output entropy and be good to go with that as our second state variable, and this works fine for single component systems. S_out = S_in + dS
         # change in entropy = change in entropy due to heat transfer (q_wall/(mdot * T)) + change in entropy due to friction (f_darcy * v^2/(2*D_h * Tin))
-        #Assumes temperature is relatively constant over this slice. If significant temperature changes occur, need to cut down the length slice.
-        dS = (q_wall/mdot +f_darcy*v**2 * dL / (2*D_h))/T_in
         
-        S_out = S_in + dS
+        # However, with multicomponent systems, CoolProp has trouble using entropy as one of the inputs, so for robustness we need to use a thermodynamic identity to convert it to something easier to deal with like temperature
+        # Use dH = TdS + VdP = Cp dT + [V - T (∂V/∂T)_P] dP (from table 6.2-1 in "Chemical, Biochemical, and Engineering Thermodynmics, 4th ed." by Sandler)
+        #substitute (∂V/∂T)_P = -1/ρ^2 (∂ρ/∂T)_P and solve for dT
+        # Then, use the Euler method to calculate T_out        
+        #Assumes temperature, density, heat capacity, velocity, and our weird (∂ρ/∂T)_P property are all relatively constant over this slice. 
+        # If significant changes occur, need to cut down the length slice (or implement a better numerical integration scheme like Runge-Kutta).
+        
+        Cp = AS.cpmass()
+        drhodT_P = AS.first_partial_deriv(CP.iDmass, CP.iT, CP.iP)
 
-    #next, update the abstract state with the now known outlet specific entropy (or temperature if isothermal) and pressure. Use this to calculate other variables.
+        dT = (1/Cp) * (q_wall/mdot - (T_in/rho**2) * drhodT_P * dP + (f_darcy * dL * v**2)/(2 * D_h))
+
+        T_out = T_in + dT
+
+    #next, update the abstract state with the now known outlet temperature and pressure. Use this to calculate other variables.
     try:
         
-        if isothermal:
-            AS.update(CP.PT_INPUTS, P_out, T_out)
-            S_out = AS.smass()
-            
+        AS.update(CP.PT_INPUTS, P_out, T_out)
 
-        else:
-            AS.update(CP.PSmass_INPUTS, P_out, S_out)
-            T_out = AS.T()
         H_out = AS.hmass()
+        S_out = AS.smass()
         phase_out = AS.phase()
        
         if phase_out == _CP_PHASE_TWOPHASE:
@@ -586,26 +591,25 @@ def compressible_hydraulics(
         a_out   = AS.speed_sound()
         v_out   = mdot / (rho_out*flow_area)
         Ma_out  = v_out / a_out
-        #Energy balance - calculate actual heat leaving wall (Watts). For adiabadic case, should = 0.
+        #Energy balance - calculate actual heat leaving wall (Watts) as a check on our results. For adiabadic case, should = 0. 
+        # It won't actually be exactly that, due to numerical integration erros, but it's a decent measure of the accuracy of 
+        # that approximation and tells you if you need to cut down your length step size.
         q_wall_actual = ((H_out - H_in) + (v_out**2 - v**2) / 2 + grav_constant*dz)*mdot
-        # if isothermal:
-        #     q_wall_actual = ((H_out - H_in) + (v_out**2 - v**2) / 2 + grav_constant*dz)*mdot
-        # else:
-        #     q_wall_actual = q_wall   
+
     except RuntimeError:
         raise   # re-raise our own RuntimeErrors as-is
     except Exception as exc:
         raise RuntimeError(
             f"compressible_hydraulics: CoolProp failed to evaluate outlet "
             f"state (P_out={P_out:.4g} Pa, S_out={S_out:.4g} J/kg*k).  "
-            f"Try a smaller step size? dL={dL:.4g} m is likely too large.  Detail: {exc}"
+            f"Try a smaller step size? dL={dL:.4g} m may be too large.  Detail: {exc}"
         ) from exc
 
     if Ma_out >= choke_mach_limit:
         raise RuntimeError(
             f"compressible_hydraulics: outlet Mach number Ma_out={Ma_out:.4f} "
             f">= choke limit {choke_mach_limit}.  Flow choked within this slice "
-            f"(dL={dL:.4g} m).  Use smaller steps."
+
         )
 
     # ------------------------------------------------------------------
@@ -851,6 +855,277 @@ def export_pressure_profile(results, output_path):
 
 
 # ---------------------------------------------------------------------------
+# Compressible profile CSV runner
+# ---------------------------------------------------------------------------
+
+# Unit-system definitions for compressible profile export.
+# Each entry maps a system name to conversion factors and column header labels.
+# Conversions are applied as: output_value = SI_value * factor  (except
+# temperature, which uses an offset conversion via pint).
+_COMP_OUTPUT_UNITS = {
+    "US_Common": {
+        "dist_label":    "distance_ft",
+        "elev_label":    "elevation_ft",
+        "P_label":       "P_psia",
+        "T_label":       "T_degF",
+        "v_label":       "v_fps",
+        "q_wall_label":  "q_wall_W",      # watts -- should change this to btu/hr
+        "dist_unit":     "ft",
+        "elev_unit":     "ft",
+        "P_unit":        "psi",
+        "T_unit":        "degF",
+        "v_unit":        "ft/s",
+    },
+    "SI": {
+        "dist_label":    "distance_m",
+        "elev_label":    "elevation_m",
+        "P_label":       "P_Pa",
+        "T_label":       "T_K",
+        "v_label":       "v_ms",
+        "q_wall_label":  "q_wall_W",
+        "dist_unit":     "m",
+        "elev_unit":     "m",
+        "P_unit":        "Pa",
+        "T_unit":        "K",
+        "v_unit":        "m/s",
+    },
+    "metric": {
+        "dist_label":    "distance_m",
+        "elev_label":    "elevation_m",
+        "P_label":       "P_kPa",
+        "T_label":       "T_degC",
+        "v_label":       "v_ms",
+        "q_wall_label":  "q_wall_W",
+        "dist_unit":     "m",
+        "elev_unit":     "m",
+        "P_unit":        "kPa",
+        "T_unit":        "degC",
+        "v_unit":        "m/s",
+    },
+}
+
+
+def _convert_comp_output(value_si, quantity_type, unit_spec):
+    """Convert a single SI value to the output unit specified in unit_spec.
+
+    Args:
+        value_si      : float, value in SI units.
+        quantity_type : str, one of 'dist', 'elev', 'P', 'T', 'v'.
+        unit_spec     : dict, one entry from _COMP_OUTPUT_UNITS.
+
+    Returns:
+        float, converted value.
+    """
+    unit_key = quantity_type + "_unit"
+    src_units = {
+        "dist": "m",
+        "elev": "m",
+        "P":    "Pa",
+        "T":    "K",
+        "v":    "m/s",
+    }
+    src = src_units[quantity_type]
+    dst = unit_spec[unit_key]
+    if src == dst:
+        return value_si
+    return ureg.Quantity(value_si, src).to(dst).magnitude
+
+
+def compressible_hydraulics_from_csv(
+    csv_path,
+    output_csv_path,
+    abstract_state,
+    P_in,
+    T_in,
+    mdot,
+    D_h,
+    roughness,
+    flow_area,
+    isothermal=True,
+    q_wall=0.0,
+    output_units="US_Common",
+):
+    """Run compressible hydraulics slice-by-slice along a profile loaded from
+    a CSV file and write the per-point results to an output CSV.
+
+    The inlet CSV is expected to have the same three-column format used by
+    Line_Segment.from_csv():
+        col 0 - ignored (layer ID or similar label)
+        col 1 - along-pipe distance from origin [m]
+        col 2 - elevation [m]
+    A header row is expected and skipped.
+
+    One output row is written per profile point (including the inlet as
+    point 0).  The inlet row includes distance, elevation, P, T, v, and Ma
+    computed from the supplied inlet conditions; the q_wall_W column is left
+    blank for point 0 because no slice has yet been traversed.
+
+    Args:
+        csv_path          : str, path to the elevation profile CSV.
+        output_csv_path   : str, path for the output results CSV.
+        abstract_state    : CoolProp AbstractState instance pre-configured for
+                            the working fluid.  Updated in-place on each call
+                            to compressible_hydraulics(); must not be shared
+                            across threads.
+        P_in              : float, inlet pressure [Pa].
+        T_in              : float, inlet temperature [K].
+        mdot              : float, mass flow rate [kg/s].
+        D_h               : float, hydraulic diameter [m].
+        roughness         : float, absolute pipe-wall roughness [m].
+        flow_area         : float, cross-section flow area [m^2].
+        isothermal        : bool, if True run isothermal; if False uses q_wall.  Default True.
+        q_wall            : float, heat flow into fluid [W].  Only used when
+                            isothermal=False.  Default 0.0 (adiabatic).
+        output_units      : str, one of 'US_Common' (ft / psia / degF),
+                            'SI' (m / Pa / K), or 'metric' (m / kPa / degC).
+                            Default 'US_Common'.
+
+    Returns:
+        None.  Results are written to output_csv_path.
+
+    Raises:
+        ValueError   : unrecognized output_units string, empty CSV, or mdot
+                       / geometry issues propagated from compressible_hydraulics.
+        RuntimeError : two-phase inlet, choked flow, or CoolProp failure
+                       propagated from compressible_hydraulics.
+    """
+    if output_units not in _COMP_OUTPUT_UNITS:
+        raise ValueError(
+            f"compressible_hydraulics_from_csv: unrecognized output_units "
+            f"'{output_units}'.  Choose from: "
+            f"{list(_COMP_OUTPUT_UNITS.keys())}."
+        )
+    uspec = _COMP_OUTPUT_UNITS[output_units]
+
+    # ------------------------------------------------------------------
+    # Load elevation profile from CSV (same format as Line_Segment.from_csv)
+    # ------------------------------------------------------------------
+    profile = []
+    with open(csv_path, newline="") as f:
+        reader = csv.reader(f)
+        next(reader)                      # skip header row
+        for row in reader:
+            dist_m = float(row[1])
+            elev_m = float(row[2])
+            profile.append((dist_m, elev_m))
+
+    if not profile:
+        raise ValueError(
+            f"compressible_hydraulics_from_csv: CSV '{csv_path}' contains no "
+            f"data rows."
+        )
+
+    # Sort by distance and prepend a zero-distance point if needed,
+    # mirroring Line_Segment._normalize_profile().
+    profile.sort(key=lambda r: r[0])
+    if profile[0][0] != 0.0:
+        profile = [(0.0, profile[0][1])] + profile
+
+    n_points = len(profile)
+    print(
+        f"  Profile loaded from '{csv_path}': {n_points} points, "
+        f"total distance = {profile[-1][0]:.2f} m, "
+        f"net elevation change = {profile[-1][1] - profile[0][1]:.4f} m"
+    )
+
+    # ------------------------------------------------------------------
+    # Compute inlet velocity and Mach number from inlet conditions.
+    # abstract_state is updated in-place here; compressible_hydraulics()
+    # will update it again on the first slice call.
+    # ------------------------------------------------------------------
+    AS = abstract_state
+    AS.update(CP.PT_INPUTS, P_in, T_in)
+
+    phase_in = AS.phase()
+    if phase_in == _CP_PHASE_TWOPHASE:
+        raise RuntimeError(
+            f"compressible_hydraulics_from_csv: fluid is two-phase at inlet "
+            f"(P={P_in:.4g} Pa, T={T_in:.4g} K).  Single-phase hydraulics only."
+        )
+
+    rho_in = AS.rhomass()          # kg/m^3
+    a_in   = AS.speed_sound()      # m/s
+    v_in   = mdot / (rho_in * flow_area)   # m/s
+    Ma_in  = v_in / a_in
+    S_in = AS.smass()
+
+    # ------------------------------------------------------------------
+    # Open output CSV and write header + inlet row (point 0)
+    # ------------------------------------------------------------------
+    with open(output_csv_path, "w", newline="") as out_f:
+        writer = csv.writer(out_f)
+
+        writer.writerow([
+            "point",
+            uspec["dist_label"],
+            uspec["elev_label"],
+            uspec["P_label"],
+            uspec["T_label"],
+            uspec["v_label"],
+            "Ma",
+            uspec["q_wall_label"],
+            "Spec. Entropy"
+        ])
+
+        dist_0, elev_0 = profile[0]
+        writer.writerow([
+            0,
+            f"{_convert_comp_output(dist_0, 'dist', uspec):.4f}",
+            f"{_convert_comp_output(elev_0, 'elev', uspec):.4f}",
+            f"{_convert_comp_output(P_in,   'P',    uspec):.4f}",
+            f"{_convert_comp_output(T_in,   'T',    uspec):.4f}",
+            f"{_convert_comp_output(v_in,   'v',    uspec):.4f}",
+            f"{Ma_in:.6f}",
+            "",                           # q_wall blank for inlet row
+            f"{S_in:.6f}",
+        ])
+
+        # ------------------------------------------------------------------
+        # Step through consecutive profile point pairs
+        # ------------------------------------------------------------------
+        P_cur = P_in
+        T_cur = T_in
+
+        for i in range(n_points - 1):
+            dist_in,  elev_in  = profile[i]
+            dist_out, elev_out = profile[i + 1]
+
+            slice_dL = dist_out - dist_in   # m, along-pipe length of this slice
+            slice_dz = elev_out - elev_in   # m, elevation rise (positive = uphill)
+            print(f"Step: {i} of {n_points}", end="\r")
+            result = compressible_hydraulics(
+                abstract_state=AS,
+                P_in=P_cur,
+                T_in=T_cur,
+                mdot=mdot,
+                dL=slice_dL,
+                dz=slice_dz,
+                D_h=D_h,
+                roughness=roughness,
+                flow_area=flow_area,
+                isothermal=isothermal,
+                q_wall=q_wall,
+            )
+            # S_cur = S_out
+            P_cur = result["P_out"]
+            T_cur = result["T_out"]
+
+            writer.writerow([
+                i + 1,
+                f"{_convert_comp_output(dist_out,          'dist', uspec):.4f}",
+                f"{_convert_comp_output(elev_out,          'elev', uspec):.4f}",
+                f"{_convert_comp_output(P_cur,             'P',    uspec):.4f}",
+                f"{_convert_comp_output(T_cur,             'T',    uspec):.4f}",
+                f"{_convert_comp_output(result['v_out'],   'v',    uspec):.4f}",
+                f"{result['Ma_out']:.6f}",
+                f"{result['q_wall_actual']:.4f}",
+                f"{result['S_out']:.6f}",
+            ])
+
+    print(f"  Compressible profile results exported to: {output_csv_path}")
+
+
+# ---------------------------------------------------------------------------
 # Example / entry point
 # ---------------------------------------------------------------------------
 
@@ -922,12 +1197,12 @@ def test_comp_hydraulics():
     eps_gas  = ureg.Quantity(0.00015, "ft").to("m").magnitude
     dL_gas   = ureg.Quantity(100.0,    "feet").to("m").magnitude
     dz_gas   = ureg.Quantity(-100.0,    "feet").to("m").magnitude
-    AS_g = AbstractState("HEOS", "Methane")
+    AS_g = AbstractState("HEOS", "Air")
     AS_g.update(CP.PT_INPUTS, P_gas, T_gas)
     rho_gas = AS_g.rhomass()
     S_in = AS_g.smass()
     Q_scfd   = ureg.Quantity(1.0, "mmscf/day")
-    mdot     = Q_scfd.to("mol/s").magnitude * 16.043e-3   # kg/s from mol wt
+    mdot     = Q_scfd.to("mol/s").magnitude * AS_g.molar_mass()   # kg/s from mol wt
     G_gas    = mdot / A_gas
 
     print('\n')
@@ -950,11 +1225,19 @@ def test_comp_hydraulics():
 
 def test_compressible_slices():
     slicecount = 500
-    total_length      = ureg.Quantity(10000.0, "feet").to("m").magnitude
-    total_elev_change = ureg.Quantity(-10000.0, "feet").to("m").magnitude
+    total_length      = ureg.Quantity(2, "miles").to("m").magnitude
+    total_elev_change = ureg.Quantity(2, "miles").to("m").magnitude
     D_pipe  = ureg.Quantity(1.995,  "inch").to("m").magnitude
     eps_pipe = ureg.Quantity(0.00015, "ft").to("m").magnitude
-    Q_scfd  = ureg.Quantity(1, "mmscf/day")
+    Q_scfd  = ureg.Quantity(0.3, "mmscf/day")
+
+    
+    # Initial conditions.
+    initial_pressure = ureg.Quantity(100.0, "psi")
+    P_in = initial_pressure.to("Pa").magnitude   # Pa
+    T_in = 300      # K
+
+    AS_g = define_composition()
 
     dL = total_length      / slicecount
     dz = total_elev_change / slicecount
@@ -970,18 +1253,12 @@ def test_compressible_slices():
         profile=profile,
     )
 
-    # Initial conditions.
-    initial_pressure = ureg.Quantity(1000.0, "psi").to("Pa").magnitude
-    P_in = initial_pressure   # Pa
-    T_in = 300      # K
-
     A_pipe = math.pi * D_pipe**2 / 4.0
 
-    AS_g = AbstractState("HEOS", "Methane")
+
     AS_g.update(CP.PT_INPUTS, P_in, T_in)
 
-    # Methane molecular weight: 16.043 g/mol = 16.043e-3 kg/mol.
-    mdot = Q_scfd.to("mol/s").magnitude * 16.043e-3   # kg/s
+    mdot = Q_scfd.to("mol/s").magnitude * AS_g.molar_mass()   # kg/s
 
     # Compute inlet velocity and Mach number for the header row.
     rho_in = AS_g.rhomass()                    # kg/m^3
@@ -1060,7 +1337,7 @@ def test_compressible_slices():
             D_h=D_pipe,
             roughness=eps_pipe,
             flow_area=A_pipe,
-            isothermal=False,
+            isothermal=True,
         )
 
         P_cur = result["P_out"]
@@ -1082,8 +1359,94 @@ def test_compressible_slices():
 
 
 
+def test_comp_csv_profile():
+    """Exercise compressible_hydraulics_from_csv() using testprofile1.csv."""
+
+    # Pipe geometry
+    D_pipe   = ureg.Quantity(4.026, "inch").to("m").magnitude   # m
+    eps_pipe = ureg.Quantity(0.00015, "ft").to("m").magnitude   # m
+    A_pipe   = math.pi * D_pipe**2 / 4.0                        # m^2
+
+    # Inlet conditions.
+    P_in = ureg.Quantity(1000.0, "psi").to("Pa").magnitude   # Pa
+    T_in = ureg.Quantity(80.0, "degF").to("degK").magnitude                                            # K
+
+    # Flow rate
+    Q_scfd = ureg.Quantity(10, "mmscf/day")
+
+    AS = define_composition()
+    mdot = Q_scfd.to("mol/s").magnitude * AS.molar_mass()          # kg/s
+
+    compressible_hydraulics_from_csv(
+        csv_path="testprofile.csv",
+        output_csv_path="testprofile_comp_results.csv",
+        abstract_state=AS,
+        P_in=P_in,
+        T_in=T_in,
+        mdot=mdot,
+        D_h=D_pipe,
+        roughness=eps_pipe,
+        flow_area=A_pipe,
+        isothermal=False,
+        output_units="US_Common",
+    )
+
+def define_composition():
+    # --- USER INPUTS (Mole Fractions) ---
+    y_Methane         = 0.9
+    y_Ethane          = 0.05
+    y_Propane         = 0.03
+    y_n_Butane        = 0.01
+    y_IsoButane       = 0.0
+    y_n_Pentane       = 0.00
+    y_Isopentane      = 0.00
+    y_n_Hexane        = 0.00
+    y_n_Heptane       = 0.0
+    y_n_Octane        = 0.0
+    y_n_Nonane        = 0.0
+    y_n_Decane        = 0.0
+    y_CarbonDioxide   = 0.01
+    y_Water           = 0.0
+    y_Nitrogen        = 0.00
+    y_Oxygen          = 0.0
+    y_Argon           = 0.0
+    y_Hydrogen        = 0.0
+    y_HydrogenSulfide = 0.0
+    # ------------------------------------
+
+    # The list of suffixes based on CoolProp's registry names
+    components = [
+        "Methane", "Ethane", "Propane", "n_Butane", "IsoButane",
+        "n_Pentane", "Isopentane", "n_Hexane", "n_Heptane", "n_Octane",
+        "n_Nonane", "n_Decane", "CarbonDioxide", "Water", "Nitrogen",
+        "Oxygen", "Argon", "Hydrogen", "HydrogenSulfide"
+    ]
+
+    active_cp_names = []
+    fractions = []
+
+    for comp in components:
+        val = locals().get(f"y_{comp}", 0.0)
+        if val > 0:
+            # CoolProp uses hyphens (n-Butane) while Python uses underscores (n_Butane)
+            cp_ready_name = comp.replace("_", "-")
+            active_cp_names.append(cp_ready_name)
+            fractions.append(val)
+
+    # Normalize to ensure the sum is exactly 1.0 (prevents CoolProp errors)
+    total = sum(fractions)
+    fractions = [f / total for f in fractions]
+
+    # Generate State
+    fluid_string = "&".join(active_cp_names)
+    AS = AbstractState("HEOS", fluid_string)
+    AS.set_mole_fractions(fractions)
+
+    return AS
+
 if __name__ == "__main__":
 
     # test_p2p()
     # test_comp_hydraulics()
-    test_compressible_slices()
+    #test_compressible_slices()
+    test_comp_csv_profile()
