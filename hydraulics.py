@@ -46,7 +46,7 @@ ureg.define(f'mmscf = {1e6/_V_scf}*  mol ')
 
 
 # ---------------------------------------------------------------------------
-# Fluid class
+# Incompressible Fluid class
 # ---------------------------------------------------------------------------
 
 class Incompressible_Fluid:
@@ -392,6 +392,29 @@ class Line_Segment:
 # Hydraulics calculation
 # ---------------------------------------------------------------------------
 
+def viscosity_LGE(T, mol_wt, density):
+    """
+    Lee, Gonzalez, and Eakin correlation for hydrocarbon gas viscosity
+    Use this for gas viscosity if using a CoolProp equation of state that doesn't support viscosity calculation (like Peng-Robinson)
+    T = Temperature, degrees K
+    mol_wt = gas molecular weight, kg/kmol
+    density = kg/m^3
+
+    Uses the pint library for unit conversion
+    """
+    T = ureg.Quantity(T, "degK").to("degR").magnitude
+    density = ureg.Quantity(density, "kg/m^3").to("g/cm^3").magnitude
+    
+    #Temperature input to equation is in degrees R, density input is g/cm^3, returns centipoise. Good gravy those are some ridiculous units.
+
+    x = 3.5+986/(T)+0.01*mol_wt
+    k = (9.4+0.02*mol_wt)*((T)**1.5)/(209+19*mol_wt+T)
+    y = 2.4 - 0.2 * x
+    
+    mu = k * math.exp(x * density ** y)/10000.0
+
+    return ureg.Quantity(mu, "cP").to("Pa*s").magnitude
+
 def _darcy_friction(Re, eps, d_h):
     """Return the Darcy friction factor and flow regime string.
 
@@ -453,7 +476,8 @@ def compressible_hydraulics(
     roughness,
     flow_area,
     q_wall=0.0,
-    isothermal = False
+    isothermal = False,
+    mu = None 
     ):
     #Inputs
     """ 
@@ -474,6 +498,7 @@ def compressible_hydraulics(
         q_wall          : float, heat flow into fluid [W] (default 0 =
                           adiabatic).
         isothermal      : boolean, if True then properties are evaluated isothermally (ignoring q_wall if supplied). If false, uses q_wall.
+        mu              : float, viscosity in Pascal-seconds. If not supplied, first tries to calculate from the abstract state, and if that doesn't work, falls back to the Lee, Gonzalez, and Eakin correlation
 
         Calculated:
         rho             : float, mass density [kg/m^3]
@@ -519,7 +544,13 @@ def compressible_hydraulics(
     rho   = AS.rhomass()                  # kg/m^3
     Cp    = AS.cpmass()                   # J/(kg*K)
     a     = AS.speed_sound()              # m/s  (isentropic speed of sound)
-    mu    = AS.viscosity()                # Pa*s
+    if mu is None:
+        try:
+            mu    = AS.viscosity()                # Pa*s
+        except:
+            #If the abstract state is not able to calculate mixture viscosity (like if the Peng Robinson equation is used), use a backup viscosity correlation.
+            #Note that the Lee, Gonzalez, Eakin equation is really only intended for hydrocarbon gas mixtures, so if you have some other material, you should supply mu to the function.
+            mu = viscosity_LGE(T_in, AS.molar_mass() * 1000.0, AS.rhomass())
     S_in = AS.smass() #specific entropy in J/kg K
     H_in = AS.hmass() #specific enthalpy in J/kg
 
@@ -546,7 +577,9 @@ def compressible_hydraulics(
     #and overall change in pressure
     dP = (rho/(1-Ma**2)) * (-f_darcy * dL * v**2/(2 * D_h) - grav_constant * dz)
 
-    #Euler method to find pressure at outlet
+    #Euler method to find pressure at outlet. 
+    # Assumes density, Mach number/velocity, and friction factor are relatively constant over this slice. 
+    # If they're not, need to use a smaller length slice or a better numerical integration scheme like Runge-Kutta.
     P_out = P_in + dP
     
     #Now we have P but need one more thermodynamic state variable to be able to calculate everything else.
@@ -555,15 +588,16 @@ def compressible_hydraulics(
         T_out = T_in
         
     else:
-        #Ideally we would just calculate the output entropy and be good to go with that as our second state variable, and this works fine for single component systems. S_out = S_in + dS
+        #Ideally we would just calculate the output entropy and be good to go with that as our second state variable, and this works fine for single component systems. 
         # change in entropy = change in entropy due to heat transfer (q_wall/(mdot * T)) + change in entropy due to friction (f_darcy * v^2/(2*D_h * Tin))
-        
-        # However, with multicomponent systems, CoolProp has trouble using entropy as one of the inputs, so for robustness we need to use a thermodynamic identity to convert it to something easier to deal with like temperature
+        # S_out = S_in + dS
+        # However, with multicomponent systems, CoolProp has trouble using entropy as one of the inputs, so for robustness we need to use a thermodynamic identity to convert it to something easier to deal with, like temperature.
         # Use dH = TdS + VdP = Cp dT + [V - T (∂V/∂T)_P] dP (from table 6.2-1 in "Chemical, Biochemical, and Engineering Thermodynmics, 4th ed." by Sandler)
+        #                                   ^ [V - T (∂V/∂T)_P] is the Joule Thompson coefficient μ times negative heat capacity [-μCp]
         #substitute (∂V/∂T)_P = -1/ρ^2 (∂ρ/∂T)_P and solve for dT
         # Then, use the Euler method to calculate T_out        
-        #Assumes temperature, density, heat capacity, velocity, and our weird (∂ρ/∂T)_P property are all relatively constant over this slice. 
-        # If significant changes occur, need to cut down the length slice (or implement a better numerical integration scheme like Runge-Kutta).
+        #Assumes temperature, density, heat capacity, velocity, and our weird isobaric thermal expansion (∂ρ/∂T)_P property are all relatively constant over this slice. 
+        # If significant changes occur over the slice, need to cut down the length slice (or implement a better numerical integration scheme like Runge-Kutta).
         
         Cp = AS.cpmass()
         drhodT_P = AS.first_partial_deriv(CP.iDmass, CP.iT, CP.iP)
@@ -593,7 +627,7 @@ def compressible_hydraulics(
         Ma_out  = v_out / a_out
         #Energy balance - calculate actual heat leaving wall (Watts) as a check on our results. For adiabadic case, should = 0. 
         # It won't actually be exactly that, due to numerical integration erros, but it's a decent measure of the accuracy of 
-        # that approximation and tells you if you need to cut down your length step size.
+        # the approximation and tells you if you need to cut down your length step size or if you're getting outside of the zone of validity of the model.
         q_wall_actual = ((H_out - H_in) + (v_out**2 - v**2) / 2 + grav_constant*dz)*mdot
 
     except RuntimeError:
@@ -601,8 +635,8 @@ def compressible_hydraulics(
     except Exception as exc:
         raise RuntimeError(
             f"compressible_hydraulics: CoolProp failed to evaluate outlet "
-            f"state (P_out={P_out:.4g} Pa, S_out={S_out:.4g} J/kg*k).  "
-            f"Try a smaller step size? dL={dL:.4g} m may be too large.  Detail: {exc}"
+            f"state (P_out={P_out:.4g} Pa, T_out={T_out:.4g} K).  "
+            f"step size dL={dL:.4g} m  Detail: {exc}"
         ) from exc
 
     if Ma_out >= choke_mach_limit:
@@ -615,6 +649,7 @@ def compressible_hydraulics(
     # ------------------------------------------------------------------
     # Return results
     # ------------------------------------------------------------------
+    # Maybe just change this to return the abstract state, from which the P, T, S, rho, phase, and whatever else can be extracted, along with maybe Ma and Re too and q_wall_actual.
     return {
         "P_out":        P_out,
         "T_out":        T_out,
@@ -633,27 +668,8 @@ def compressible_hydraulics(
         "q_wall_actual" : q_wall_actual,    
     }
 
-def viscosity_LGE(T, mol_wt, density):
-    """
-    Lee, Gonzalez, and Eakin correlation for hydrocarbon gas viscosity
-    T = pint quantity with temperature units
-    mol_wt = gas molecular weight, kg/kmol
-    density = pint quantity with mass/vol units
-    """
-    T = T.to("degR").magnitude
-    density = density.to("g/cm^3").magnitude
-    
-    #Temperature input to equation is in degrees R, density input is g/cm^3, returns centipoise. Good gravy those are some ridiculous units.
 
-    x = 3.5+986/(T)+0.01*mol_wt
-    k = (9.4+0.02*mol_wt)*((T)**1.5)/(209+19*mol_wt+T)
-    y = 2.4 - 0.2 * x
-    
-    mu = k * math.exp(x * density ** y)/10000.0
-
-    return ureg.Quantity(mu, "cP")
-
-def liquid_hydraulics(fluid, segment, flow_rate, grav_constant=None):
+def liquid_hydraulics(fluid, segment, flow_rate):
     """Calculate incompressible liquid pressure drop along a pipe segment.
 
     The calculation is performed one profile step at a time so that a
@@ -687,7 +703,6 @@ def liquid_hydraulics(fluid, segment, flow_rate, grav_constant=None):
                         e.g. kg/s, lb/min).  Mass flow rate is converted to
                         volumetric using the fluid density.  A plain float or
                         a Quantity with any other dimensions raises ValueError.
-        grav_constant : pint Quantity (acceleration). Defaults to 9.8066 m/s^2.
 
     Returns:
         dict with keys:
@@ -702,10 +717,8 @@ def liquid_hydraulics(fluid, segment, flow_rate, grav_constant=None):
                                  {distance_m, elevation_m,
                                   dP_static_Pa, dP_friction_Pa, dP_total_Pa}
     """
-    if grav_constant is None:
-        grav_constant = ureg.Quantity(9.8066, "m/s^2")
 
-    g   = grav_constant.to("m/s^2").magnitude
+    grav_constant   = 9.8066
     rho = fluid.density_si
 
     # --- Resolve flow rate to volumetric (m^3/s) ---
@@ -753,7 +766,7 @@ def liquid_hydraulics(fluid, segment, flow_rate, grav_constant=None):
     profile_results = []
 
     for dist_m, elev_m in profile:
-        dP_static   =  rho * g * (elev_ref - elev_m)
+        dP_static   =  rho * grav_constant * (elev_ref - elev_m)
         dP_friction = -friction_gradient * dist_m    # negative = pressure loss
         dP_total    =  dP_static + dP_friction
         profile_results.append({
@@ -869,7 +882,7 @@ _COMP_OUTPUT_UNITS = {
         "P_label":       "P_psia",
         "T_label":       "T_degF",
         "v_label":       "v_fps",
-        "q_wall_label":  "q_wall_W",      # watts -- should change this to btu/hr
+        "q_wall_label":  "q_wall_W",      #  watts -- TODO should change this to btu/hr
         "dist_unit":     "ft",
         "elev_unit":     "ft",
         "P_unit":        "psi",
@@ -917,6 +930,7 @@ def _convert_comp_output(value_si, quantity_type, unit_spec):
         float, converted value.
     """
     unit_key = quantity_type + "_unit"
+    #need to add power for converting watt to btu/hr
     src_units = {
         "dist": "m",
         "elev": "m",
@@ -938,10 +952,10 @@ def compressible_hydraulics_from_csv(
     P_in,
     T_in,
     mdot,
-    D_h,
     roughness,
-    flow_area,
-    isothermal=True,
+    D_h = None,
+    flow_area = None,
+    isothermal = True,
     q_wall=0.0,
     output_units="US_Common",
 ):
@@ -953,6 +967,9 @@ def compressible_hydraulics_from_csv(
         col 0 - ignored (layer ID or similar label)
         col 1 - along-pipe distance from origin [m]
         col 2 - elevation [m]
+        col 3 - hydraulic diameter [m] (optional - if D_h is supplied to the function, ignore column in file and use the supplied D_h for the entire length)
+        col 4 - flow area [m^2] (optional - if flow_area is supplied to the function, ignore column in file and use the supplied flow_area for the entire length)
+        col 5 - Surrounding ground temperature for performing heat transfer calculation TODO not yet implemented
     A header row is expected and skipped.
 
     One output row is written per profile point (including the inlet as
@@ -1007,7 +1024,18 @@ def compressible_hydraulics_from_csv(
         for row in reader:
             dist_m = float(row[1])
             elev_m = float(row[2])
-            profile.append((dist_m, elev_m))
+
+            if D_h is None:
+                D_h_m = float(row[3])
+            else:
+                D_h_m = D_h
+
+            if flow_area is None:
+                flow_area_m = float(row[4])
+            else:
+                flow_area_m = flow_area
+            #T_K = float(row[5]) #TODO for implementing heat transfer
+            profile.append((dist_m, elev_m, D_h_m,flow_area_m))
 
     if not profile:
         raise ValueError(
@@ -1019,7 +1047,7 @@ def compressible_hydraulics_from_csv(
     # mirroring Line_Segment._normalize_profile().
     profile.sort(key=lambda r: r[0])
     if profile[0][0] != 0.0:
-        profile = [(0.0, profile[0][1])] + profile
+        profile = [(0.0, profile[0][1], profile[0][2], profile[0][3])] + profile
 
     n_points = len(profile)
     print(
@@ -1045,7 +1073,7 @@ def compressible_hydraulics_from_csv(
 
     rho_in = AS.rhomass()          # kg/m^3
     a_in   = AS.speed_sound()      # m/s
-    v_in   = mdot / (rho_in * flow_area)   # m/s
+    v_in   = mdot / (rho_in * profile[0][3])   # m/s  -- use inlet row flow area
     Ma_in  = v_in / a_in
     S_in = AS.smass()
 
@@ -1067,7 +1095,7 @@ def compressible_hydraulics_from_csv(
             "Spec. Entropy"
         ])
 
-        dist_0, elev_0 = profile[0]
+        dist_0, elev_0, _, _ = profile[0]
         writer.writerow([
             0,
             f"{_convert_comp_output(dist_0, 'dist', uspec):.4f}",
@@ -1087,12 +1115,13 @@ def compressible_hydraulics_from_csv(
         T_cur = T_in
 
         for i in range(n_points - 1):
-            dist_in,  elev_in  = profile[i]
-            dist_out, elev_out = profile[i + 1]
+            dist_in,  elev_in,  D_h_in,  area_in  = profile[i]
+            dist_out, elev_out, D_h_out, area_out = profile[i + 1]
 
             slice_dL = dist_out - dist_in   # m, along-pipe length of this slice
             slice_dz = elev_out - elev_in   # m, elevation rise (positive = uphill)
             print(f"Step: {i} of {n_points}", end="\r")
+
             result = compressible_hydraulics(
                 abstract_state=AS,
                 P_in=P_cur,
@@ -1100,9 +1129,9 @@ def compressible_hydraulics_from_csv(
                 mdot=mdot,
                 dL=slice_dL,
                 dz=slice_dz,
-                D_h=D_h,
+                D_h=D_h_in,        # hydraulic diameter at slice inlet. 
                 roughness=roughness,
-                flow_area=flow_area,
+                flow_area=area_in,  # flow area at slice inlet. Note that this program assumes perfect pressure/velocity recovery when the flow area changes between slices (no discharge coefficient)
                 isothermal=isothermal,
                 q_wall=q_wall,
             )
@@ -1157,8 +1186,8 @@ def test_p2p():
     # --- Display and export ---
     print_results(results, fluid, segment, flow_rate)
 
-    output_csv = os.path.splitext("simple.csv")[0] + "_pressure_profile.csv"
-    export_pressure_profile(results, output_csv)
+    # output_csv = os.path.splitext("simple.csv")[0] + "_pressure_profile.csv"
+    # export_pressure_profile(results, output_csv)
 
 def test_csv_profile():
     #Example with csv file defined profile
@@ -1224,20 +1253,29 @@ def test_comp_hydraulics():
     print(result_g)
 
 def test_compressible_slices():
-    slicecount = 500
+    slicecount = 100
     total_length      = ureg.Quantity(2, "miles").to("m").magnitude
     total_elev_change = ureg.Quantity(2, "miles").to("m").magnitude
     D_pipe  = ureg.Quantity(1.995,  "inch").to("m").magnitude
     eps_pipe = ureg.Quantity(0.00015, "ft").to("m").magnitude
-    Q_scfd  = ureg.Quantity(0.3, "mmscf/day")
+    Q_scfd  = ureg.Quantity(3, "mmscf/day")
 
     
     # Initial conditions.
-    initial_pressure = ureg.Quantity(100.0, "psi")
+    initial_pressure = ureg.Quantity(2000.0, "psi")
     P_in = initial_pressure.to("Pa").magnitude   # Pa
-    T_in = 300      # K
+    T_in = 425      # K
 
-    AS_g = define_composition()
+    isothermal=False
+
+    AS_g = define_composition(
+        y_Methane = 0.9,
+        y_Ethane = 0.05,
+        y_Propane=0.02,
+        y_n_Butane = 0.01,
+        y_CarbonDioxide= 0.02,
+        eos = "HEOS"
+        )
 
     dL = total_length      / slicecount
     dz = total_elev_change / slicecount
@@ -1282,7 +1320,6 @@ def test_compressible_slices():
     sep = "-" * len(header)
 
     print("\n=== Compressible Isothermal Hydraulics -- Slice-by-Slice Results ===")
-    print(f"  Fluid  : Methane (HEOS)")
     print(f"  Pipe ID: {ureg.Quantity(D_pipe, 'm').to('inch'):.4f~P}")
     print(f"  Flow   : {Q_scfd:.4f~P}  =  {mdot:.4f} kg/s")
     print(f"  Slices : {slicecount}")
@@ -1337,7 +1374,7 @@ def test_compressible_slices():
             D_h=D_pipe,
             roughness=eps_pipe,
             flow_area=A_pipe,
-            isothermal=True,
+            isothermal=isothermal,
         )
 
         P_cur = result["P_out"]
@@ -1363,55 +1400,206 @@ def test_comp_csv_profile():
     """Exercise compressible_hydraulics_from_csv() using testprofile1.csv."""
 
     # Pipe geometry
-    D_pipe   = ureg.Quantity(4.026, "inch").to("m").magnitude   # m
+    # D_pipe   = ureg.Quantity(1.995, "inch").to("m").magnitude   # m
     eps_pipe = ureg.Quantity(0.00015, "ft").to("m").magnitude   # m
-    A_pipe   = math.pi * D_pipe**2 / 4.0                        # m^2
+    # A_pipe   = math.pi * D_pipe**2 / 4.0                        # m^2
 
     # Inlet conditions.
-    P_in = ureg.Quantity(1000.0, "psi").to("Pa").magnitude   # Pa
-    T_in = ureg.Quantity(80.0, "degF").to("degK").magnitude                                            # K
+    P_in = ureg.Quantity(7300.0, "psi").to("Pa").magnitude   # Pa
+    T_in = ureg.Quantity(338.0, "degF").to("degK").magnitude                                            # K
 
     # Flow rate
-    Q_scfd = ureg.Quantity(10, "mmscf/day")
+    Q_scfd = ureg.Quantity(193, "mmscf/day")
 
-    AS = define_composition()
+    AS = define_composition(
+        y_Methane = 0.9,
+        y_Ethane = 0.05,
+        y_Propane=0.02,
+        y_n_Butane = 0.01,
+        y_CarbonDioxide= 0.02,
+        eos = "HEOS"
+        )
     mdot = Q_scfd.to("mol/s").magnitude * AS.molar_mass()          # kg/s
 
     compressible_hydraulics_from_csv(
-        csv_path="testprofile.csv",
-        output_csv_path="testprofile_comp_results.csv",
+        csv_path="Example_Well_Survey.csv",
+        output_csv_path="EWS_comp_results.csv",
         abstract_state=AS,
         P_in=P_in,
         T_in=T_in,
         mdot=mdot,
-        D_h=D_pipe,
+        # D_h=D_pipe,
         roughness=eps_pipe,
-        flow_area=A_pipe,
-        isothermal=False,
-        output_units="US_Common",
+        # flow_area=A_pipe,
+        isothermal = False,
+        output_units="US_Common"
     )
 
-def define_composition():
+def define_combination(
+    AS_gas    = None,
+    AS_oil    = None,
+    AS_water  = None,
+    gas_rate  = None,
+    oil_rate  = None,
+    water_rate= None,
+    eos       = "HEOS",
+):
+    """Combine up to three single-phase AbstractState streams into one mixed
+    AbstractState whose mole fractions reflect the weighted average composition
+    of all active streams.
+
+    Each stream is described by a CoolProp AbstractState (already configured
+    with mole fractions via set_mole_fractions()) and a total molar flow rate
+    in mol (or mol/s, or any consistent molar quantity -- the units cancel
+    during normalization, so only the ratio between rates matters).
+
+    Streams where both the AbstractState and rate are non-None are treated as
+    active.  A stream is silently skipped if either its AbstractState or its
+    rate is None.  At least one stream must be active.
+
+    Components that appear in more than one stream (e.g., n-Butane in both gas
+    and oil) are merged by summing their molar contributions before
+    normalization.
+
+    Args:
+        AS_gas     : CoolProp AbstractState for the gas stream, or None.
+        AS_oil     : CoolProp AbstractState for the liquid hydrocarbon stream,
+                     or None.
+        AS_water   : CoolProp AbstractState for the water stream, or None.
+        gas_rate   : float, total moles of gas stream.  Ignored if AS_gas is
+                     None.
+        oil_rate   : float, total moles of oil stream.  Ignored if AS_oil is
+                     None.
+        water_rate : float, total moles of water stream.  Ignored if AS_water
+                     is None.
+        eos        : str, CoolProp equation-of-state backend to use for the
+                     combined AbstractState (default 'HEOS').
+
+    Returns:
+        CoolProp AbstractState configured with the merged mole fractions.
+        Note: the returned AbstractState has NOT been updated to a (P, T) state
+        yet -- call AS.update(CP.PT_INPUTS, P, T) before querying properties.
+
+    Raises:
+        ValueError : if no active streams are present, or if any active stream
+                     has a non-positive rate.
+    """
+    # Build a list of (AbstractState, rate) pairs for active streams only.
+    streams = []
+    for label, AS, rate in [
+        ("gas",   AS_gas,   gas_rate),
+        ("oil",   AS_oil,   oil_rate),
+        ("water", AS_water, water_rate),
+    ]:
+        if AS is None or rate is None:
+            continue  # silently skip absent streams
+        if rate <= 0.0:
+            raise ValueError(
+                f"define_combination: {label}_rate must be positive "
+                f"(received {rate})."
+            )
+        streams.append((AS, rate))
+
+    if not streams:
+        raise ValueError(
+            "define_combination: at least one stream (gas, oil, or water) "
+            "must be provided with a non-None AbstractState and rate."
+        )
+
+    # Accumulate molar contributions from each stream into a dict keyed by
+    # CoolProp component name (hyphenated, e.g. 'n-Butane').
+    # contribution[name] = sum over streams of (stream_mole_fraction * stream_rate)
+    contribution = {}
+    for AS, rate in streams:
+        names     = AS.fluid_names()          # list of str, e.g. ['Methane', 'n-Butane']
+        fractions = AS.get_mole_fractions()   # list of float, same length
+
+        for name, frac in zip(names, fractions):
+            contribution[name] = contribution.get(name, 0.0) + frac * rate
+
+    # Normalize so that mole fractions sum to exactly 1.0.
+    total_moles = sum(contribution.values())
+    combined_names     = list(contribution.keys())
+    combined_fractions = [contribution[n] / total_moles for n in combined_names]
+
+    # Build and return the combined AbstractState.
+    fluid_string = "&".join(combined_names)
+    AS_combined  = AbstractState(eos, fluid_string)
+    AS_combined.set_mole_fractions(combined_fractions)
+
+    return AS_combined
+
+
+def test_define_combination():
+    AS_gas = define_composition(
+        y_Methane = 0.9,
+        y_Ethane = 0.05,
+        y_Propane=0.02,
+        y_n_Butane = 0.01,
+        y_CarbonDioxide= 0.02,
+        eos = "HEOS"
+        )
+    AS_oil = define_composition(
+        y_n_Butane        = 0.02,
+        y_IsoButane       = 0.0,
+        y_n_Pentane       = 0.05,
+        y_Isopentane      = 0.0,
+        y_n_Hexane        = 0.08,
+        y_n_Heptane       = 0.2,
+        y_n_Octane        = 0.3,
+        y_n_Nonane        = 0.25,
+        y_n_Decane        = 0.1,
+        eos = "HEOS"
+    )
+    AS_water = AbstractState("HEOS", "Water")
+    AS_gas.update(CP.PT_INPUTS, 101325, 288.7)
+    AS_oil.update(CP.PT_INPUTS, 101325, 288.7)
+    AS_water.update(CP.PT_INPUTS, 101325, 288.7)
+
+    gas_rate   = ureg.Quantity(3813,  "mscf").to("mol").magnitude
+    oil_rate   = ureg.Quantity(148.0, "oil_bbl").to("m^3").magnitude * AS_oil.rhomolar()
+    water_rate = ureg.Quantity(119.0, "oil_bbl").to("m^3").magnitude * AS_water.rhomolar()
+
+    AS_combined = define_combination(
+        AS_gas    = AS_gas,
+        AS_oil    = AS_oil,
+        AS_water  = AS_water,
+        gas_rate  = gas_rate,
+        oil_rate  = oil_rate,
+        water_rate= water_rate,
+        eos       = "HEOS",
+    )
+
+    AS_combined.update(CP.PT_INPUTS, 1*101325, 300)
+
+    print(AS_combined.Q())
+
+
+
+
+def define_composition(
     # --- USER INPUTS (Mole Fractions) ---
-    y_Methane         = 0.9
-    y_Ethane          = 0.05
-    y_Propane         = 0.03
-    y_n_Butane        = 0.01
-    y_IsoButane       = 0.0
-    y_n_Pentane       = 0.00
-    y_Isopentane      = 0.00
-    y_n_Hexane        = 0.00
-    y_n_Heptane       = 0.0
-    y_n_Octane        = 0.0
-    y_n_Nonane        = 0.0
-    y_n_Decane        = 0.0
-    y_CarbonDioxide   = 0.01
-    y_Water           = 0.0
-    y_Nitrogen        = 0.00
-    y_Oxygen          = 0.0
-    y_Argon           = 0.0
-    y_Hydrogen        = 0.0
-    y_HydrogenSulfide = 0.0
+    y_Methane         = 0.0,
+    y_Ethane          = 0.0,
+    y_Propane         = 0.0,
+    y_n_Butane        = 0.0,
+    y_IsoButane       = 0.0,
+    y_n_Pentane       = 0.0,
+    y_Isopentane      = 0.0,
+    y_n_Hexane        = 0.0,
+    y_n_Heptane       = 0.0,
+    y_n_Octane        = 0.0,
+    y_n_Nonane        = 0.0,
+    y_n_Decane        = 0.0,
+    y_CarbonDioxide   = 0.0,
+    y_Water           = 0.0,
+    y_Nitrogen        = 0.0,
+    y_Oxygen          = 0.0,
+    y_Argon           = 0.0,
+    y_Hydrogen        = 0.0,
+    y_HydrogenSulfide = 0.0,
+    eos = "HEOS"              #equation of state. HEOS is CoolProp's default Helmholz equation of state. Can also use Peng Robinson (PR) which is faster, although it doesn't allow the calculation of viscosity.
+    ):
     # ------------------------------------
 
     # The list of suffixes based on CoolProp's registry names
@@ -1439,14 +1627,17 @@ def define_composition():
 
     # Generate State
     fluid_string = "&".join(active_cp_names)
-    AS = AbstractState("HEOS", fluid_string)
+
+    #Set abstract state model. HEOS is CoolProp's default Helmholz equation of state. Can also use Peng Robinson, although it doesn't allow the calculation of viscosity.
+    AS = AbstractState(eos, fluid_string)
     AS.set_mole_fractions(fractions)
 
     return AS
 
 if __name__ == "__main__":
 
-    # test_p2p()
+    #test_p2p()
     # test_comp_hydraulics()
-    #test_compressible_slices()
+    # test_compressible_slices()
     test_comp_csv_profile()
+    # test_define_combination()
