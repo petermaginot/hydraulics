@@ -7,6 +7,7 @@ from fluids.friction import friction_factor as fluids_friction_factor
 from fluids.core import Reynolds as fluids_Reynolds
 import CoolProp.CoolProp as CP
 from CoolProp.CoolProp import AbstractState
+import composition
 
 ureg = UnitRegistry()
 #need to register standard cubic foot (scf), thousand standard cubic feet (mscf), million standard cubic feet (mmscf), and standard cubic meter (scm) as custom units in the unit registry
@@ -272,7 +273,7 @@ class Line_Segment:
 
     @staticmethod
     def _normalize_profile(raw_profile):
-        """Sort profile by distance, convert Quantities to float metres, and
+        """Sort profile by distance, convert Quantities to float meters, and
         prepend a synthetic zero-distance point if the first entry is not
         already at distance = 0.
 
@@ -391,6 +392,7 @@ class Line_Segment:
 # ---------------------------------------------------------------------------
 # Hydraulics calculation
 # ---------------------------------------------------------------------------
+
 
 def viscosity_LGE(T, mol_wt, density):
     """
@@ -1189,6 +1191,7 @@ def test_p2p():
     # output_csv = os.path.splitext("simple.csv")[0] + "_pressure_profile.csv"
     # export_pressure_profile(results, output_csv)
 
+
 def test_csv_profile():
     #Example with csv file defined profile
     # --- Fluid definition ---
@@ -1252,6 +1255,11 @@ def test_comp_hydraulics():
 
     print(result_g)
 
+def incompressible_changing_area(P_in, v_in, A_in, A_out):
+
+    return P_out, v_out
+
+
 def test_compressible_slices():
     slicecount = 100
     total_length      = ureg.Quantity(2, "miles").to("m").magnitude
@@ -1268,7 +1276,7 @@ def test_compressible_slices():
 
     isothermal=False
 
-    AS_g = define_composition(
+    AS_g = composition.define_composition(
         y_Methane = 0.9,
         y_Ethane = 0.05,
         y_Propane=0.02,
@@ -1395,35 +1403,39 @@ def test_compressible_slices():
     print()
 
 
-
 def test_comp_csv_profile():
     """Exercise compressible_hydraulics_from_csv() using testprofile1.csv."""
 
     # Pipe geometry
-    # D_pipe   = ureg.Quantity(1.995, "inch").to("m").magnitude   # m
+    # D_pipe   = ureg.Quantity(4.026, "inch").to("m").magnitude   # m
     eps_pipe = ureg.Quantity(0.00015, "ft").to("m").magnitude   # m
     # A_pipe   = math.pi * D_pipe**2 / 4.0                        # m^2
 
     # Inlet conditions.
-    P_in = ureg.Quantity(7300.0, "psi").to("Pa").magnitude   # Pa
-    T_in = ureg.Quantity(338.0, "degF").to("degK").magnitude                                            # K
+    P_in = ureg.Quantity(100.0, "psi").to("Pa").magnitude   # Pa
+    T_in = ureg.Quantity(60.0, "degF").to("degK").magnitude                                            # K
 
     # Flow rate
-    Q_scfd = ureg.Quantity(193, "mmscf/day")
+    # Q_scfd = ureg.Quantity(1, "mmscf/day")
+    Vdot = ureg.Quantity(4000, "oil_bbl/day")
 
-    AS = define_composition(
-        y_Methane = 0.9,
-        y_Ethane = 0.05,
-        y_Propane=0.02,
-        y_n_Butane = 0.01,
-        y_CarbonDioxide= 0.02,
+    AS = composition.define_composition(
+        y_Methane = 0.0,
+        y_Ethane = 0.0,
+        y_Propane=0.0,
+        y_n_Butane = 0.0,
+        y_CarbonDioxide= 0.0,
+        y_n_Decane= 0.0,
+        y_Water = 1,
         eos = "HEOS"
         )
-    mdot = Q_scfd.to("mol/s").magnitude * AS.molar_mass()          # kg/s
+    AS.update(CP.PT_INPUTS, P_in, T_in)
+
+    mdot = Vdot.to("m^3/s").magnitude * AS.rhomass()          # kg/s
 
     compressible_hydraulics_from_csv(
-        csv_path="Example_Well_Survey.csv",
-        output_csv_path="EWS_comp_results.csv",
+        csv_path="testprofile_short.csv",
+        output_csv_path="testprofile_short_results.csv",
         abstract_state=AS,
         P_in=P_in,
         T_in=T_in,
@@ -1431,208 +1443,51 @@ def test_comp_csv_profile():
         # D_h=D_pipe,
         roughness=eps_pipe,
         # flow_area=A_pipe,
-        isothermal = False,
+        isothermal = True,
         output_units="US_Common"
     )
 
-def define_combination(
-    AS_gas    = None,
-    AS_oil    = None,
-    AS_water  = None,
-    gas_rate  = None,
-    oil_rate  = None,
-    water_rate= None,
-    eos       = "HEOS",
-):
-    """Combine up to three single-phase AbstractState streams into one mixed
-    AbstractState whose mole fractions reflect the weighted average composition
-    of all active streams.
 
-    Each stream is described by a CoolProp AbstractState (already configured
-    with mole fractions via set_mole_fractions()) and a total molar flow rate
-    in mol (or mol/s, or any consistent molar quantity -- the units cancel
-    during normalization, so only the ratio between rates matters).
+def test_liq_plot():
+    import matplotlib.pyplot as plt
 
-    Streams where both the AbstractState and rate are non-None are treated as
-    active.  A stream is silently skipped if either its AbstractState or its
-    rate is None.  At least one stream must be active.
-
-    Components that appear in more than one stream (e.g., n-Butane in both gas
-    and oil) are merged by summing their molar contributions before
-    normalization.
-
-    Args:
-        AS_gas     : CoolProp AbstractState for the gas stream, or None.
-        AS_oil     : CoolProp AbstractState for the liquid hydrocarbon stream,
-                     or None.
-        AS_water   : CoolProp AbstractState for the water stream, or None.
-        gas_rate   : float, total moles of gas stream.  Ignored if AS_gas is
-                     None.
-        oil_rate   : float, total moles of oil stream.  Ignored if AS_oil is
-                     None.
-        water_rate : float, total moles of water stream.  Ignored if AS_water
-                     is None.
-        eos        : str, CoolProp equation-of-state backend to use for the
-                     combined AbstractState (default 'HEOS').
-
-    Returns:
-        CoolProp AbstractState configured with the merged mole fractions.
-        Note: the returned AbstractState has NOT been updated to a (P, T) state
-        yet -- call AS.update(CP.PT_INPUTS, P, T) before querying properties.
-
-    Raises:
-        ValueError : if no active streams are present, or if any active stream
-                     has a non-positive rate.
-    """
-    # Build a list of (AbstractState, rate) pairs for active streams only.
-    streams = []
-    for label, AS, rate in [
-        ("gas",   AS_gas,   gas_rate),
-        ("oil",   AS_oil,   oil_rate),
-        ("water", AS_water, water_rate),
-    ]:
-        if AS is None or rate is None:
-            continue  # silently skip absent streams
-        if rate <= 0.0:
-            raise ValueError(
-                f"define_combination: {label}_rate must be positive "
-                f"(received {rate})."
-            )
-        streams.append((AS, rate))
-
-    if not streams:
-        raise ValueError(
-            "define_combination: at least one stream (gas, oil, or water) "
-            "must be provided with a non-None AbstractState and rate."
-        )
-
-    # Accumulate molar contributions from each stream into a dict keyed by
-    # CoolProp component name (hyphenated, e.g. 'n-Butane').
-    # contribution[name] = sum over streams of (stream_mole_fraction * stream_rate)
-    contribution = {}
-    for AS, rate in streams:
-        names     = AS.fluid_names()          # list of str, e.g. ['Methane', 'n-Butane']
-        fractions = AS.get_mole_fractions()   # list of float, same length
-
-        for name, frac in zip(names, fractions):
-            contribution[name] = contribution.get(name, 0.0) + frac * rate
-
-    # Normalize so that mole fractions sum to exactly 1.0.
-    total_moles = sum(contribution.values())
-    combined_names     = list(contribution.keys())
-    combined_fractions = [contribution[n] / total_moles for n in combined_names]
-
-    # Build and return the combined AbstractState.
-    fluid_string = "&".join(combined_names)
-    AS_combined  = AbstractState(eos, fluid_string)
-    AS_combined.set_mole_fractions(combined_fractions)
-
-    return AS_combined
-
-
-def test_define_combination():
-    AS_gas = define_composition(
-        y_Methane = 0.9,
-        y_Ethane = 0.05,
-        y_Propane=0.02,
-        y_n_Butane = 0.01,
-        y_CarbonDioxide= 0.02,
-        eos = "HEOS"
-        )
-    AS_oil = define_composition(
-        y_n_Butane        = 0.02,
-        y_IsoButane       = 0.0,
-        y_n_Pentane       = 0.05,
-        y_Isopentane      = 0.0,
-        y_n_Hexane        = 0.08,
-        y_n_Heptane       = 0.2,
-        y_n_Octane        = 0.3,
-        y_n_Nonane        = 0.25,
-        y_n_Decane        = 0.1,
-        eos = "HEOS"
-    )
-    AS_water = AbstractState("HEOS", "Water")
-    AS_gas.update(CP.PT_INPUTS, 101325, 288.7)
-    AS_oil.update(CP.PT_INPUTS, 101325, 288.7)
-    AS_water.update(CP.PT_INPUTS, 101325, 288.7)
-
-    gas_rate   = ureg.Quantity(3813,  "mscf").to("mol").magnitude
-    oil_rate   = ureg.Quantity(148.0, "oil_bbl").to("m^3").magnitude * AS_oil.rhomolar()
-    water_rate = ureg.Quantity(119.0, "oil_bbl").to("m^3").magnitude * AS_water.rhomolar()
-
-    AS_combined = define_combination(
-        AS_gas    = AS_gas,
-        AS_oil    = AS_oil,
-        AS_water  = AS_water,
-        gas_rate  = gas_rate,
-        oil_rate  = oil_rate,
-        water_rate= water_rate,
-        eos       = "HEOS",
+     #Example with csv file defined profile
+    # --- Fluid definition ---
+    fluid = Incompressible_Fluid.from_api_gravity(
+        api_gravity=50.0,
+        viscosity=ureg.Quantity(1.0, "cP"),
     )
 
-    AS_combined.update(CP.PT_INPUTS, 1*101325, 300)
+    # --- Pipe segment loaded from CSV ---
+    segment = Line_Segment.from_csv(
+        csv_path="testprofile.csv",
+        roughness=ureg.Quantity(0.00015, "ft"),
+        id_val=ureg.Quantity(3.068, "inch"),
+    )
 
-    print(AS_combined.Q())
+    # --- Flow rate ---
+    flow_rate = ureg.Quantity(2000, "oil_bbl/day")
 
+    # --- Run calculation ---
+    results = liquid_hydraulics(fluid, segment, flow_rate)
+    x = []
+    y = []
+    z = []
+    for pt in results["profile_results"]:
+        x.append(ureg.Quantity(pt['distance_m'], "m").to("ft").magnitude)
+        y.append(ureg.Quantity(pt['dP_total_Pa'], "Pa").to("psi").magnitude)
+        z.append(ureg.Quantity(pt['elevation_m'], "m").to("ft").magnitude)
+    fig, ax = plt.subplots()
+    plt.rcParams['font.family'] = 'Consolas'
+    l1, = ax.plot(x, y, label='Pressure change [psi]', color = 'black')
+    ax2 = ax.twinx()
+    l2, = ax2.plot(x, z, label='Elevation [ft]', color = 'red')
+    ax.set_xlabel('Distance [ft]')  # Add an x-label to the Axes.
+    ax.set_ylabel('Pressure change [psi]')  # Add a y-label to the Axes.
+    ax2.set_ylabel('Elevation [m]')
+    ax2.legend([l1, l2], ['Pressure change [psi]', 'Elevation [m]'])
+    plt.show()
 
-
-
-def define_composition(
-    # --- USER INPUTS (Mole Fractions) ---
-    y_Methane         = 0.0,
-    y_Ethane          = 0.0,
-    y_Propane         = 0.0,
-    y_n_Butane        = 0.0,
-    y_IsoButane       = 0.0,
-    y_n_Pentane       = 0.0,
-    y_Isopentane      = 0.0,
-    y_n_Hexane        = 0.0,
-    y_n_Heptane       = 0.0,
-    y_n_Octane        = 0.0,
-    y_n_Nonane        = 0.0,
-    y_n_Decane        = 0.0,
-    y_CarbonDioxide   = 0.0,
-    y_Water           = 0.0,
-    y_Nitrogen        = 0.0,
-    y_Oxygen          = 0.0,
-    y_Argon           = 0.0,
-    y_Hydrogen        = 0.0,
-    y_HydrogenSulfide = 0.0,
-    eos = "HEOS"              #equation of state. HEOS is CoolProp's default Helmholz equation of state. Can also use Peng Robinson (PR) which is faster, although it doesn't allow the calculation of viscosity.
-    ):
-    # ------------------------------------
-
-    # The list of suffixes based on CoolProp's registry names
-    components = [
-        "Methane", "Ethane", "Propane", "n_Butane", "IsoButane",
-        "n_Pentane", "Isopentane", "n_Hexane", "n_Heptane", "n_Octane",
-        "n_Nonane", "n_Decane", "CarbonDioxide", "Water", "Nitrogen",
-        "Oxygen", "Argon", "Hydrogen", "HydrogenSulfide"
-    ]
-
-    active_cp_names = []
-    fractions = []
-
-    for comp in components:
-        val = locals().get(f"y_{comp}", 0.0)
-        if val > 0:
-            # CoolProp uses hyphens (n-Butane) while Python uses underscores (n_Butane)
-            cp_ready_name = comp.replace("_", "-")
-            active_cp_names.append(cp_ready_name)
-            fractions.append(val)
-
-    # Normalize to ensure the sum is exactly 1.0 (prevents CoolProp errors)
-    total = sum(fractions)
-    fractions = [f / total for f in fractions]
-
-    # Generate State
-    fluid_string = "&".join(active_cp_names)
-
-    #Set abstract state model. HEOS is CoolProp's default Helmholz equation of state. Can also use Peng Robinson, although it doesn't allow the calculation of viscosity.
-    AS = AbstractState(eos, fluid_string)
-    AS.set_mole_fractions(fractions)
-
-    return AS
 
 if __name__ == "__main__":
 
@@ -1640,4 +1495,4 @@ if __name__ == "__main__":
     # test_comp_hydraulics()
     # test_compressible_slices()
     test_comp_csv_profile()
-    # test_define_combination()
+    # test_liq_plot()
