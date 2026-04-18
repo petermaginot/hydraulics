@@ -464,6 +464,238 @@ _SINGLE_PHASE_CODES = frozenset([
 
 
 # ---------------------------------------------------------------------------
+# Area-change pressure correction functions
+# ---------------------------------------------------------------------------
+
+def incompressible_changing_area(P_in, v_in, rho, A_in, A_out, Cd=1.0):
+    """Pressure correction for an incompressible fluid passing through a
+    change in flow area, using the Bernoulli equation.
+
+    Applies conservation of mass (continuity) and the Bernoulli equation:
+
+        v_out = v_in * (A_in / A_out)                     [continuity]
+
+        P_out = P_in + 0.5 * rho * (v_in^2 - v_out^2) * Cd^2
+
+    The discharge coefficient Cd models losses at the transition:
+      - Cd = 1.0  perfect (lossless) area change -- all velocity head is
+                  recovered as static pressure.
+      - Cd = 0.0  no recovery -- all kinetic-energy difference is lost
+                  (appropriate for a sudden expansion with full separation).
+      - 0 < Cd < 1  partial recovery.
+
+    Note that Cd acts on the recovered velocity head (v_in^2 - v_out^2),
+    not on the outlet velocity itself.  For a contraction the outlet
+    velocity is higher than the inlet velocity and the pressure always
+    drops regardless of Cd; Cd only affects expansions where static
+    pressure recovery is possible.
+
+    Args:
+        P_in  : float, inlet static pressure [Pa].
+        v_in  : float, inlet velocity [m/s].
+        rho   : float, fluid density [kg/m^3].  Assumed constant (incompressible).
+        A_in  : float, inlet flow area [m^2].
+        A_out : float, outlet flow area [m^2].
+        Cd    : float, discharge coefficient (default 1.0 = lossless).
+
+    Returns:
+        (P_out, v_out) -- tuple of floats.
+            P_out : float, outlet static pressure [Pa].
+            v_out : float, outlet velocity [m/s].
+
+    Raises:
+        ValueError : if A_in or A_out are non-positive, or Cd is outside [0, 1].
+    """
+    if A_in <= 0.0:
+        raise ValueError(
+            f"incompressible_changing_area: A_in must be positive (got {A_in})."
+        )
+    if A_out <= 0.0:
+        raise ValueError(
+            f"incompressible_changing_area: A_out must be positive (got {A_out})."
+        )
+    if not (0.0 <= Cd <= 1.0):
+        raise ValueError(
+            f"incompressible_changing_area: Cd must be in [0, 1] (got {Cd})."
+        )
+
+    v_out = v_in * (A_in / A_out)                          # continuity
+    dP    = 0.5 * rho * (v_in**2 - v_out**2) * Cd**2      # Bernoulli with loss
+    P_out = P_in + dP
+
+    return P_out, v_out
+
+
+def compressible_changing_area(P_in, T_in, Ma_in, A_in, A_out, abstract_state, Cd=1.0):
+    """Pressure and Mach-number correction for a compressible fluid passing
+    through a change in flow area, using isentropic flow relations.
+
+    Uses the isentropic area-Mach relation (NASA Glenn Eq #9) to find the
+    outlet Mach number that satisfies continuity on the same isentropic
+    curve, then recovers outlet static conditions from total-condition ratios
+    (NASA Glenn Eqs #6, #7).
+
+    The heat-capacity ratio gamma (isentropic exponent) is obtained from
+    the CoolProp AbstractState at the inlet conditions, making the result
+    consistent with the equation of state in use rather than assuming a
+    fixed gamma.
+
+    Area-Mach relation (isentropic, Eq #9 from NASA Glenn):
+
+        A / A* = (1/M) * {[2/(gamma+1)] * [1 + (gamma-1)/2 * M^2]}
+                         ^ [(gamma+1) / (2*(gamma-1))]
+
+    Total-condition ratios (Eqs #6, #7 from NASA Glenn):
+
+        P / P_total = [1 + (gamma-1)/2 * M^2] ^ [-gamma/(gamma-1)]
+        T / T_total = [1 + (gamma-1)/2 * M^2] ^ [-1]
+
+    The discharge coefficient Cd is applied as a total-pressure loss:
+
+        P_total_out = P_total_in * Cd
+
+    This is the standard compressible-flow interpretation of a discharge
+    coefficient: entropy is generated at the area change and the total
+    pressure is reduced by the factor Cd.  Cd = 1.0 gives a fully
+    isentropic transition; Cd = 0.0 is unphysical and is rejected.
+
+    The outlet Mach number is found by numerically solving the A/A* equation
+    for Ma_out using scipy.optimize.brentq.  The subsonic root is always
+    chosen here; supersonic flow through area changes is outside the scope
+    of this model (shocks would be needed).
+
+    Args:
+        P_in           : float, inlet static pressure [Pa].
+        T_in           : float, inlet static temperature [K].
+        Ma_in          : float, inlet Mach number (must be < 1).
+        A_in           : float, inlet flow area [m^2].
+        A_out          : float, outlet flow area [m^2].
+        abstract_state : CoolProp AbstractState, updated in-place at (P_in, T_in)
+                         to obtain gamma = Cp/Cv.  Must not be shared across threads.
+        Cd             : float, discharge coefficient applied as a total-pressure
+                         ratio (default 1.0 = isentropic).
+
+    Returns:
+        (P_out, T_out, Ma_out) -- tuple of floats.
+            P_out  : float, outlet static pressure [Pa].
+            T_out  : float, outlet static temperature [K].
+            Ma_out : float, outlet Mach number.
+
+    Raises:
+        ValueError   : if A_in or A_out are non-positive, Ma_in is outside
+                       (0, 1), or Cd is outside (0, 1].
+        RuntimeError : if the numerical solver fails to find a subsonic root.
+    """
+    from scipy.optimize import brentq
+
+    if A_in <= 0.0:
+        raise ValueError(
+            f"compressible_changing_area: A_in must be positive (got {A_in})."
+        )
+    if A_out <= 0.0:
+        raise ValueError(
+            f"compressible_changing_area: A_out must be positive (got {A_out})."
+        )
+    if not (0.0 < Ma_in < 1.0):
+        raise ValueError(
+            f"compressible_changing_area: Ma_in must be in (0, 1) for subsonic "
+            f"flow (got {Ma_in:.6f}).  Supersonic area changes are not supported."
+        )
+    if not (0.0 < Cd <= 1.0):
+        raise ValueError(
+            f"compressible_changing_area: Cd must be in (0, 1] (got {Cd})."
+        )
+
+    # ------------------------------------------------------------------
+    # Obtain gamma from CoolProp at inlet conditions.
+    # ------------------------------------------------------------------
+    AS = abstract_state
+    AS.update(CP.PT_INPUTS, P_in, T_in)
+    gamma = AS.cpmass() / AS.cvmass()     # isentropic exponent, dimensionless
+
+    # ------------------------------------------------------------------
+    # Isentropic area-Mach function  A/A* = f(M, gamma)
+    # NASA Glenn Eq #9.
+    # ------------------------------------------------------------------
+    exp_num = (gamma + 1.0) / (2.0 * (gamma - 1.0))  # exponent on bracket
+    def _area_ratio(M):
+        """Return A/A* for Mach number M."""
+        bracket = 1.0 + (gamma - 1.0) / 2.0 * M**2
+        coeff   = (2.0 / (gamma + 1.0)) * bracket
+        return (1.0 / M) * coeff**exp_num
+
+    # ------------------------------------------------------------------
+    # Total-condition ratios  (NASA Glenn Eqs #6, #7)
+    # P/P_t = [1 + (gamma-1)/2 * M^2]^[-gamma/(gamma-1)]
+    # T/T_t = [1 + (gamma-1)/2 * M^2]^[-1]
+    # ------------------------------------------------------------------
+    def _p_ratio(M):
+        return (1.0 + (gamma - 1.0) / 2.0 * M**2) ** (-(gamma / (gamma - 1.0)))
+
+    def _t_ratio(M):
+        return (1.0 + (gamma - 1.0) / 2.0 * M**2) ** (-1.0)
+
+    # ------------------------------------------------------------------
+    # Recover total conditions at inlet.
+    # ------------------------------------------------------------------
+    P_total_in = P_in / _p_ratio(Ma_in)
+    T_total_in = T_in / _t_ratio(Ma_in)
+
+    # ------------------------------------------------------------------
+    # Apply discharge coefficient as a total-pressure loss.
+    # ------------------------------------------------------------------
+    P_total_out = P_total_in * Cd
+    T_total_out = T_total_in          # total temperature is conserved (adiabatic)
+
+    # ------------------------------------------------------------------
+    # A/A* is conserved along an isentropic stream tube, so the outlet
+    # A/A* equals the inlet A/A* scaled by the area ratio A_out/A_in.
+    # ------------------------------------------------------------------
+    A_star_ratio_in  = _area_ratio(Ma_in)            # A_in  / A*
+    A_star_ratio_out = A_star_ratio_in * (A_out / A_in)  # A_out / A*
+
+    # ------------------------------------------------------------------
+    # Solve for subsonic Ma_out such that _area_ratio(Ma_out) == A_star_ratio_out.
+    # The subsonic branch is on (0, 1); brentq needs f(a) and f(b) to
+    # have opposite signs.  For A/A* >= 1 (always true for M < 1),
+    # the subsonic root always exists in (1e-9, 1-eps).
+    # ------------------------------------------------------------------
+    Ma_lo  = 1e-9
+    Ma_hi  = 1.0 - 1e-9
+
+    f_lo = _area_ratio(Ma_lo) - A_star_ratio_out
+    f_hi = _area_ratio(Ma_hi) - A_star_ratio_out
+
+    if f_lo * f_hi > 0.0:
+        raise RuntimeError(
+            f"compressible_changing_area: could not bracket a subsonic root for "
+            f"A/A*={A_star_ratio_out:.6f} (f_lo={f_lo:.4g}, f_hi={f_hi:.4g}).  "
+            f"Check that the area ratio is physically realizable."
+        )
+
+    Ma_out, solver_result = brentq(
+        lambda M: _area_ratio(M) - A_star_ratio_out,
+        Ma_lo, Ma_hi,
+        xtol=1e-10, rtol=1e-10,
+        full_output=True,
+    )
+
+    if not solver_result.converged:
+        raise RuntimeError(
+            f"compressible_changing_area: brentq solver did not converge "
+            f"(A/A*={A_star_ratio_out:.6f}, Ma_in={Ma_in:.6f})."
+        )
+
+    # ------------------------------------------------------------------
+    # Recover outlet static conditions from total conditions and Ma_out.
+    # ------------------------------------------------------------------
+    P_out = P_total_out * _p_ratio(Ma_out)
+    T_out = T_total_out * _t_ratio(Ma_out)
+
+    return P_out, T_out, Ma_out
+
+
+# ---------------------------------------------------------------------------
 # Compressible dL slice hydraulics
 # ---------------------------------------------------------------------------
 
@@ -1113,8 +1345,10 @@ def compressible_hydraulics_from_csv(
         # ------------------------------------------------------------------
         # Step through consecutive profile point pairs
         # ------------------------------------------------------------------
-        P_cur = P_in
-        T_cur = T_in
+        P_cur  = P_in
+        T_cur  = T_in
+        # Relative tolerance for detecting a flow-area change between slices.
+        _AREA_TOL = 1e-6
 
         for i in range(n_points - 1):
             dist_in,  elev_in,  D_h_in,  area_in  = profile[i]
@@ -1131,24 +1365,73 @@ def compressible_hydraulics_from_csv(
                 mdot=mdot,
                 dL=slice_dL,
                 dz=slice_dz,
-                D_h=D_h_in,        # hydraulic diameter at slice inlet. 
+                D_h=D_h_in,
                 roughness=roughness,
-                flow_area=area_in,  # flow area at slice inlet. Note that this program assumes perfect pressure/velocity recovery when the flow area changes between slices (no discharge coefficient)
+                flow_area=area_in,
                 isothermal=isothermal,
                 q_wall=q_wall,
             )
-            # S_cur = S_out
-            P_cur = result["P_out"]
-            T_cur = result["T_out"]
+
+            P_cur  = result["P_out"]
+            T_cur  = result["T_out"]
+            Ma_cur = result["Ma_out"]
+            v_cur  = result["v_out"]
+
+            # ------------------------------------------------------------------
+            # Area-change correction at the transition to the next slice.
+            # If the flow area changes between this slice and the next, apply
+            # the appropriate area-change function before handing off P and T
+            # to the next iteration.  The area_out value belongs to the next
+            # profile segment, so the correction is applied at the outlet of
+            # the current slice (i.e., at distance dist_out).
+            #
+            # Phase check: liquids use Bernoulli (incompressible_changing_area);
+            # gases and supercritical fluids use isentropic relations
+            # (compressible_changing_area).
+            # abstract_state was last updated inside compressible_hydraulics()
+            # at (P_cur, T_cur), so AS.phase() is valid here.
+            # ------------------------------------------------------------------
+            area_ratio = abs(area_out - area_in) / max(area_in, area_out)
+            if area_ratio > _AREA_TOL:
+                phase_cur = AS.phase()
+                if phase_cur == _CP_PHASE_LIQUID:
+                    # Incompressible Bernoulli correction.
+                    rho_cur = AS.rhomass()
+                    P_cur, v_cur = incompressible_changing_area(
+                        P_in=P_cur,
+                        v_in=v_cur,
+                        rho=rho_cur,
+                        A_in=area_in,
+                        A_out=area_out,
+                        Cd=1.0,
+                    )
+                    # Ma is not tracked for liquid mode; set to 0 as placeholder.
+                    Ma_cur = 0.0
+                else:
+                    # Compressible isentropic correction.
+                    P_cur, T_cur, Ma_cur = compressible_changing_area(
+                        P_in=P_cur,
+                        T_in=T_cur,
+                        Ma_in=Ma_cur,
+                        A_in=area_in,
+                        A_out=area_out,
+                        abstract_state=AS,
+                        Cd=1.0,
+                    )
+                    # Recompute velocity from updated Ma and abstract state.
+                    AS.update(CP.PT_INPUTS, P_cur, T_cur)
+                    rho_cur = AS.rhomass()
+                    a_cur   = AS.speed_sound()
+                    v_cur   = Ma_cur * a_cur
 
             writer.writerow([
                 i + 1,
-                f"{_convert_comp_output(dist_out,          'dist', uspec):.4f}",
-                f"{_convert_comp_output(elev_out,          'elev', uspec):.4f}",
-                f"{_convert_comp_output(P_cur,             'P',    uspec):.4f}",
-                f"{_convert_comp_output(T_cur,             'T',    uspec):.4f}",
-                f"{_convert_comp_output(result['v_out'],   'v',    uspec):.4f}",
-                f"{result['Ma_out']:.6f}",
+                f"{_convert_comp_output(dist_out,  'dist', uspec):.4f}",
+                f"{_convert_comp_output(elev_out,  'elev', uspec):.4f}",
+                f"{_convert_comp_output(P_cur,     'P',    uspec):.4f}",
+                f"{_convert_comp_output(T_cur,     'T',    uspec):.4f}",
+                f"{_convert_comp_output(v_cur,     'v',    uspec):.4f}",
+                f"{Ma_cur:.6f}",
                 f"{result['q_wall_actual']:.4f}",
                 f"{result['S_out']:.6f}",
             ])
@@ -1254,10 +1537,6 @@ def test_comp_hydraulics():
     )
 
     print(result_g)
-
-def incompressible_changing_area(P_in, v_in, A_in, A_out):
-
-    return P_out, v_out
 
 
 def test_compressible_slices():
@@ -1412,30 +1691,30 @@ def test_comp_csv_profile():
     # A_pipe   = math.pi * D_pipe**2 / 4.0                        # m^2
 
     # Inlet conditions.
-    P_in = ureg.Quantity(100.0, "psi").to("Pa").magnitude   # Pa
+    P_in = ureg.Quantity(1000.0, "psi").to("Pa").magnitude   # Pa
     T_in = ureg.Quantity(60.0, "degF").to("degK").magnitude                                            # K
 
     # Flow rate
-    # Q_scfd = ureg.Quantity(1, "mmscf/day")
-    Vdot = ureg.Quantity(4000, "oil_bbl/day")
+    Q_scfd = ureg.Quantity(100, "mmscf/day")
+    # Vdot = ureg.Quantity(25000, "oil_bbl/day")
 
     AS = composition.define_composition(
-        y_Methane = 0.0,
-        y_Ethane = 0.0,
-        y_Propane=0.0,
+        y_Methane = 0.9,
+        y_Ethane = 0.08,
+        y_Propane=0.01,
         y_n_Butane = 0.0,
-        y_CarbonDioxide= 0.0,
+        y_CarbonDioxide= 0.01,
         y_n_Decane= 0.0,
-        y_Water = 1,
+        y_Water = 0.0,
         eos = "HEOS"
         )
     AS.update(CP.PT_INPUTS, P_in, T_in)
-
-    mdot = Vdot.to("m^3/s").magnitude * AS.rhomass()          # kg/s
+    mdot = Q_scfd.to("mol/s").magnitude * AS.molar_mass()     #mol/s * kg/mol = kg/s
+    # mdot = Vdot.to("m^3/s").magnitude * AS.rhomass()          # kg/s
 
     compressible_hydraulics_from_csv(
         csv_path="testprofile_short.csv",
-        output_csv_path="testprofile_short_results.csv",
+        output_csv_path="testprofile_results_short_fixed.csv",
         abstract_state=AS,
         P_in=P_in,
         T_in=T_in,
