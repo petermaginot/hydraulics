@@ -256,8 +256,8 @@ def mass_flow_rate():
 
 def calc_viscosity():
     AS = define_composition(
-        y_Methane         = 0.0,
-        y_Ethane          = 0.0,
+        y_Methane         = 0.95,
+        y_Ethane          = 0.05,
         y_Propane         = 0.0,
         y_n_Butane        = 0.0,
         y_IsoButane       = 0.0,
@@ -270,7 +270,7 @@ def calc_viscosity():
         y_n_Decane        = 0.0,
         y_Benzene         = 0.0,
         y_CarbonDioxide   = 0.0,
-        y_Water           = 0.1,
+        y_Water           = 0.0,
         y_Nitrogen        = 0.0,
         y_Oxygen          = 0.0,
         y_Argon           = 0.0,
@@ -279,12 +279,13 @@ def calc_viscosity():
         eos = "HEOS")
     
     T_in = ureg.Quantity(60, "degF").to("degK").magnitude
-    P_in = ureg.Quantity(60, "psi").to("Pa").magnitude
+    P_in = ureg.Quantity(10000, "psi").to("Pa").magnitude
 
     AS.update(CP.PT_INPUTS, P_in, T_in)
 
-    print(ureg.Quantity(AS.viscosity(), "Pa*s").to("cP"))
+    print(AS.cpmass())
     print(ureg.Quantity(AS.rhomass(), "kg/m^3"))
+    print(AS.rhomolar())
 
 if __name__ == "__main__":
     calc_viscosity()
