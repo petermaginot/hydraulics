@@ -196,4 +196,4 @@ if __name__ == "__main__":
     # _n       = int(sys.argv[2])
     # _output  = sys.argv[3] if len(sys.argv) >= 4 else None
 
-    interpolate_profile_csv("Example_Well_Survey2.csv", 9, "Example_Well_Survey2_interp.csv")
+    interpolate_profile_csv("Example_Well_Survey.csv", 5, "Example_Well_Survey_interp5.csv")
