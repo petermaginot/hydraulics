@@ -1,4 +1,4 @@
-ID,Measured depth (m),TVD (m),D_h,Flow area,Temperature (K)
+ID,distance,elevation,D_h,flow_area,Temperature (K)
 ,0,-3849.111936,0.118618,0.011050733,437.3535556
 ,32.004,-3845.149536,0.118618,0.011050733,437.2091111
 ,60.96,-3836.919936,0.118618,0.011050733,436.9091111
