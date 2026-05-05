@@ -5,6 +5,7 @@ import warnings
 from pint import UnitRegistry
 from fluids.friction import friction_factor as fluids_friction_factor
 from fluids.core import Reynolds as fluids_Reynolds
+import fluids.fittings
 import CoolProp.CoolProp as CP
 from CoolProp.CoolProp import AbstractState
 import composition
@@ -53,12 +54,305 @@ ureg.define(f'mmscf = {1e6/_V_scf}*  mol ')
 
 
 
+class Line_Segment(Base_Line_Segment):
+    """Pipe segment with compressible-flow pressure and temperature calculation.
+
+    Inherits geometry storage, CSV loading, and convenience properties from
+    Base_Line_Segment.  Adds dP_dT() for compressible flow, stepping through
+    consecutive profile slices via compressible_hydraulics() and applying
+    isentropic area-change corrections at inter-slice boundaries.
+
+    Constructor arguments and behavior are identical to Base_Line_Segment.
+    See Base_Line_Segment for full argument documentation.
+    """
+
+    def dP_dT(
+        self,
+        abstract_state,
+        flow_rate,
+        P0,
+        T0,
+        isothermal=False,
+        q_wall=0.0,
+    ):
+        """Calculate outlet pressure and temperature for compressible flow
+        through the segment.
+
+        Steps through consecutive profile point pairs, calling
+        compressible_hydraulics() for each slice and applying isentropic
+        area-change corrections at boundaries where the flow area changes.
+
+        Heat input q_wall is distributed uniformly per unit pipe length across
+        all slices.
+
+        Args:
+            abstract_state : CoolProp AbstractState pre-configured for the
+                             working fluid.  Updated in-place during
+                             integration; must not be shared across threads.
+            flow_rate      : pint Quantity -- mass ([mass]/[time]), molar or
+                             standard-volume ([substance]/[time], e.g. mol/s,
+                             mmscf/day), or actual volumetric
+                             ([length]^3/[time]) flow rate.
+            P0             : float, inlet static pressure [Pa].
+            T0             : float, inlet static temperature [K].
+            isothermal     : bool, if True temperature is held constant
+                             through each slice.  Default False.
+            q_wall         : float, total heat input to the fluid over the
+                             entire segment [W].  Distributed uniformly per
+                             unit length.  Ignored when isothermal=True.
+                             Default 0.0 (adiabatic).
+
+        Returns:
+            (P_out, T_out) : tuple of floats [Pa, K].
+
+        Raises:
+            ValueError   : if the profile has fewer than two points or
+                           flow_rate dimensions are unrecognized.
+            RuntimeError : if two-phase conditions, choked flow, or a
+                           CoolProp failure occur during integration.
+        """
+        if len(self.profile) < 2:
+            raise ValueError(
+                "Line_Segment.dP_dT: profile must have at least two points."
+            )
+
+        AS = abstract_state
+        T_cric, P_bar, T_c, P_c = _build_phase_limits(AS)
+        _safe_update_PT(AS, P0, T0, T_cric, P_bar, T_c, P_c)
+        mdot = _resolve_mdot(flow_rate, AS)
+
+        total_length  = self.total_length_m
+        q_per_length  = q_wall / total_length if total_length > 0.0 else 0.0
+
+        _AREA_TOL = 1e-6   # fractional area-change threshold
+        n     = len(self.profile)
+        P_cur = P0
+        T_cur = T0
+
+        for i in range(n - 1):
+
+            dist_in,  elev_in,  D_h_in,  area_in  = self.profile[i]
+            dist_out, elev_out, D_h_out, area_out = self.profile[i + 1]
+
+            dL      = dist_out - dist_in   # m, along-pipe slice length
+            dz      = elev_out - elev_in   # m, elevation rise (positive = uphill)
+            q_slice = q_per_length * dL    # W, heat for this slice
+
+            compressible_hydraulics2(
+                abstract_state=AS,
+                mdot=mdot,
+                dL=dL,
+                dz=dz,
+                D_h=D_h_in,
+                roughness=self.roughness_si,
+                flow_area=area_in,
+                isothermal=isothermal,
+                q_wall=q_slice,
+                T_cricondentherm=T_cric,
+                P_cricondenbar=P_bar,
+                T_critical=T_c,
+                P_critical=P_c,
+            )
+
+            P_cur   = AS.p()
+            T_cur   = AS.T()
+            rho_cur = AS.rhomass()
+            a_cur   = AS.speed_sound()
+            v_cur   = mdot / (rho_cur * area_in)
+            Ma_cur  = v_cur / a_cur
+
+            # Area-change correction at the boundary to the next slice.
+            area_ratio = abs(area_out - area_in) / max(area_in, area_out)
+            if area_ratio > _AREA_TOL:
+                AS = compressible_changing_area_K(
+                    AS, mdot, area_in, area_out, K=0.0
+                ) #is it necessary to set AS = compressible_changing_area_K since the abstract state is updated in place?
+            print(f" Step: {i+1} of {n-1}, P = {P_cur}, T = {T_cur}")
+            # print(f" Step: {i+1} of {n-1}, P = {P_cur}, T = {T_cur}", end="\r")               
+        print(f"")
+        return P_cur, T_cur
+
+
+class Bend(Base_Bend):
+    """Rounded pipe bend fitting with compressible pressure/temperature
+    calculation.
+
+    Modeled as adiabatic.  Inherits geometry storage and validation from
+    Base_Bend.  The dP_dT() method is not yet implemented.
+
+    Constructor arguments are identical to Base_Bend:
+        Di        : pint Quantity or float (m if float).  Pipe inner diameter.
+        ang_deg   : float.  Bend angle [degrees].
+        bend_dias : float.  Bend radius as a multiple of Di.
+    """
+
+    def dP_dT(self, abstract_state, flow_rate, P0, T0):
+        """Outlet pressure and temperature through the bend [Pa, K].
+
+        Args:
+            abstract_state : CoolProp AbstractState instance.
+            flow_rate      : pint Quantity -- mass, molar, or volumetric flow.
+            P0             : float, inlet static pressure [Pa].
+            T0             : float, inlet static temperature [K].
+
+        Returns:
+            (P_out, T_out) : tuple of floats [Pa, K].
+
+        Raises:
+            NotImplementedError : always (not yet implemented).
+        """
+        raise NotImplementedError(
+            "Bend.dP_dT is not yet implemented for compressible flow."
+        )
+
+
+class Contraction_Expansion(Base_Contraction_Expansion):
+    """Abrupt contraction or expansion with compressible pressure/temperature
+    calculation.
+
+    Modeled as adiabatic.  Inherits geometry storage and validation from
+    Base_Contraction_Expansion.  The dP_dT() method is not yet implemented.
+
+    Constructor arguments are identical to Base_Contraction_Expansion:
+        Di_US : pint Quantity or float (m if float).  Upstream inner diameter.
+        Di_DS : pint Quantity or float (m if float).  Downstream inner diameter.
+    """
+
+    def dP_dT(self, abstract_state, flow_rate):
+        """Outlet abstract state for a compressible fluid passing through the
+        contraction/expansion.
+
+        The caller must update abstract_state to the inlet (P, T) conditions
+        before calling.
+
+        Uses fluids.fittings.contraction_sharp() or diffuser_sharp() to obtain
+        the K-factor, then calls compressible_changing_area_K() with that K
+        referenced to the upstream (inlet) velocity head.
+
+        Args:
+            abstract_state : CoolProp AbstractState instance, pre-updated to
+                             inlet (P, T) by the caller.  Updated in-place on
+                             return to outlet conditions.
+            flow_rate      : pint Quantity -- mass, molar, or volumetric flow.
+
+        Returns:
+            abstract_state updated to outlet (P, T) conditions.
+        """
+        AS   = abstract_state
+        mdot = _resolve_mdot(flow_rate, AS)
+
+        Di_US = self.Di_US_si
+        Di_DS = self.Di_DS_si
+
+        if abs(Di_US - Di_DS) < 1e-12:
+            return AS
+
+        A_US = math.pi * Di_US ** 2 / 4.0
+        A_DS = math.pi * Di_DS ** 2 / 4.0
+
+        if Di_US > Di_DS:
+            # Contraction: fluids returns K w.r.t. downstream; convert to upstream.
+            K_ds = fluids.fittings.contraction_sharp(Di1=Di_US, Di2=Di_DS)
+            K    = K_ds * (A_DS / A_US) ** 2
+        else:
+            # Expansion: fluids returns K w.r.t. upstream velocity directly.
+            K = fluids.fittings.diffuser_sharp(Di1=Di_US, Di2=Di_DS)
+
+        return compressible_changing_area_K(AS, mdot, A_US, A_DS, K)
 
 
 # ---------------------------------------------------------------------------
-# Hydraulics calculation
+# Flow-rate helper
 # ---------------------------------------------------------------------------
 
+def _resolve_mdot(flow_rate, abstract_state):
+    """Convert a pint Quantity flow rate to mass flow rate [kg/s].
+
+    Accepts:
+      - Mass flow:           [mass]/[time]        e.g. kg/s, lb/hr
+      - Molar / std-volume:  [substance]/[time]   e.g. mol/s, scf/day, mmscf/day
+        Standard-volume units (scf, mmscf, scm) are defined as mol equivalents
+        in the unit registry, so they fall into this branch automatically.
+      - Actual volumetric:   [length]^3/[time]    e.g. m^3/s, ft^3/min
+        Requires abstract_state to be updated to the relevant (P, T) so that
+        rhomass() returns the correct in-situ density.
+
+    Args:
+        flow_rate      : pint Quantity.
+        abstract_state : CoolProp AbstractState, used for molar_mass() or
+                         rhomass() when the input is not already in kg/s.
+
+    Returns:
+        float, mass flow rate [kg/s].
+
+    Raises:
+        ValueError : if the dimensionality of flow_rate is not recognized.
+    """
+    dim = flow_rate.dimensionality
+    if dim == {"[mass]": 1, "[time]": -1}:
+        return flow_rate.to("kg/s").magnitude
+    elif dim == {"[substance]": 1, "[time]": -1}:
+        return flow_rate.to("mol/s").magnitude * abstract_state.molar_mass()
+    elif dim == {"[length]": 3, "[time]": -1}:
+        rho = abstract_state.rhomass()
+        return flow_rate.to("m^3/s").magnitude * rho
+    else:
+        raise ValueError(
+            f"flow_rate has unrecognized dimensions {dict(dim)}.  "
+            "Expected [mass]/[time] (kg/s, …), [substance]/[time] (mol/s, "
+            "scf/day, mmscf/day, …), or [length]^3/[time] (m^3/s, …)."
+        )
+
+
+# ---------------------------------------------------------------------------
+# Compressible component classes
+# ---------------------------------------------------------------------------
+
+# Unit-system definitions for compressible profile export.
+# Each entry maps a system name to conversion factors and column header labels.
+# Conversions are applied as: output_value = SI_value * factor  (except
+# temperature, which uses an offset conversion via pint).
+_COMP_OUTPUT_UNITS = {
+    "US_Common": {
+        "dist_label":    "distance_ft",
+        "elev_label":    "elevation_ft",
+        "P_label":       "P_psia",
+        "T_label":       "T_degF",
+        "v_label":       "v_fps",
+        "q_wall_label":  "q_wall_W",      #  watts -- TODO should change this to btu/hr
+        "dist_unit":     "ft",
+        "elev_unit":     "ft",
+        "P_unit":        "psi",
+        "T_unit":        "degF",
+        "v_unit":        "ft/s",
+    },
+    "SI": {
+        "dist_label":    "distance_m",
+        "elev_label":    "elevation_m",
+        "P_label":       "P_Pa",
+        "T_label":       "T_K",
+        "v_label":       "v_ms",
+        "q_wall_label":  "q_wall_W",
+        "dist_unit":     "m",
+        "elev_unit":     "m",
+        "P_unit":        "Pa",
+        "T_unit":        "K",
+        "v_unit":        "m/s",
+    },
+    "metric": {
+        "dist_label":    "distance_m",
+        "elev_label":    "elevation_m",
+        "P_label":       "P_kPa",
+        "T_label":       "T_degC",
+        "v_label":       "v_ms",
+        "q_wall_label":  "q_wall_W",
+        "dist_unit":     "m",
+        "elev_unit":     "m",
+        "P_unit":        "kPa",
+        "T_unit":        "degC",
+        "v_unit":        "m/s",
+    },
+}
 
 def viscosity_LGE(T, mol_wt, density):
     """
@@ -455,294 +749,6 @@ def compressible_changing_area_K(abstract_state, mdot, A_in, A_out, K):
     return AS
 
 
-# ---------------------------------------------------------------------------
-# Compressible ODE right-hand side
-# ---------------------------------------------------------------------------
-
-
-# ---------------------------------------------------------------------------
-# Flow-rate helper
-# ---------------------------------------------------------------------------
-
-def _resolve_mdot(flow_rate, abstract_state):
-    """Convert a pint Quantity flow rate to mass flow rate [kg/s].
-
-    Accepts:
-      - Mass flow:           [mass]/[time]        e.g. kg/s, lb/hr
-      - Molar / std-volume:  [substance]/[time]   e.g. mol/s, scf/day, mmscf/day
-        Standard-volume units (scf, mmscf, scm) are defined as mol equivalents
-        in the unit registry, so they fall into this branch automatically.
-      - Actual volumetric:   [length]^3/[time]    e.g. m^3/s, ft^3/min
-        Requires abstract_state to be updated to the relevant (P, T) so that
-        rhomass() returns the correct in-situ density.
-
-    Args:
-        flow_rate      : pint Quantity.
-        abstract_state : CoolProp AbstractState, used for molar_mass() or
-                         rhomass() when the input is not already in kg/s.
-
-    Returns:
-        float, mass flow rate [kg/s].
-
-    Raises:
-        ValueError : if the dimensionality of flow_rate is not recognized.
-    """
-    dim = flow_rate.dimensionality
-    if dim == {"[mass]": 1, "[time]": -1}:
-        return flow_rate.to("kg/s").magnitude
-    elif dim == {"[substance]": 1, "[time]": -1}:
-        return flow_rate.to("mol/s").magnitude * abstract_state.molar_mass()
-    elif dim == {"[length]": 3, "[time]": -1}:
-        rho = abstract_state.rhomass()
-        return flow_rate.to("m^3/s").magnitude * rho
-    else:
-        raise ValueError(
-            f"flow_rate has unrecognized dimensions {dict(dim)}.  "
-            "Expected [mass]/[time] (kg/s, …), [substance]/[time] (mol/s, "
-            "scf/day, mmscf/day, …), or [length]^3/[time] (m^3/s, …)."
-        )
-
-
-# ---------------------------------------------------------------------------
-# Compressible component classes
-# ---------------------------------------------------------------------------
-
-class Line_Segment(Base_Line_Segment):
-    """Pipe segment with compressible-flow pressure and temperature calculation.
-
-    Inherits geometry storage, CSV loading, and convenience properties from
-    Base_Line_Segment.  Adds dP_dT() for compressible flow, stepping through
-    consecutive profile slices via compressible_hydraulics() and applying
-    isentropic area-change corrections at inter-slice boundaries.
-
-    Constructor arguments and behavior are identical to Base_Line_Segment.
-    See Base_Line_Segment for full argument documentation.
-    """
-
-    def dP_dT(
-        self,
-        abstract_state,
-        flow_rate,
-        P0,
-        T0,
-        isothermal=False,
-        q_wall=0.0,
-    ):
-        """Calculate outlet pressure and temperature for compressible flow
-        through the segment.
-
-        Steps through consecutive profile point pairs, calling
-        compressible_hydraulics() for each slice and applying isentropic
-        area-change corrections at boundaries where the flow area changes.
-
-        Heat input q_wall is distributed uniformly per unit pipe length across
-        all slices.
-
-        Args:
-            abstract_state : CoolProp AbstractState pre-configured for the
-                             working fluid.  Updated in-place during
-                             integration; must not be shared across threads.
-            flow_rate      : pint Quantity -- mass ([mass]/[time]), molar or
-                             standard-volume ([substance]/[time], e.g. mol/s,
-                             mmscf/day), or actual volumetric
-                             ([length]^3/[time]) flow rate.
-            P0             : float, inlet static pressure [Pa].
-            T0             : float, inlet static temperature [K].
-            isothermal     : bool, if True temperature is held constant
-                             through each slice.  Default False.
-            q_wall         : float, total heat input to the fluid over the
-                             entire segment [W].  Distributed uniformly per
-                             unit length.  Ignored when isothermal=True.
-                             Default 0.0 (adiabatic).
-
-        Returns:
-            (P_out, T_out) : tuple of floats [Pa, K].
-
-        Raises:
-            ValueError   : if the profile has fewer than two points or
-                           flow_rate dimensions are unrecognized.
-            RuntimeError : if two-phase conditions, choked flow, or a
-                           CoolProp failure occur during integration.
-        """
-        if len(self.profile) < 2:
-            raise ValueError(
-                "Line_Segment.dP_dT: profile must have at least two points."
-            )
-
-        AS = abstract_state
-        T_cric, P_bar, T_c, P_c = _build_phase_limits(AS)
-        _safe_update_PT(AS, P0, T0, T_cric, P_bar, T_c, P_c)
-        mdot = _resolve_mdot(flow_rate, AS)
-
-        total_length  = self.total_length_m
-        q_per_length  = q_wall / total_length if total_length > 0.0 else 0.0
-
-        _AREA_TOL = 1e-6   # fractional area-change threshold
-        n     = len(self.profile)
-        P_cur = P0
-        T_cur = T0
-
-        for i in range(n - 1):
-
-            dist_in,  elev_in,  D_h_in,  area_in  = self.profile[i]
-            dist_out, elev_out, D_h_out, area_out = self.profile[i + 1]
-
-            dL      = dist_out - dist_in   # m, along-pipe slice length
-            dz      = elev_out - elev_in   # m, elevation rise (positive = uphill)
-            q_slice = q_per_length * dL    # W, heat for this slice
-
-            compressible_hydraulics2(
-                abstract_state=AS,
-                mdot=mdot,
-                dL=dL,
-                dz=dz,
-                D_h=D_h_in,
-                roughness=self.roughness_si,
-                flow_area=area_in,
-                isothermal=isothermal,
-                q_wall=q_slice,
-                T_cricondentherm=T_cric,
-                P_cricondenbar=P_bar,
-                T_critical=T_c,
-                P_critical=P_c,
-            )
-
-            P_cur   = AS.p()
-            T_cur   = AS.T()
-            rho_cur = AS.rhomass()
-            a_cur   = AS.speed_sound()
-            v_cur   = mdot / (rho_cur * area_in)
-            Ma_cur  = v_cur / a_cur
-
-            # Area-change correction at the boundary to the next slice.
-            area_ratio = abs(area_out - area_in) / max(area_in, area_out)
-            if area_ratio > _AREA_TOL:
-                AS = compressible_changing_area_K(
-                    AS, mdot, area_in, area_out, K=0.0
-                ) #is it necessary to set AS = compressible_changing_area_K since the abstract state is updated in place?
-            print(f" Step: {i+1} of {n-1}, P = {P_cur}, T = {T_cur}")
-            # print(f" Step: {i+1} of {n-1}, P = {P_cur}, T = {T_cur}", end="\r")               
-        print(f"")
-        return P_cur, T_cur
-
-
-class Bend(Base_Bend):
-    """Rounded pipe bend fitting with compressible pressure/temperature
-    calculation.
-
-    Modeled as adiabatic.  Inherits geometry storage and validation from
-    Base_Bend.  The dP_dT() method is not yet implemented.
-
-    Constructor arguments are identical to Base_Bend:
-        Di        : pint Quantity or float (m if float).  Pipe inner diameter.
-        ang_deg   : float.  Bend angle [degrees].
-        bend_dias : float.  Bend radius as a multiple of Di.
-    """
-
-    def dP_dT(self, abstract_state, flow_rate, P0, T0):
-        """Outlet pressure and temperature through the bend [Pa, K].
-
-        Args:
-            abstract_state : CoolProp AbstractState instance.
-            flow_rate      : pint Quantity -- mass, molar, or volumetric flow.
-            P0             : float, inlet static pressure [Pa].
-            T0             : float, inlet static temperature [K].
-
-        Returns:
-            (P_out, T_out) : tuple of floats [Pa, K].
-
-        Raises:
-            NotImplementedError : always (not yet implemented).
-        """
-        raise NotImplementedError(
-            "Bend.dP_dT is not yet implemented for compressible flow."
-        )
-
-
-class Contraction_Expansion(Base_Contraction_Expansion):
-    """Abrupt contraction or expansion with compressible pressure/temperature
-    calculation.
-
-    Modeled as adiabatic.  Inherits geometry storage and validation from
-    Base_Contraction_Expansion.  The dP_dT() method is not yet implemented.
-
-    Constructor arguments are identical to Base_Contraction_Expansion:
-        Di_US : pint Quantity or float (m if float).  Upstream inner diameter.
-        Di_DS : pint Quantity or float (m if float).  Downstream inner diameter.
-    """
-
-    def dP_dT(self, abstract_state, flow_rate, P0, T0):
-        """Outlet pressure and temperature through the contraction/expansion
-        [Pa, K].
-
-        Args:
-            abstract_state : CoolProp AbstractState instance.
-            flow_rate      : pint Quantity -- mass, molar, or volumetric flow.
-            P0             : float, inlet static pressure [Pa].
-            T0             : float, inlet static temperature [K].
-
-        Returns:
-            (P_out, T_out) : tuple of floats [Pa, K].
-
-        Raises:
-            NotImplementedError : always (not yet implemented).
-        """
-        raise NotImplementedError(
-            "Contraction_Expansion.dP_dT is not yet implemented for "
-            "compressible flow."
-        )
-
-
-# ---------------------------------------------------------------------------
-# Compressible profile CSV runner
-# ---------------------------------------------------------------------------
-
-# Unit-system definitions for compressible profile export.
-# Each entry maps a system name to conversion factors and column header labels.
-# Conversions are applied as: output_value = SI_value * factor  (except
-# temperature, which uses an offset conversion via pint).
-_COMP_OUTPUT_UNITS = {
-    "US_Common": {
-        "dist_label":    "distance_ft",
-        "elev_label":    "elevation_ft",
-        "P_label":       "P_psia",
-        "T_label":       "T_degF",
-        "v_label":       "v_fps",
-        "q_wall_label":  "q_wall_W",      #  watts -- TODO should change this to btu/hr
-        "dist_unit":     "ft",
-        "elev_unit":     "ft",
-        "P_unit":        "psi",
-        "T_unit":        "degF",
-        "v_unit":        "ft/s",
-    },
-    "SI": {
-        "dist_label":    "distance_m",
-        "elev_label":    "elevation_m",
-        "P_label":       "P_Pa",
-        "T_label":       "T_K",
-        "v_label":       "v_ms",
-        "q_wall_label":  "q_wall_W",
-        "dist_unit":     "m",
-        "elev_unit":     "m",
-        "P_unit":        "Pa",
-        "T_unit":        "K",
-        "v_unit":        "m/s",
-    },
-    "metric": {
-        "dist_label":    "distance_m",
-        "elev_label":    "elevation_m",
-        "P_label":       "P_kPa",
-        "T_label":       "T_degC",
-        "v_label":       "v_ms",
-        "q_wall_label":  "q_wall_W",
-        "dist_unit":     "m",
-        "elev_unit":     "m",
-        "P_unit":        "kPa",
-        "T_unit":        "degC",
-        "v_unit":        "m/s",
-    },
-}
-
 def compressible_hydraulics2(
     abstract_state,
     mdot,
@@ -1070,14 +1076,14 @@ def test_line_segment_csv():
 
     P_in = ureg.Quantity(9000, "psi").to("Pa").magnitude
     T_in = 437.0   # K
-    Q_scfd = ureg.Quantity(27.0, "mmscf/day")
+    Q_scfd = ureg.Quantity(25.6, "mmscf/day")
 
     AS = composition.define_composition(
         y_Methane = 0.95,
         y_Ethane = 0.05,
-        # y_Propane=0.02,
-        # y_n_Butane = 0.01,
-        # y_CarbonDioxide= 0.02,
+        y_Propane=0.02,
+        y_n_Butane = 0.01,
+        y_CarbonDioxide= 0.02,
         eos = "HEOS"
     )
     AS.update(CP.PT_INPUTS, P_in, T_in)
@@ -1214,11 +1220,37 @@ def test_twophase():
     compressibility_factor = AS_g.compressibility_factor()
     print(f'Z: {compressibility_factor}')
 
+def test_contract_expand():
+    D_small = ureg.Quantity(3.826, "in")
+    D_large = ureg.Quantity(4.026, "in")
+    contraction_test = Contraction_Expansion(Di_US=D_large, Di_DS= D_small)
+    expansion_test = Contraction_Expansion(Di_US=D_small, Di_DS= D_large)
+    P_in = ureg.Quantity(1000, "psi").to("Pa").magnitude
+    T_in = 300.0   # K
+    Q_scfd = ureg.Quantity(60, "mmscf/day")
+    print(f'Inlet P:{P_in}, T:{T_in}')
+    AS = composition.define_composition(
+        y_Methane = 0.95,
+        y_Ethane = 0.05,
+        y_Propane=0.02,
+        y_n_Butane = 0.01,
+        y_CarbonDioxide= 0.02,
+        eos = "HEOS"
+    )
+    AS.update(CP.PT_INPUTS, P_in, T_in)
+
+    AS = contraction_test.dP_dT(AS, Q_scfd)
+    print(f'After contraction P:{AS.p()}, T:{AS.T()}')
+    AS = expansion_test.dP_dT(AS, Q_scfd)
+    print(f'After expansion P:{AS.p()}, T:{AS.T()}')
+
+
 if __name__ == "__main__":
+    test_contract_expand()
     # test_twophase()
     # phase_env()
     # testasdf()
-    test_line_segment_csv()
+    # test_line_segment_csv()
     #test_p2p()
     # test_comp_hydraulics()
     # test_compressible_slices()
