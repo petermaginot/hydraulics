@@ -1,3 +1,81 @@
+"""compressible.py
+
+Single-phase Compressible (gas) pipeline hydraulics.
+
+This module provides component classes and helper functions for computing
+pressure and temperature profiles along gas pipelines.  CoolProp AbstractState
+objects are used throughout for real-gas equation-of-state calculations, so
+any fluid or mixture supported by CoolProp can be used without modification.
+
+The component classes (Line_Segment, Bend, Contraction_Expansion) inherit
+geometry storage and CSV-loading logic from the base classes in
+component_classes.py, adding compressible-flow dP_dT() methods that update a
+CoolProp AbstractState in-place as conditions evolve along the pipe.
+
+Classes
+-------
+Line_Segment  (inherits Base_Line_Segment)
+    Adds dP_dT() for compressible flow.  Steps through consecutive profile
+    point pairs via compressible_hydraulics2(), applying isentropic
+    area-change corrections at inter-slice boundaries.  Returns the outlet
+    AbstractState together with a list of (distance, pressure, temperature,
+    velocity) tuples for profile plotting.
+
+Bend  (inherits Base_Bend)
+    Adds dP_dT() using fluids.fittings.bend_rounded() to obtain K, then
+    delegates to compressible_K().
+
+Contraction_Expansion  (inherits Base_Contraction_Expansion)
+    Adds dP_dT() using fluids.fittings.contraction_sharp() or
+    diffuser_sharp() to obtain K, then delegates to
+    compressible_changing_area_K().
+
+Module-level functions
+----------------------
+_resolve_mdot(flow_rate, abstract_state)
+    Convert a pint Quantity flow rate (mass, molar, standard-volume, or
+    actual volumetric) to mass flow rate [kg/s].
+
+viscosity_LGE(T, mol_wt, density)
+    Lee-Gonzalez-Eakin correlation for hydrocarbon gas viscosity.  Used as
+    a fallback when the chosen equation of state does not support viscosity
+    (e.g. Peng-Robinson).
+
+_build_phase_limits(AS)
+    Build the phase envelope on a scratch AbstractState and return
+    (T_cricondentherm, P_cricondenbar, T_critical, P_critical).
+
+_safe_update_PT(AS, P, T, ...)
+    Call AS.update(PT_INPUTS, P, T) with an explicit phase hint when the
+    state is determinably outside the two-phase region, bypassing CoolProp's
+    internal phase-stability analysis to avoid false two-phase detection.
+
+compressible_changing_area(abstract_state, mdot, A_in, A_out)
+    Isentropic pressure and temperature correction for a compressible fluid
+    passing through a change in flow area.  Uses the area-Mach relation to
+    find the subsonic outlet Mach number, then recovers static conditions
+    from total-condition ratios.
+
+compressible_changing_area_K(abstract_state, mdot, A_in, A_out, K)
+    Outlet conditions for an area change with a known loss coefficient K.
+    Solves the simultaneous stagnation-enthalpy and entropy-generation
+    balance equations via scipy.optimize.root, using the isentropic result
+    as the initial guess.
+
+compressible_K(abstract_state, mdot, flow_area, K)
+    Outlet conditions for a constant-area fitting with a known loss
+    coefficient K.  Applies a single-step analytical result from the
+    combined energy, continuity, entropy, and EOS derivation, then corrects
+    temperature to satisfy the stagnation-enthalpy balance.
+
+compressible_hydraulics2(abstract_state, mdot, dL, dz, D_h, roughness,
+                          flow_area, ...)
+    Core compressible pipe-flow integration over a single pipe slice.
+    Solves coupled dP/dL and dT/dL ODEs (or the isothermal dP/dL equation)
+    using a forward-Euler step with a one-iteration energy-balance
+    correction.  Updates the AbstractState in-place to outlet conditions.
+"""
+
 import csv
 import math
 import os
@@ -402,32 +480,6 @@ def viscosity_LGE(T, mol_wt, density):
 
     return ureg.Quantity(mu, "cP").to("Pa*s").magnitude
 
-def _darcy_friction(Re, eps, d_h):
-    """Return the Darcy friction factor and flow regime string.
-
-    Delegates to fluids.friction.friction_factor(), which selects the best
-    available correlation automatically.  For Re < 2040 the laminar solution
-    f_D = 64 / Re is returned by the library; for Re >= 2040 a high-accuracy
-    turbulent correlation (Colebrook exact solution by default) is used.
-
-    The Darcy friction factor relates to the Fanning friction factor by:
-        f_Darcy = 4 * f_Fanning
-
-    Args:
-        Re  : Reynolds number (dimensionless).
-        eps : absolute roughness (m).
-        d_h : hydraulic diameter (m).
-
-    Returns:
-        (f_darcy, regime_string)
-    """
-    f_darcy = fluids_friction_factor(Re=Re, eD=eps / d_h)
-    regime  = "laminar" if Re < 2040 else "turbulent"
-    return f_darcy, regime
-
-# ---------------------------------------------------------------------------
-# Two-phase / phase-boundary guard
-# ---------------------------------------------------------------------------
 
 # CoolProp integer phase codes returned by AbstractState.phase().
 # Retained here as named constants so comparisons read clearly.
@@ -842,7 +894,7 @@ def compressible_K(abstract_state, mdot, flow_area, K):
     drhodH_P = AS.first_partial_deriv(CP.iDmass, CP.iHmass, CP.iP)      # (drho/dH)_P
     dHdP_T   = AS.first_partial_deriv(CP.iHmass, CP.iP,     CP.iT)      # (dH/dP)_T
 
-    # dP: derived from energy + continuity + entropy + EOS with dA = 0
+    # dP: derived from energy + continuity + entropy + EOS with dA = 0. See full derivation in Derivation_images/dP_for_K
     inner  = 1.0 - (v_in**2 / rho_in) * drhodH_P
     dP     = (-K * v_in**2 * rho_in / 2.0) / (1.0 - v_in**2 * drhodP_H / inner)
     P_out  = P_in + dP
