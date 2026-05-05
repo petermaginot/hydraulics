@@ -48,7 +48,6 @@ export_pressure_profile(segment, fluid, flow_rate, output_path, P0)
 import csv
 import math
 import warnings
-from pint import UnitRegistry
 from fluids.friction import friction_factor as fluids_friction_factor
 from fluids.core import Reynolds as fluids_Reynolds
 import fluids.fittings
@@ -62,32 +61,6 @@ from component_classes import (
     _flow_props_from_id,
     ureg,
 )
-
-
-# ---------------------------------------------------------------------------
-# Custom standard-volume unit definitions
-# ---------------------------------------------------------------------------
-# Standard conditions:
-#   SCM  : 0 deg C (273.15 K), 101325 Pa  (SI/metric standard)
-#   SCF  : 60 deg F (288.706 K), 14.696 psia (US upstream gas standard)
-#
-# Molar volume at standard conditions via ideal gas law:
-#   V_std = R * T_std / P_std   [m^3/mol]
-
-_R = 8.31446261815324  # J/(mol*K) -- exact CODATA 2018 value
-
-_T_scm = 273.15        # K
-_P_scm = 101325.0      # Pa
-_V_scm = _R * _T_scm / _P_scm   # m^3/mol (~0.022414)
-
-_T_scf = (60.0 - 32.0) * 5.0 / 9.0 + 273.15   # K (~288.706)
-_P_scf = 14.696 * 6894.757293168               # Pa
-_V_scf = ureg.Quantity(_R * _T_scf / _P_scf, 'm^3').to("ft^3").magnitude
-
-ureg.define(f'scm  = {1.0/_V_scm} * mol ')
-ureg.define(f'scf  = {1.0/_V_scf} * mol ')
-ureg.define(f'mscf = {1e3/_V_scf}  *   mol ')
-ureg.define(f'mmscf = {1e6/_V_scf}*  mol ')
 
 
 # ---------------------------------------------------------------------------

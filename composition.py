@@ -1,42 +1,6 @@
-from pint import UnitRegistry
 import CoolProp.CoolProp as CP
 from CoolProp.CoolProp import AbstractState
-
-ureg = UnitRegistry()
-#need to register standard cubic foot (scf), thousand standard cubic feet (mscf), million standard cubic feet (mmscf), and standard cubic meter (scm) as custom units in the unit registry
-
-# ---------------------------------------------------------------------------
-# Custom standard-volume unit definitions
-# ---------------------------------------------------------------------------
-# Standard conditions:
-#   SCM  : 0 deg C (273.15 K), 101325 Pa  (SI/metric standard)
-#   SCF  : 60 deg F (288.706 K), 14.696 psia (US upstream gas standard)
-#
-# Molar volume at standard conditions via ideal gas law:
-#   V_std = R * T_std / P_std   [m^3/mol]
-#
-# The unit is defined as that molar volume, so 1 scm == V_scm m^3/mol of gas,
-# allowing pint to convert between standard-volume and molar flow rates.
-# ---------------------------------------------------------------------------
-
-_R = 8.31446261815324  # J/(mol*K) -- exact CODATA 2018 value
-
-# SCM: 0 degC, 101325 Pa
-_T_scm = 273.15        # K
-_P_scm = 101325.0      # Pa
-_V_scm = _R * _T_scm / _P_scm   # m^3/mol  (~0.022414)
-
-# SCF: 60 degF, 14.696 psia
-_T_scf = (60.0 - 32.0) * 5.0 / 9.0 + 273.15   # K (~288.706)
-_P_scf = 14.696 * 6894.757293168               # Pa (14.696 psi is not quite exactly 101325 Pa)
-_V_scf = ureg.Quantity(_R * _T_scf / _P_scf, 'm^3')          #1 scf = 1.20 moles, but let the calculation be done in case you need to use some oddball standard conditions
-_V_scf = _V_scf.to("ft^3")
-_V_scf = _V_scf.magnitude
-
-ureg.define(f'scm  = {1.0/_V_scm} * mol ')
-ureg.define(f'scf  = {1.0/_V_scf} * mol ')
-ureg.define(f'mscf = {1e3/_V_scf}  *   mol ')
-ureg.define(f'mmscf = {1e6/_V_scf}*  mol ')
+from component_classes import ureg
 
 
 def define_combination(
