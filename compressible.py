@@ -103,7 +103,11 @@ class Line_Segment(Base_Line_Segment):
                              Default 0.0 (adiabatic).
 
         Returns:
-            (P_out, T_out) : tuple of floats [Pa, K].
+            (AS, profile_points) where AS is the updated CoolProp
+            AbstractState at outlet conditions, and profile_points is a list
+            of (distance_m, pressure_Pa, temperature_K, velocity_ms) tuples,
+            one per profile point (inlet through outlet), suitable for
+            constructing pressure, temperature, or velocity profile plots.
 
         Raises:
             ValueError   : if the profile has fewer than two points or
@@ -126,8 +130,11 @@ class Line_Segment(Base_Line_Segment):
 
         _AREA_TOL = 1e-6   # fractional area-change threshold
         n     = len(self.profile)
-        P_cur = P0
-        T_cur = T0
+
+        # Record inlet conditions at profile point 0.
+        dist0, _elev0, _D_h0, area0 = self.profile[0]
+        v0 = mdot / (AS.rhomass() * area0)
+        profile_points = [(dist0, P0, T0, v0)]
 
         for i in range(n - 1):
 
@@ -154,24 +161,22 @@ class Line_Segment(Base_Line_Segment):
                 P_critical=P_c,
             )
 
-            P_cur   = AS.p()
-            T_cur   = AS.T()
-            rho_cur = AS.rhomass()
-            a_cur   = AS.speed_sound()
-            v_cur   = mdot / (rho_cur * area_in)
-            Ma_cur  = v_cur / a_cur
-
             # Area-change correction at the boundary to the next slice.
-            
             area_ratio = abs(area_out - area_in) / max(area_in, area_out)
             if area_ratio > _AREA_TOL:
                 AS = compressible_changing_area_K(
                     AS, mdot, area_in, area_out, K=0.0
                 ) #is it necessary to set AS = compressible_changing_area_K since the abstract state is updated in place?
-            # print(f" Step: {i+1} of {n-1}, P = {P_cur}, T = {T_cur}")
-            print(f" Step: {i+1} of {n-1}, P = {P_cur}, T = {T_cur}", end="\r")               
+
+            # Record conditions at this profile point after all corrections.
+            P_cur   = AS.p()
+            T_cur   = AS.T()
+            v_cur   = mdot / (AS.rhomass() * area_out)
+            profile_points.append((dist_out, P_cur, T_cur, v_cur))
+
+            print(f" Step: {i+1} of {n-1}, P = {P_cur}, T = {T_cur}", end="\r")
         print(f"")
-        return AS
+        return AS, profile_points
 
 
 class Bend(Base_Bend):
@@ -1188,25 +1193,24 @@ def test_comp_hydraulics():
     print('Adiabadic case')
     print(f'outputs: P = {outlet_P}, T = {outlet_T}, Smass= {S_out}, velocity = {v_out}, Mach number = {Ma_out}')
 
-
 def test_line_segment_csv():
-    csv_path = os.path.join(os.path.dirname(__file__), "testprofile_long_ID.csv")
+    csv_path = os.path.join(os.path.dirname(__file__), "Example_Well_Survey.csv")
     roughness = ureg.Quantity(0.00015, "ft")
 
     seg = Line_Segment.from_csv(csv_path, roughness=roughness)
 
-    P_in = ureg.Quantity(1300, "psi").to("Pa").magnitude
-    T_in = 300.0   # K
-    Q_scfd = ureg.Quantity(10000, "oil_bbl/day")
+    P_in = ureg.Quantity(8000, "psi").to("Pa").magnitude
+    T_in = 437.0   # K
+    Q_scfd = ureg.Quantity(10, "mmscf/day")
 
     AS = composition.define_composition(
-        # y_Methane = 0.95,
-        # y_Ethane = 0.05,
-        # y_Propane=0.02,
-        y_n_Butane = 1,
-        # y_CarbonDioxide= 0.02,
+        y_Methane = 0.95,
+        y_Ethane = 0.05,
+        y_Propane=0.02,
+        y_n_Butane = 0.01,
+        y_CarbonDioxide= 0.02,
         # y_Water = 1.0,
-        eos = "PR"
+        eos = "HEOS"
     )
     AS.update(CP.PT_INPUTS, P_in, T_in)
     rho_in = AS.rhomass()
@@ -1217,7 +1221,7 @@ def test_line_segment_csv():
     print("\ntest_line_segment_csv")
     print(f"  inlet: P={P_in:.4g} Pa, T={T_in} K, Ma={Ma_in:.4f}")
 
-    AS = seg.dP_dT(abstract_state=AS, flow_rate=Q_scfd,P0= P_in, T0= T_in, isothermal= False)
+    AS, profile_points = seg.dP_dT(abstract_state=AS, flow_rate=Q_scfd, P0=P_in, T0=T_in, isothermal=False)
     P_out = AS.p()
     T_out = AS.T()
    
@@ -1231,48 +1235,35 @@ def test_line_segment_csv():
     print(f"  outlet: P={P_out_psi:.4g} psi, T={T_out:.4g} K, Ma={Ma_out:.4f}")
     print(f"  dP = {dP_psi:.4f} psi")
 
-
-def test_liq_plot():
     import matplotlib.pyplot as plt
 
-     #Example with csv file defined profile
-    # --- Fluid definition ---
-    fluid = Incompressible_Fluid.from_api_gravity(
-        api_gravity=50.0,
-        viscosity=ureg.Quantity(1.0, "cP"),
-    )
+    dist_ft = [ureg.Quantity(pt[0], "m").to("ft").magnitude  for pt in profile_points]
+    P_psi   = [ureg.Quantity(pt[1], "Pa").to("psi").magnitude for pt in profile_points]
+    T_degF  = [ureg.Quantity(pt[2], "degK").to("degF").magnitude for pt in profile_points]
+    v_fts = [ureg.Quantity(pt[3], "m").to("ft").magnitude for pt in profile_points]
 
-    # --- Pipe segment loaded from CSV ---
-    segment = Line_Segment.from_csv(
-        csv_path="testprofile.csv",
-        roughness=ureg.Quantity(0.00015, "ft"),
-        id_val=ureg.Quantity(3.068, "inch"),
-    )
+    plt.rcParams["font.family"] = "Consolas"
+    fig, ax1 = plt.subplots()
 
-    # --- Flow rate ---
-    flow_rate = ureg.Quantity(2000, "oil_bbl/day")
+    l1, = ax1.plot(dist_ft, P_psi,  color="black", label="Pressure [psi]")
+    ax1.set_xlabel("Distance [ft]")
+    ax1.set_ylabel("Pressure [psi]")
+    
 
-    # --- Run calculation ---
-    results = liquid_hydraulics(fluid, segment, flow_rate)
-    x = []
-    y = []
-    z = []
-    for pt in results["profile_results"]:
-        x.append(ureg.Quantity(pt['distance_m'], "m").to("ft").magnitude)
-        y.append(ureg.Quantity(pt['dP_total_Pa'], "Pa").to("psi").magnitude)
-        z.append(ureg.Quantity(pt['elevation_m'], "m").to("ft").magnitude)
-    fig, ax = plt.subplots()
-    plt.rcParams['font.family'] = 'Consolas'
-    l1, = ax.plot(x, y, label='Pressure change [psi]', color = 'black')
-    ax2 = ax.twinx()
-    l2, = ax2.plot(x, z, label='Elevation [ft]', color = 'red')
-    ax.set_xlabel('Distance [ft]')  # Add an x-label to the Axes.
-    ax.set_ylabel('Pressure change [psi]')  # Add a y-label to the Axes.
-    ax2.set_ylabel('Elevation [m]')
-    ax2.legend([l1, l2], ['Pressure change [psi]', 'Elevation [m]'])
+    ax2 = ax1.twinx() 
+
+    l2, = ax2.plot(dist_ft, T_degF, color="red",   label="Temperature [°F]")
+    ax2.set_ylabel("Temperature [°F]")
+
+    # l2, = ax2.plot(dist_ft, v_fts, color="red",   label="Velocity(ft/s)")
+    # ax2.set_ylabel("Velocity (ft/s)")
+
+    ax2.legend([l1, l2], ["Pressure [psi]", "Velocity (ft/s)"])
+    plt.title(f'Pressure and temperature profile at {Q_scfd}')
+    plt.tight_layout()
     plt.show()
 
-def testasdf():
+def phase_env():
     import matplotlib.pyplot as plt
     AS_g = composition.define_composition(
         y_Methane = 0.9,
@@ -1300,50 +1291,8 @@ def testasdf():
     # phase = AS_g.phase()
     # if phase == _CP_PHASE_TWOPHASE:
     #     print('two phase')
-    
-def phase_env():
-    import matplotlib.pyplot as plt
 
-    HEOS = CP.AbstractState('HEOS', 'Methane&Ethane')
-
-    for x0 in [0.02, 0.2, 0.4, 0.6, 0.8, 0.98]:
-        HEOS.set_mole_fractions([x0, 1 - x0])
-        try:
-            HEOS.build_phase_envelope("dummy")
-            PE = HEOS.get_phase_envelope_data()
-            PELabel = 'Methane, x = ' + str(x0)
-            plt.plot(PE.T, PE.p, '-', label=PELabel)
-        except ValueError as VE:
-            print(VE)
-
-    plt.xlabel('Temperature [K]')
-    plt.ylabel('Pressure [Pa]')
-    plt.yscale('log')
-    plt.title('Phase Envelope for Methane/Ethane Mixtures')
-    plt.legend(loc='lower right', shadow=True)
-    plt.savefig('methane-ethane.pdf')
-    plt.savefig('methane-ethane.png')
-    plt.close()
-
-def test_twophase():
-    AS_g = composition.define_composition(
-        y_Methane = 0.95,
-        y_Ethane = 0.05,
-
-        eos = "HEOS"
-        )
-    P0 =6.895e+06
-    T0 = 300.0
-    T_cric, P_bar, T_c, P_c = _build_phase_limits(AS_g)
-    # print(f'T cr: {T_cric}, P cr: {P_bar}')
-    # _safe_update_PT(AS_g, P0, T0, T_cric, P_bar, T_c, P_c)
-    AS_g.update(CP.PT_INPUTS, P0, T0)
-    phase = AS_g.phase()
-    print(f'Phase: {phase}')
-    compressibility_factor = AS_g.compressibility_factor()
-    print(f'Z: {compressibility_factor}')
-
-def test_contract_expand():
+def test_fittings():
     D_small = ureg.Quantity(3.826, "in")
     D_large = ureg.Quantity(4.026, "in")
     contraction_test = Contraction_Expansion(Di_US=D_large, Di_DS= D_small)
@@ -1366,42 +1315,12 @@ def test_contract_expand():
     print(f'After contraction P:{AS.p()}, T:{AS.T()}')
     AS = expansion_test.dP_dT(AS, Q_scfd)
     print(f'After expansion P:{AS.p()}, T:{AS.T()}')
-
-
-def test_elbow():
-    D_in = ureg.Quantity(4.026, "in")
-    elbow = Bend(D_in, 90, 1.5)
-    P_in = ureg.Quantity(1000, "psi").to("Pa").magnitude
-    T_in = 300.0   # K
-    Q_scfd = ureg.Quantity(60, "mmscf/day")
-    print(f'Inlet P:{P_in}, T:{T_in}')
-    AS = composition.define_composition(
-        y_Methane = 0.95,
-        y_Ethane = 0.05,
-        y_Propane=0.02,
-        y_n_Butane = 0.01,
-        y_CarbonDioxide= 0.02,
-        eos = "HEOS"
-    )
-    AS.update(CP.PT_INPUTS, P_in, T_in)
-
     AS = elbow.dP_dT(abstract_state=AS, flow_rate=Q_scfd)
     print(f'After elbow P:{AS.p()}, T:{AS.T()}')
 
-def avail_units():
-    all_units = list(ureg)
-    print(all_units)
 
 if __name__ == "__main__":
-    # avail_units()
-    # test_elbow()
-    # test_contract_expand()
-    # test_twophase()
+    # test_fittings()
     # phase_env()
-    # testasdf()
     test_line_segment_csv()
-    #test_p2p()
     # test_comp_hydraulics()
-    # test_compressible_slices()
-    # test_comp_csv_profile()
-    # test_liq_plot()
