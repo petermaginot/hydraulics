@@ -162,15 +162,16 @@ class Line_Segment(Base_Line_Segment):
             Ma_cur  = v_cur / a_cur
 
             # Area-change correction at the boundary to the next slice.
+            
             area_ratio = abs(area_out - area_in) / max(area_in, area_out)
             if area_ratio > _AREA_TOL:
                 AS = compressible_changing_area_K(
                     AS, mdot, area_in, area_out, K=0.0
                 ) #is it necessary to set AS = compressible_changing_area_K since the abstract state is updated in place?
-            print(f" Step: {i+1} of {n-1}, P = {P_cur}, T = {T_cur}")
-            # print(f" Step: {i+1} of {n-1}, P = {P_cur}, T = {T_cur}", end="\r")               
+            # print(f" Step: {i+1} of {n-1}, P = {P_cur}, T = {T_cur}")
+            print(f" Step: {i+1} of {n-1}, P = {P_cur}, T = {T_cur}", end="\r")               
         print(f"")
-        return P_cur, T_cur
+        return AS
 
 
 class Bend(Base_Bend):
@@ -178,7 +179,7 @@ class Bend(Base_Bend):
     calculation.
 
     Modeled as adiabatic.  Inherits geometry storage and validation from
-    Base_Bend.  The dP_dT() method is not yet implemented.
+    Base_Bend.
 
     Constructor arguments are identical to Base_Bend:
         Di        : pint Quantity or float (m if float).  Pipe inner diameter.
@@ -186,24 +187,43 @@ class Bend(Base_Bend):
         bend_dias : float.  Bend radius as a multiple of Di.
     """
 
-    def dP_dT(self, abstract_state, flow_rate, P0, T0):
-        """Outlet pressure and temperature through the bend [Pa, K].
+    def dP_dT(self, abstract_state, flow_rate):
+        """Outlet conditions for a compressible fluid passing through the bend.
+
+        The caller must update abstract_state to the inlet (P, T) conditions
+        before calling.  Uses fluids.fittings.bend_rounded() to obtain K, then
+        delegates to compressible_K().
 
         Args:
-            abstract_state : CoolProp AbstractState instance.
+            abstract_state : CoolProp AbstractState, pre-updated to inlet (P, T)
+                             by the caller.  Updated in-place on return.
             flow_rate      : pint Quantity -- mass, molar, or volumetric flow.
-            P0             : float, inlet static pressure [Pa].
-            T0             : float, inlet static temperature [K].
 
         Returns:
-            (P_out, T_out) : tuple of floats [Pa, K].
-
-        Raises:
-            NotImplementedError : always (not yet implemented).
+            abstract_state updated to outlet (P, T) conditions.
         """
-        raise NotImplementedError(
-            "Bend.dP_dT is not yet implemented for compressible flow."
+        AS   = abstract_state
+        mdot = _resolve_mdot(flow_rate, AS)
+
+        Di = self.Di_si
+        A  = math.pi * Di ** 2 / 4.0
+
+        rho_in = AS.rhomass()
+        try:
+            mu = AS.viscosity()
+        except Exception:
+            mu = viscosity_LGE(AS.T(), AS.molar_mass() * 1000.0, rho_in)
+
+        v_in = mdot / (rho_in * A)
+        Re   = fluids_Reynolds(V=v_in, D=Di, rho=rho_in, mu=mu)
+        K    = fluids.fittings.bend_rounded(
+            Di=Di,
+            bend_diameters=self.bend_dias,
+            angle=self.ang_deg,
+            Re=Re,
         )
+
+        return compressible_K(AS, mdot, A, K)
 
 
 class Contraction_Expansion(Base_Contraction_Expansion):
@@ -749,6 +769,107 @@ def compressible_changing_area_K(abstract_state, mdot, A_in, A_out, K):
     return AS
 
 
+def compressible_K(abstract_state, mdot, flow_area, K):
+    """Outlet conditions for a compressible fluid passing through a fitting
+    with a known loss coefficient K and no area change.
+
+    Assumes adiabatic conditions and that fluid properties are roughly constant
+    across the fitting.  Applies the single-step result from the combined
+    energy, continuity, entropy, and EOS derivation (dA = 0 branch):
+
+        dP = -K * v^2 * rho / 2
+             / [1 - v^2*(drho/dP)_H / (1 - (v^2/rho)*(drho/dH)_P)]
+
+        dT = [K*v^2/2 + (1/rho - (dH/dP)_T) * dP] / Cp
+
+    For low Mach numbers the dP formula reduces to the familiar
+    incompressible result dP = -K*rho*v^2/2.
+
+    Args:
+        abstract_state : CoolProp AbstractState, pre-updated to inlet (P, T)
+                         by the caller.  Updated in-place to outlet conditions
+                         on return.  Must not be shared across threads.
+        mdot           : float, mass flow rate [kg/s].
+        flow_area      : float, flow area [m^2].
+        K              : float, loss coefficient referenced to inlet velocity
+                         head (dimensionless, >= 0).
+
+    Returns:
+        abstract_state updated to outlet (P, T) conditions.
+
+    Raises:
+        ValueError   : if mdot or flow_area are non-positive, or K is negative.
+        RuntimeError : if two-phase conditions or near-sonic flow are detected.
+    """
+    choke_mach_limit = 0.98
+
+    if mdot <= 0.0:
+        raise ValueError(f"compressible_K: mdot must be positive (got {mdot}).")
+    if flow_area <= 0.0:
+        raise ValueError(f"compressible_K: flow_area must be positive (got {flow_area}).")
+    if K < 0.0:
+        raise ValueError(f"compressible_K: K must be non-negative (got {K}).")
+
+    AS = abstract_state
+    P_in  = AS.p()
+    T_in  = AS.T()
+
+    if AS.phase() == _CP_PHASE_TWOPHASE:
+        raise RuntimeError(
+            f"compressible_K: fluid is two-phase at inlet "
+            f"(P={P_in:.4g} Pa, T={T_in:.4g} K).  Single-phase flow only."
+        )
+
+    rho_in = AS.rhomass()
+    Cp     = AS.cpmass()
+    H_in   = AS.hmass()
+    v_in   = mdot / (rho_in * flow_area)
+    Ma_in  = v_in / AS.speed_sound()
+
+    if Ma_in >= choke_mach_limit:
+        raise RuntimeError(
+            f"compressible_K: inlet Mach number Ma={Ma_in:.4f} is near-sonic.  "
+            f"Reduce flow rate or check geometry."
+        )
+
+    # Partial derivatives at inlet conditions
+    drhodP_H = AS.first_partial_deriv(CP.iDmass, CP.iP,     CP.iHmass)  # (drho/dP)_H
+    drhodH_P = AS.first_partial_deriv(CP.iDmass, CP.iHmass, CP.iP)      # (drho/dH)_P
+    dHdP_T   = AS.first_partial_deriv(CP.iHmass, CP.iP,     CP.iT)      # (dH/dP)_T
+
+    # dP: derived from energy + continuity + entropy + EOS with dA = 0
+    inner  = 1.0 - (v_in**2 / rho_in) * drhodH_P
+    dP     = (-K * v_in**2 * rho_in / 2.0) / (1.0 - v_in**2 * drhodP_H / inner)
+    P_out  = P_in + dP
+
+    # dT: from thermodynamic identity dH = Cp*dT + (dH/dP)_T * dP
+    dT    = (K * v_in**2 / 2.0 + (1.0 / rho_in - dHdP_T) * dP) / Cp
+    T_out = T_in + dT
+
+    AS.update(CP.PT_INPUTS, P_out, T_out)
+    #This is an initial guess for T_out, but we can perform an energy balance to make sure energy is conserved.
+    # Stagnation enthalpy is conserved (adiabatic, no elevation change).
+    # Nudge T_out so the computed state satisfies the energy balance exactly.
+    H_stag = H_in + v_in**2 / 2.0
+    rho_out_calc = AS.rhomass()
+    v_out_calc   = mdot / (flow_area * rho_out_calc)
+    energy_error = H_stag - (AS.hmass() + v_out_calc**2 / 2.0)
+    Cp_out    = AS.cpmass()
+    drhodT_P  = AS.first_partial_deriv(CP.iDmass, CP.iT, CP.iP)
+    T_out = T_out + energy_error / (Cp_out - (mdot / (flow_area * rho_out_calc)) * drhodT_P)
+    AS.update(CP.PT_INPUTS, P_out, T_out)
+
+    rho_out = AS.rhomass()
+    Ma_out  = (mdot / (rho_out * flow_area)) / AS.speed_sound()
+    if Ma_out >= choke_mach_limit:
+        raise RuntimeError(
+            f"compressible_K: outlet Mach number Ma={Ma_out:.4f} is near-sonic.  "
+            f"Reduce flow rate or check geometry."
+        )
+
+    return AS
+
+
 def compressible_hydraulics2(
     abstract_state,
     mdot,
@@ -1069,22 +1190,23 @@ def test_comp_hydraulics():
 
 
 def test_line_segment_csv():
-    csv_path = os.path.join(os.path.dirname(__file__), "Example_Well_Survey.csv")
+    csv_path = os.path.join(os.path.dirname(__file__), "testprofile_long_ID.csv")
     roughness = ureg.Quantity(0.00015, "ft")
 
     seg = Line_Segment.from_csv(csv_path, roughness=roughness)
 
-    P_in = ureg.Quantity(9000, "psi").to("Pa").magnitude
-    T_in = 437.0   # K
-    Q_scfd = ureg.Quantity(25.6, "mmscf/day")
+    P_in = ureg.Quantity(1300, "psi").to("Pa").magnitude
+    T_in = 300.0   # K
+    Q_scfd = ureg.Quantity(10000, "oil_bbl/day")
 
     AS = composition.define_composition(
-        y_Methane = 0.95,
-        y_Ethane = 0.05,
-        y_Propane=0.02,
-        y_n_Butane = 0.01,
-        y_CarbonDioxide= 0.02,
-        eos = "HEOS"
+        # y_Methane = 0.95,
+        # y_Ethane = 0.05,
+        # y_Propane=0.02,
+        y_n_Butane = 1,
+        # y_CarbonDioxide= 0.02,
+        # y_Water = 1.0,
+        eos = "PR"
     )
     AS.update(CP.PT_INPUTS, P_in, T_in)
     rho_in = AS.rhomass()
@@ -1095,9 +1217,10 @@ def test_line_segment_csv():
     print("\ntest_line_segment_csv")
     print(f"  inlet: P={P_in:.4g} Pa, T={T_in} K, Ma={Ma_in:.4f}")
 
-    P_out, T_out = seg.dP_dT(AS, Q_scfd, P_in, T_in)
-
-    AS.update(CP.PT_INPUTS, P_out, T_out)
+    AS = seg.dP_dT(abstract_state=AS, flow_rate=Q_scfd,P0= P_in, T0= T_in, isothermal= False)
+    P_out = AS.p()
+    T_out = AS.T()
+   
     rho_out = AS.rhomass()
     area_out = seg.profile[-1][3]
     v_out = _resolve_mdot(Q_scfd, AS) / (rho_out * area_out)
@@ -1230,11 +1353,11 @@ def test_contract_expand():
     Q_scfd = ureg.Quantity(60, "mmscf/day")
     print(f'Inlet P:{P_in}, T:{T_in}')
     AS = composition.define_composition(
-        y_Methane = 0.95,
-        y_Ethane = 0.05,
-        y_Propane=0.02,
-        y_n_Butane = 0.01,
-        y_CarbonDioxide= 0.02,
+        y_Methane = 0.0,
+        y_Ethane = 0.00,
+        y_Propane=0.00,
+        y_n_Butane = 1,
+        y_CarbonDioxide= 0.0,
         eos = "HEOS"
     )
     AS.update(CP.PT_INPUTS, P_in, T_in)
@@ -1245,12 +1368,38 @@ def test_contract_expand():
     print(f'After expansion P:{AS.p()}, T:{AS.T()}')
 
 
+def test_elbow():
+    D_in = ureg.Quantity(4.026, "in")
+    elbow = Bend(D_in, 90, 1.5)
+    P_in = ureg.Quantity(1000, "psi").to("Pa").magnitude
+    T_in = 300.0   # K
+    Q_scfd = ureg.Quantity(60, "mmscf/day")
+    print(f'Inlet P:{P_in}, T:{T_in}')
+    AS = composition.define_composition(
+        y_Methane = 0.95,
+        y_Ethane = 0.05,
+        y_Propane=0.02,
+        y_n_Butane = 0.01,
+        y_CarbonDioxide= 0.02,
+        eos = "HEOS"
+    )
+    AS.update(CP.PT_INPUTS, P_in, T_in)
+
+    AS = elbow.dP_dT(abstract_state=AS, flow_rate=Q_scfd)
+    print(f'After elbow P:{AS.p()}, T:{AS.T()}')
+
+def avail_units():
+    all_units = list(ureg)
+    print(all_units)
+
 if __name__ == "__main__":
-    test_contract_expand()
+    # avail_units()
+    # test_elbow()
+    # test_contract_expand()
     # test_twophase()
     # phase_env()
     # testasdf()
-    # test_line_segment_csv()
+    test_line_segment_csv()
     #test_p2p()
     # test_comp_hydraulics()
     # test_compressible_slices()
