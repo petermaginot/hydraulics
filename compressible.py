@@ -110,8 +110,6 @@ class Line_Segment(Base_Line_Segment):
         self,
         abstract_state,
         flow_rate,
-        P0,
-        T0,
         isothermal=False,
         q_wall=0.0,
         T_cricondentherm=None,
@@ -131,14 +129,14 @@ class Line_Segment(Base_Line_Segment):
 
         Args:
             abstract_state : CoolProp AbstractState pre-configured for the
-                             working fluid.  Updated in-place during
+                             working fluid AND already updated to the segment
+                             inlet (P, T).  Read in-place to obtain the inlet
+                             conditions, and mutated in place during
                              integration; must not be shared across threads.
             flow_rate      : pint Quantity -- mass ([mass]/[time]), molar or
                              standard-volume ([substance]/[time], e.g. mol/s,
                              mmscf/day), or actual volumetric
                              ([length]^3/[time]) flow rate.
-            P0             : float, inlet static pressure [Pa].
-            T0             : float, inlet static temperature [K].
             isothermal     : bool, if True temperature is held constant
                              through each slice.  Default False.
             q_wall         : float, total heat input to the fluid over the
@@ -194,7 +192,11 @@ class Line_Segment(Base_Line_Segment):
                 T_critical,
                 P_critical,
             )
-        _safe_update_PT(AS, P0, T0, T_cric, P_bar, T_c, P_c)
+        # Inlet conditions come from AS as the caller provided it; consistent
+        # with Bend.dP_dT and Contraction_Expansion.dP_dT, which also assume
+        # the caller has updated AS to the inlet (P, T) before calling.
+        P0   = AS.p()
+        T0   = AS.T()
         mdot = _resolve_mdot(flow_rate, AS)
 
         total_length  = self.total_length_m
@@ -1301,7 +1303,7 @@ def test_line_segment_csv():
     print("\ntest_line_segment_csv")
     print(f"  inlet: P={P_in:.4g} Pa, T={T_in} K, Ma={Ma_in:.4f}")
 
-    AS, profile_points = seg.dP_dT(abstract_state=AS, flow_rate=Q_scfd, P0=P_in, T0=T_in, isothermal=False)
+    AS, profile_points = seg.dP_dT(abstract_state=AS, flow_rate=Q_scfd, isothermal=False)
     P_out = AS.p()
     T_out = AS.T()
    
