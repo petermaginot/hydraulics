@@ -114,6 +114,10 @@ class Line_Segment(Base_Line_Segment):
         T0,
         isothermal=False,
         q_wall=0.0,
+        T_cricondentherm=None,
+        P_cricondenbar=None,
+        T_critical=None,
+        P_critical=None,
     ):
         """Calculate outlet pressure and temperature for compressible flow
         through the segment.
@@ -141,6 +145,17 @@ class Line_Segment(Base_Line_Segment):
                              entire segment [W].  Distributed uniformly per
                              unit length.  Ignored when isothermal=True.
                              Default 0.0 (adiabatic).
+            T_cricondentherm,
+            P_cricondenbar,
+            T_critical,
+            P_critical     : optional precomputed phase-envelope limits [K, Pa].
+                             If all four are supplied, the internal call to
+                             _build_phase_limits is skipped.  Useful when
+                             dP_dT is invoked many times on the same fluid
+                             (e.g. parallel-flow iteration), since
+                             build_phase_envelope is expensive for
+                             multicomponent HEOS mixtures.  Default None
+                             (envelope is built on each call).
 
         Returns:
             (AS, profile_points) where AS is the updated CoolProp
@@ -161,7 +176,24 @@ class Line_Segment(Base_Line_Segment):
             )
 
         AS = abstract_state
-        T_cric, P_bar, T_c, P_c = _build_phase_limits(AS)
+        # If the caller supplied any limits, trust them and skip the rebuild --
+        # _build_phase_limits is allowed to return Nones for fields it couldn't
+        # compute (e.g. envelope failed but critical point succeeded), and we
+        # don't want to retry on every call.
+        if (
+            T_cricondentherm is None
+            and P_cricondenbar is None
+            and T_critical is None
+            and P_critical is None
+        ):
+            T_cric, P_bar, T_c, P_c = _build_phase_limits(AS)
+        else:
+            T_cric, P_bar, T_c, P_c = (
+                T_cricondentherm,
+                P_cricondenbar,
+                T_critical,
+                P_critical,
+            )
         _safe_update_PT(AS, P0, T0, T_cric, P_bar, T_c, P_c)
         mdot = _resolve_mdot(flow_rate, AS)
 
@@ -470,16 +502,32 @@ def _build_phase_limits(AS):
     AbstractState at the last envelope point it visited; subsequent update()
     calls on the same object then fail unpredictably.
 
-    Returns (None, None, None, None) if the envelope cannot be built.
+    The envelope tracer is fragile (some HEOS mixtures and the PR backend can
+    fail to converge), so the critical-point query is wrapped separately.  When
+    the envelope fails but the critical point succeeds, returns
+    (None, None, T_critical, P_critical) -- callers can still use the critical
+    point as a coarser phase hint via _safe_update_PT.
+
+    Returns (None, None, None, None) only when both queries fail.
     """
+    AS_tmp = AbstractState("HEOS", "&".join(AS.fluid_names()))
+    AS_tmp.set_mole_fractions(list(AS.get_mole_fractions()))
+
     try:
-        AS_tmp = AbstractState("HEOS", "&".join(AS.fluid_names()))
-        AS_tmp.set_mole_fractions(list(AS.get_mole_fractions()))
         AS_tmp.build_phase_envelope("")
         PE = AS_tmp.get_phase_envelope_data()
-        return max(PE.T), max(PE.p), AS_tmp.T_critical(), AS_tmp.p_critical()
+        T_cric = max(PE.T)
+        P_bar  = max(PE.p)
     except Exception:
-        return None, None, None, None
+        T_cric, P_bar = None, None
+
+    try:
+        T_c = AS_tmp.T_critical()
+        P_c = AS_tmp.p_critical()
+    except Exception:
+        T_c, P_c = None, None
+
+    return T_cric, P_bar, T_c, P_c
 
 
 def _safe_update_PT(AS, P, T, T_cricondentherm=None, P_cricondenbar=None,
@@ -497,7 +545,17 @@ def _safe_update_PT(AS, P, T, T_cricondentherm=None, P_cricondenbar=None,
       T > T_cricondentherm, P > P_critical  → iphase_supercritical
       T > T_cricondentherm, P <= P_critical → iphase_supercritical_gas
       P > P_cricondenbar                    → iphase_supercritical
+      T > T_critical, P > P_critical        → iphase_supercritical    (fallback)
+      T > T_critical, P <= P_critical       → iphase_supercritical_gas (fallback)
       otherwise                             → no hint; CoolProp determines phase
+
+    The two trailing fallback rules apply only when T_cricondentherm /
+    P_cricondenbar are unavailable (e.g. the envelope tracer failed for the
+    mixture).  They use just the mixture critical point.  This is *coarser*
+    than the cricondentherm bound -- there is a small region above T_critical
+    but below T_cricondentherm where a multicomponent mixture can still be
+    two-phase -- so callers near the envelope should still prefer the full
+    cricondentherm/cricondenbar limits when available.
     """
     phase = None
     if T_cricondentherm is not None and T > T_cricondentherm:
@@ -507,6 +565,14 @@ def _safe_update_PT(AS, P, T, T_cricondentherm=None, P_cricondenbar=None,
             phase = CP.iphase_supercritical_gas
     elif P_cricondenbar is not None and P > P_cricondenbar:
         phase = CP.iphase_supercritical
+    elif (
+        T_cricondentherm is None
+        and P_cricondenbar is None
+        and T_critical is not None
+        and P_critical is not None
+        and T > T_critical
+    ):
+        phase = CP.iphase_supercritical if P > P_critical else CP.iphase_supercritical_gas
 
     if phase is not None:
         AS.specify_phase(phase)
