@@ -29,31 +29,47 @@ def parallel_incompressible(line_segment_list, fluid, total_flow_rate):
 
     # Iterate flow fractions until dP across every segment converges to a common value.
     # Physics constraint: parallel segments share the same inlet/outlet, so dP_i must
-    # be equal for all i. Correction uses the turbulent approximation dP ~ Q^2, giving
-    # new_Q_i = Q_i * sqrt(dP_target / dP_i), then renormalize to preserve total flow.
-    MAX_ITER = 100
+    # be equal for all i.
+    #
+    # Newton's method: estimate d(dP_i)/d(ff_i) numerically via a small perturbation.
+    # Because elevation is a flow-independent offset in dP, only the friction term
+    # appears in the slope. This makes Newton robust when elevation >> friction
+    # (low flow rates), where a ratio-based correction would stall.
+    #
+    # Given slopes s_i, the Newton target dP_common and correction delta_ff_i are:
+    #   dP_common   = sum(dP_i / s_i) / sum(1 / s_i)
+    #   delta_ff_i  = (dP_common - dP_i) / s_i
+    # By construction sum(delta_ff_i) = 0, so total flow is exactly preserved.
+    MAX_ITER = 20
     TOL = 1e-6
-    print(f'initial fraction guess: {flow_fraction}')
+    EPS = 1e-4  # dimensionless perturbation to each flow fraction for slope estimation
+
     dP_list = []
+    dP_target = 0.0
+
     for k in range(MAX_ITER):
         dP_list = [
             seg.dP(fluid=fluid, flow_rate=total_flow_rate * ff)
             for seg, ff in zip(line_segment_list, flow_fraction)
         ]
 
-        dP_target = sum(ff * dp for ff, dp in zip(flow_fraction, dP_list))
+        slopes = [
+            (seg.dP(fluid=fluid, flow_rate=total_flow_rate * (ff + EPS)) - dP) / EPS
+            for seg, ff, dP in zip(line_segment_list, flow_fraction, dP_list)
+        ]
+
+        sum_inv_s = sum(1.0 / s for s in slopes)
+        dP_target = sum(dp / s for dp, s in zip(dP_list, slopes)) / sum_inv_s
 
         max_rel_dev = max(abs(dp - dP_target) / abs(dP_target) for dp in dP_list)
         if max_rel_dev < TOL:
             break
 
-        new_fractions = [
-            ff * (dP_target / dp) ** 0.5
-            for ff, dp in zip(flow_fraction, dP_list)
-        ]
-        total = sum(new_fractions)
-        flow_fraction = [ff / total for ff in new_fractions]
-        print(f'iteration {k}, {flow_fraction}, {dP_list}')
+        delta_ff = [(dP_target - dp) / s for dp, s in zip(dP_list, slopes)]
+        new_fractions = [max(ff + dff, 1e-10) for ff, dff in zip(flow_fraction, delta_ff)]
+        total_ff = sum(new_fractions)
+        flow_fraction = [ff / total_ff for ff in new_fractions]
+        # print(f'iteration {k}, {flow_fraction}, {dP_list}')
     return dP_target, flow_fraction
 
 def test_parallel():
@@ -99,7 +115,7 @@ def test_parallel():
         )
     )
 
-    flow_rate = ureg.Quantity(200, "oil_bbl/day")
+    flow_rate = ureg.Quantity(10000, "oil_bbl/day")
     P0        = ureg.Quantity(100.0, "psi").to("Pa").magnitude
 
     dP, flow_fractions = parallel_incompressible(segment_list, fluid, flow_rate)
