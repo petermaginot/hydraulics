@@ -239,7 +239,9 @@ class Line_Segment(Base_Line_Segment):
             area_ratio = abs(area_out - area_in) / max(area_in, area_out)
             if area_ratio > _AREA_TOL:
                 AS = compressible_changing_area_K(
-                    AS, mdot, area_in, area_out, K=0.0
+                    AS, mdot, area_in, area_out, K=0.0,
+                    T_cricondentherm=T_cric, P_cricondenbar=P_bar,
+                    T_critical=T_c, P_critical=P_c,
                 ) #is it necessary to set AS = compressible_changing_area_K since the abstract state is updated in place?
 
             # Record conditions at this profile point after all corrections.
@@ -247,9 +249,9 @@ class Line_Segment(Base_Line_Segment):
             T_cur   = AS.T()
             v_cur   = mdot / (AS.rhomass() * area_out)
             profile_points.append((dist_out, P_cur, T_cur, v_cur))
-
-            print(f" Step: {i+1} of {n-1}, P = {P_cur}, T = {T_cur}", end="\r")
-        print(f"")
+            msg = str(f"Segment {self.name} Step: {i+1} of {n-1}, P = {P_cur}, T = {T_cur}")
+            print(msg, end="\r")
+        print(f" "*len(msg), end="\r")
         return AS, profile_points
 
 
@@ -266,7 +268,15 @@ class Bend(Base_Bend):
         bend_dias : float.  Bend radius as a multiple of Di.
     """
 
-    def dP_dT(self, abstract_state, flow_rate):
+    def dP_dT(
+        self,
+        abstract_state,
+        flow_rate,
+        T_cricondentherm=None,
+        P_cricondenbar=None,
+        T_critical=None,
+        P_critical=None,
+    ):
         """Outlet conditions for a compressible fluid passing through the bend.
 
         The caller must update abstract_state to the inlet (P, T) conditions
@@ -277,7 +287,13 @@ class Bend(Base_Bend):
             abstract_state : CoolProp AbstractState, pre-updated to inlet (P, T)
                              by the caller.  Updated in-place on return.
             flow_rate      : pint Quantity -- mass, molar, or volumetric flow.
-
+            T_cricondentherm,
+            P_cricondenbar,
+            T_critical,
+            P_critical     : optional precomputed phase-envelope limits, forwarded
+                             to compressible_K() so PT updates can specify a
+                             supercritical phase hint and bypass HEOS phase
+                             stability analysis (which fails for some mixtures).
         Returns:
             abstract_state updated to outlet (P, T) conditions.
         """
@@ -302,7 +318,13 @@ class Bend(Base_Bend):
             Re=Re,
         )
 
-        return compressible_K(AS, mdot, A, K)
+        return compressible_K(
+            AS, mdot, A, K,
+            T_cricondentherm=T_cricondentherm,
+            P_cricondenbar=P_cricondenbar,
+            T_critical=T_critical,
+            P_critical=P_critical,
+        )
 
 
 class Contraction_Expansion(Base_Contraction_Expansion):
@@ -317,7 +339,15 @@ class Contraction_Expansion(Base_Contraction_Expansion):
         Di_DS : pint Quantity or float (m if float).  Downstream inner diameter.
     """
 
-    def dP_dT(self, abstract_state, flow_rate):
+    def dP_dT(
+        self,
+        abstract_state,
+        flow_rate,
+        T_cricondentherm=None,
+        P_cricondenbar=None,
+        T_critical=None,
+        P_critical=None,
+    ):
         """Outlet abstract state for a compressible fluid passing through the
         contraction/expansion.
 
@@ -333,6 +363,12 @@ class Contraction_Expansion(Base_Contraction_Expansion):
                              inlet (P, T) by the caller.  Updated in-place on
                              return to outlet conditions.
             flow_rate      : pint Quantity -- mass, molar, or volumetric flow.
+            T_cricondentherm,
+            P_cricondenbar,
+            T_critical,
+            P_critical     : optional precomputed phase-envelope limits, forwarded
+                             to compressible_changing_area_K() for the
+                             supercritical phase hint.
 
         Returns:
             abstract_state updated to outlet (P, T) conditions.
@@ -357,7 +393,13 @@ class Contraction_Expansion(Base_Contraction_Expansion):
             # Expansion: fluids returns K w.r.t. upstream velocity directly.
             K = fluids.fittings.diffuser_sharp(Di1=Di_US, Di2=Di_DS)
 
-        return compressible_changing_area_K(AS, mdot, A_US, A_DS, K)
+        return compressible_changing_area_K(
+            AS, mdot, A_US, A_DS, K,
+            T_cricondentherm=T_cricondentherm,
+            P_cricondenbar=P_cricondenbar,
+            T_critical=T_critical,
+            P_critical=P_critical,
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -514,7 +556,7 @@ def _build_phase_limits(AS):
     """
     AS_tmp = AbstractState("HEOS", "&".join(AS.fluid_names()))
     AS_tmp.set_mole_fractions(list(AS.get_mole_fractions()))
-
+    print('Building phase limits - this can take a while', end='\r')
     try:
         AS_tmp.build_phase_envelope("")
         PE = AS_tmp.get_phase_envelope_data()
@@ -743,7 +785,11 @@ def compressible_changing_area(abstract_state, mdot, A_in, A_out):
     return (P_out, T_out)
 
 
-def compressible_changing_area_K(abstract_state, mdot, A_in, A_out, K):
+def compressible_changing_area_K(
+    abstract_state, mdot, A_in, A_out, K,
+    T_cricondentherm=None, P_cricondenbar=None,
+    T_critical=None, P_critical=None,
+):
     """Outlet pressure and temperature for a compressible fluid passing through
     an area change with a known loss coefficient K applied to inlet velocity.
 
@@ -826,7 +872,7 @@ def compressible_changing_area_K(abstract_state, mdot, A_in, A_out, K):
 
     def residuals(x):
         P, T = x
-        AS.update(CP.PT_INPUTS, P, T)
+        _safe_update_PT(AS, P, T, T_cricondentherm, P_cricondenbar, T_critical, P_critical)
         v   = mdot / (AS.rhomass() * A_out)
         T_avg = 0.5 * (T_in + T)
         #energy balance: Stagnation enthalpy = outlet enthalpy + outlet kinetic energy
@@ -852,11 +898,15 @@ def compressible_changing_area_K(abstract_state, mdot, A_in, A_out, K):
         )
 
     P_out, T_out = sol.x
-    AS.update(CP.PT_INPUTS, P_out, T_out)
+    _safe_update_PT(AS, P_out, T_out, T_cricondentherm, P_cricondenbar, T_critical, P_critical)
     return AS
 
 
-def compressible_K(abstract_state, mdot, flow_area, K):
+def compressible_K(
+    abstract_state, mdot, flow_area, K,
+    T_cricondentherm=None, P_cricondenbar=None,
+    T_critical=None, P_critical=None,
+):
     """Outlet conditions for a compressible fluid passing through a fitting
     with a known loss coefficient K and no area change.
 
@@ -933,7 +983,7 @@ def compressible_K(abstract_state, mdot, flow_area, K):
     dT    = (K * v_in**2 / 2.0 + (1.0 / rho_in - dHdP_T) * dP) / Cp
     T_out = T_in + dT
 
-    AS.update(CP.PT_INPUTS, P_out, T_out)
+    _safe_update_PT(AS, P_out, T_out, T_cricondentherm, P_cricondenbar, T_critical, P_critical)
     #This is an initial guess for T_out, but we can perform an energy balance to make sure energy is conserved.
     # Stagnation enthalpy is conserved (adiabatic, no elevation change).
     # Nudge T_out so the computed state satisfies the energy balance exactly.
@@ -944,7 +994,7 @@ def compressible_K(abstract_state, mdot, flow_area, K):
     Cp_out    = AS.cpmass()
     drhodT_P  = AS.first_partial_deriv(CP.iDmass, CP.iT, CP.iP)
     T_out = T_out + energy_error / (Cp_out - (mdot / (flow_area * rho_out_calc)) * drhodT_P)
-    AS.update(CP.PT_INPUTS, P_out, T_out)
+    _safe_update_PT(AS, P_out, T_out, T_cricondentherm, P_cricondenbar, T_critical, P_critical)
 
     rho_out = AS.rhomass()
     Ma_out  = (mdot / (rho_out * flow_area)) / AS.speed_sound()
@@ -1279,7 +1329,7 @@ def test_line_segment_csv():
     csv_path = os.path.join(os.path.dirname(__file__), "Example_Well_Survey.csv")
     roughness = ureg.Quantity(0.00015, "ft")
 
-    seg = Line_Segment.from_csv(csv_path, roughness=roughness)
+    seg = Line_Segment.from_csv(csv_path, roughness=roughness, name='1')
 
     P_in = ureg.Quantity(8000, "psi").to("Pa").magnitude
     T_in = 437.0   # K

@@ -241,7 +241,9 @@ class Base_Line_Segment:
         noncircular=False,
         id_tolerance=0.001,
         k_wall=None,
+        name=None,
     ):
+        self.name = name
         # --- Roughness (uniform, SI) ---
         self.roughness_si = _to_si(roughness, "m")
         if self.roughness_si is None:
@@ -413,6 +415,7 @@ class Base_Line_Segment:
         noncircular=False,
         id_tolerance=0.001,
         k_wall=None,
+        name=None,
     ):
         """Construct a segment by loading a profile from a CSV file.
 
@@ -452,6 +455,8 @@ class Base_Line_Segment:
             k_wall       : pint Quantity or float (W/(m*K)) or None.
                            Pipe-wall thermal conductivity, stored for future
                            heat-transfer support.  Default None.
+            name         : str or None.  Optional label for the segment.
+                           Default None.
 
         Returns:
             Instance of the calling class (or subclass).
@@ -533,6 +538,7 @@ class Base_Line_Segment:
             noncircular=noncircular,
             id_tolerance=id_tolerance,
             k_wall=k_wall,
+            name=name,
         )
 
     # ------------------------------------------------------------------
@@ -599,7 +605,8 @@ class Base_Bend:
                     radius elbow: R_bend = 1.5 * Di).  Must be positive.
     """
 
-    def __init__(self, Di, ang_deg, bend_dias):
+    def __init__(self, Di, ang_deg, bend_dias, name=None):
+        self.name      = name
         self.Di_si     = _to_si(Di, "m")
         self.ang_deg   = float(ang_deg)
         self.bend_dias = float(bend_dias)
@@ -647,7 +654,8 @@ class Base_Contraction_Expansion:
                 Must be positive.
     """
 
-    def __init__(self, Di_US, Di_DS):
+    def __init__(self, Di_US, Di_DS, name=None):
+        self.name     = name
         self.Di_US_si = _to_si(Di_US, "m")
         self.Di_DS_si = _to_si(Di_DS, "m")
 

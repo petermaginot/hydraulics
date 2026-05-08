@@ -217,8 +217,15 @@ def parallel_compressible(line_segment_list, AS, total_flow_rate):
                     T_critical=T_c, P_critical=P_c,
                 )
             else:
-                # Fitting (Bend / Contraction_Expansion).
-                AS_out = c.dP_dT(AS, flow_rate)
+                # Fitting (Bend / Contraction_Expansion).  Forward phase-envelope
+                # limits so internal PT updates can apply the same supercritical
+                # phase hint -- needed for some mixtures where HEOS phase
+                # stability analysis fails.
+                AS_out = c.dP_dT(
+                    AS, flow_rate,
+                    T_cricondentherm=T_cric, P_cricondenbar=P_bar,
+                    T_critical=T_c, P_critical=P_c,
+                )
         return AS_out.p(), AS_out.T()
 
     def _outlet(branch, ff):
@@ -257,7 +264,7 @@ def parallel_compressible(line_segment_list, AS, total_flow_rate):
 
 
 def test_parallel_compressible():
-    from compressible import Line_Segment, Bend, Contraction_Expansion
+    from compressible import Line_Segment, Bend, Contraction_Expansion, _build_phase_limits, _safe_update_PT
     import CoolProp.CoolProp as CP
     from CoolProp.CoolProp import AbstractState
     import composition
@@ -268,14 +275,18 @@ def test_parallel_compressible():
     Q_scfd = ureg.Quantity(30, "mmscf/day")
     print(f'Inlet P:{P_in}, T:{T_in}')
     AS = composition.define_composition(
-        y_Methane = 0.9,
-        y_Ethane = 0.05,
-        y_Propane=0.02,
-        y_n_Butane = 0.01,
-        y_CarbonDioxide= 0.02,
+        y_Methane = 1,
+        # y_Ethane = 0.05,
+        # y_Propane=0.02,
+        # y_n_Butane = 0.01,
+        # y_CarbonDioxide= 0.02,
+        y_Hydrogen=0.8,
         eos = "HEOS"
     )
-    AS.update(CP.PT_INPUTS, P_in, T_in)
+    # Raw AS.update(PT_INPUTS, ...) trips CoolProp's HEOS phase-stability
+    # analyzer for H2-rich mixtures at supercritical conditions.  Use the
+    # same helper parallel_compressible uses internally.
+    _safe_update_PT(AS, P_in, T_in, *_build_phase_limits(AS))
 
     segment_list = []
     roughness        = ureg.Quantity(0.00015, "ft")
@@ -283,14 +294,14 @@ def test_parallel_compressible():
     # length           = ureg.Quantity(2000.0, "ft")
     # elevation_change = ureg.Quantity(-1.3359375, "m") #all parallel lines should have identical net elevation changes
     csv_path = os.path.join(os.path.dirname(__file__), "testprofile_3inS40.csv")
-    Seg_1 = Line_Segment.from_csv(csv_path, roughness=roughness)
+    Seg_1 = Line_Segment.from_csv(csv_path, roughness=roughness, name = '1')
     segment_list.append(Seg_1)
 
     Bend_1 = Bend(id_val, 90, 1.5)
 
     csv_path = os.path.join(os.path.dirname(__file__), "testprofile_ID_OD_WT.csv")
 
-    Seg_2 = Line_Segment.from_csv(csv_path, roughness=roughness)
+    Seg_2 = Line_Segment.from_csv(csv_path, roughness=roughness, name = '2')
 
     series_list = [Bend_1, Seg_2]
     segment_list.append(series_list)
@@ -340,6 +351,7 @@ def test_parallel_incompressible():
         id_val=id_val,
         length=length,
         elevation_change=elevation_change,
+        name = '1',
         )
 
     segment_list.append(Seg_1)
@@ -354,6 +366,7 @@ def test_parallel_incompressible():
         id_val=id_val,
         length=length,
         elevation_change=elevation_change,
+        name = '2',
         )
     series_list.append(Seg_2)
 
@@ -368,6 +381,7 @@ def test_parallel_incompressible():
         id_val=id_val,
         length=length,
         elevation_change=elevation_change,
+        name = '3',
         )
 
     series_list.append(Seg_3)
