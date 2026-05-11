@@ -16,7 +16,7 @@ Classes
 -------
 Line_Segment  (inherits Base_Line_Segment)
     Adds dP_dT() for compressible flow.  Steps through consecutive profile
-    point pairs via compressible_hydraulics2(), applying isentropic
+    point pairs via compressible_pipe_segment(), applying isentropic
     area-change corrections at inter-slice boundaries.  Returns the outlet
     AbstractState together with a list of (distance, pressure, temperature,
     velocity) tuples for profile plotting.
@@ -68,7 +68,7 @@ compressible_K(abstract_state, mdot, flow_area, K)
     combined energy, continuity, entropy, and EOS derivation, then corrects
     temperature to satisfy the stagnation-enthalpy balance.
 
-compressible_hydraulics2(abstract_state, mdot, dL, dz, D_h, roughness,
+compressible_pipe_segment(abstract_state, mdot, dL, dz, D_h, roughness,
                           flow_area, ...)
     Core compressible pipe-flow integration over a single pipe slice.
     Solves coupled dP/dL and dT/dL ODEs (or the isothermal dP/dL equation)
@@ -99,7 +99,7 @@ class Line_Segment(Base_Line_Segment):
 
     Inherits geometry storage, CSV loading, and convenience properties from
     Base_Line_Segment.  Adds dP_dT() for compressible flow, stepping through
-    consecutive profile slices via compressible_hydraulics() and applying
+    consecutive profile slices via compressible_pipe_segment() and applying
     isentropic area-change corrections at inter-slice boundaries.
 
     Constructor arguments and behavior are identical to Base_Line_Segment.
@@ -112,16 +112,20 @@ class Line_Segment(Base_Line_Segment):
         flow_rate,
         isothermal=False,
         q_wall=0.0,
+        mu=None,
         T_cricondentherm=None,
         P_cricondenbar=None,
         T_critical=None,
         P_critical=None,
+        energy_tol=10.0,
+        dPdL_rel_tol=0.05,
+        max_split_depth=8,
     ):
         """Calculate outlet pressure and temperature for compressible flow
         through the segment.
 
         Steps through consecutive profile point pairs, calling
-        compressible_hydraulics() for each slice and applying isentropic
+        compressible_pipe_segment() for each slice and applying isentropic
         area-change corrections at boundaries where the flow area changes.
 
         Heat input q_wall is distributed uniformly per unit pipe length across
@@ -143,6 +147,10 @@ class Line_Segment(Base_Line_Segment):
                              entire segment [W].  Distributed uniformly per
                              unit length.  Ignored when isothermal=True.
                              Default 0.0 (adiabatic).
+            mu             : float or None, viscosity [Pa*s] forwarded to
+                             compressible_pipe_segment() for every slice.  If
+                             None (default), CoolProp is queried at each slice
+                             and falls back to Lee-Gonzalez-Eakin on failure.
             T_cricondentherm,
             P_cricondenbar,
             T_critical,
@@ -154,6 +162,15 @@ class Line_Segment(Base_Line_Segment):
                              build_phase_envelope is expensive for
                              multicomponent HEOS mixtures.  Default None
                              (envelope is built on each call).
+            energy_tol     : float, stagnation-enthalpy residual tolerance
+                             [J/kg] forwarded to compressible_pipe_segment()'s
+                             adaptive splitter.  Default 10.0.  Ignored when
+                             isothermal=True.
+            dPdL_rel_tol   : float, relative dP/dL-change tolerance forwarded
+                             to compressible_pipe_segment()'s adaptive
+                             splitter.  Default 0.05 (5%).
+            max_split_depth: int, maximum recursive bisection depth permitted
+                             per profile slice.  Default 8 (=256x refinement).
 
         Returns:
             (AS, profile_points) where AS is the updated CoolProp
@@ -219,7 +236,7 @@ class Line_Segment(Base_Line_Segment):
             dz      = elev_out - elev_in   # m, elevation rise (positive = uphill)
             q_slice = q_per_length * dL    # W, heat for this slice
 
-            compressible_hydraulics2(
+            compressible_pipe_segment(
                 abstract_state=AS,
                 mdot=mdot,
                 dL=dL,
@@ -229,10 +246,14 @@ class Line_Segment(Base_Line_Segment):
                 flow_area=area_in,
                 isothermal=isothermal,
                 q_wall=q_slice,
+                mu=mu,
                 T_cricondentherm=T_cric,
                 P_cricondenbar=P_bar,
                 T_critical=T_c,
                 P_critical=P_c,
+                energy_tol=energy_tol,
+                dPdL_rel_tol=dPdL_rel_tol,
+                _max_split_depth=max_split_depth,
             )
 
             # Area-change correction at the boundary to the next slice.
@@ -272,6 +293,7 @@ class Bend(Base_Bend):
         self,
         abstract_state,
         flow_rate,
+        mu=None,
         T_cricondentherm=None,
         P_cricondenbar=None,
         T_critical=None,
@@ -287,6 +309,10 @@ class Bend(Base_Bend):
             abstract_state : CoolProp AbstractState, pre-updated to inlet (P, T)
                              by the caller.  Updated in-place on return.
             flow_rate      : pint Quantity -- mass, molar, or volumetric flow.
+            mu             : float or None, viscosity [Pa*s] used in the
+                             Reynolds number calculation.  If None (default),
+                             CoolProp is queried and falls back to
+                             Lee-Gonzalez-Eakin on failure.
             T_cricondentherm,
             P_cricondenbar,
             T_critical,
@@ -304,10 +330,11 @@ class Bend(Base_Bend):
         A  = math.pi * Di ** 2 / 4.0
 
         rho_in = AS.rhomass()
-        try:
-            mu = AS.viscosity()
-        except Exception:
-            mu = viscosity_LGE(AS.T(), AS.molar_mass() * 1000.0, rho_in)
+        if mu is None:
+            try:
+                mu = AS.viscosity()
+            except Exception:
+                mu = viscosity_LGE(AS.T(), AS.molar_mass() * 1000.0, rho_in)
 
         v_in = mdot / (rho_in * A)
         Re   = fluids_Reynolds(V=v_in, D=Di, rho=rho_in, mu=mu)
@@ -1007,7 +1034,7 @@ def compressible_K(
     return AS
 
 
-def compressible_hydraulics2(
+def compressible_pipe_segment(
     abstract_state,
     mdot,
     dL,
@@ -1022,9 +1049,29 @@ def compressible_hydraulics2(
     P_cricondenbar=None,
     T_critical=None,
     P_critical=None,
+    energy_tol=10.0,
+    dPdL_rel_tol=0.05,
+    _split_depth=0,
+    _max_split_depth=8,
     ):
     """Calculate compressible pipe-flow hydraulics over a single pipe slice
-    using either the Euler method
+    using the Euler method with an adaptive bisection refinement.
+
+    The slice is taken as a single forward-Euler step using inlet-evaluated
+    properties.  After the step, two convergence metrics are evaluated at the
+    trial outlet state:
+
+      1. (Non-isothermal only)  The stagnation-enthalpy residual of the
+         uncorrected Euler step, |energy_error|, compared against energy_tol.
+      2. The relative change in dP/dL between inlet and trial outlet,
+         compared against dPdL_rel_tol.
+
+    If either metric exceeds its tolerance, abstract_state is restored to
+    inlet conditions and the slice is recursively bisected (halving dL, dz,
+    and q_wall) until both metrics fall within tolerance or _max_split_depth
+    is reached.  When the slice converges, a one-iteration Newton correction
+    is applied to T_out (non-isothermal case) so the final state satisfies
+    the stagnation-enthalpy balance exactly.
 
     The caller must update abstract_state to the inlet (P, T) conditions before
     calling this function.  On return, abstract_state is updated in-place to the
@@ -1051,6 +1098,23 @@ def compressible_hydraulics2(
         mu              : float or None, viscosity [Pa*s].  If None, CoolProp
                           is queried at each stage; falls back to the
                           Lee-Gonzalez-Eakin correlation if CoolProp raises error.
+                          A None value is preserved across recursive splits so
+                          each sub-slice queries its own inlet viscosity.
+        energy_tol      : float, maximum allowed pre-correction stagnation
+                          enthalpy residual [J/kg] before the slice is split.
+                          Default 10.0 J/kg (~5e-3 K of T error for typical
+                          natural-gas Cp; the post-split Newton correction
+                          cleans up the remaining residual exactly).  Ignored
+                          when isothermal=True.
+        dPdL_rel_tol    : float, maximum allowed relative change in dP/dL
+                          between inlet and trial outlet before the slice is
+                          split.  Default 0.05 (5%).
+        _split_depth    : int, internal recursion counter.  Do not set from
+                          calling code; used to enforce _max_split_depth.
+        _max_split_depth: int, maximum recursive bisection depth.  Default 8
+                          (= up to 256x refinement of the caller's slice).
+                          A RuntimeError is raised if convergence is not
+                          achieved within this many splits.
 
     """
     grav_constant    = 9.8066
@@ -1074,7 +1138,7 @@ def compressible_hydraulics2(
     ]
     if _invalid:
         raise ValueError(
-            f"compressible_hydraulics2: invalid parameter values — all must be "
+            f"compressible_pipe_segment: invalid parameter values — all must be "
             f"positive (roughness may be zero): {', '.join(_invalid)}."
         )
 
@@ -1088,7 +1152,7 @@ def compressible_hydraulics2(
     phase = AS.phase()
     if phase == _CP_PHASE_TWOPHASE:
         raise RuntimeError(
-            f"compressible_hydraulics: fluid is two-phase at inlet "
+            f"compressible_pipe_segment: fluid is two-phase at inlet "
             f"(P={P_in:.4g} Pa, T={T_in:.4g} K).  Single-phase hydraulics "
             f"only.  Consider checking your inlet conditions."
         )
@@ -1096,6 +1160,10 @@ def compressible_hydraulics2(
     rho_in = AS.rhomass()       # kg/m^3
     Cp  = AS.cpmass()        # J/(kg*K)
 
+    # Preserve the caller's mu argument (which may be None) for forwarding to
+    # recursive split calls -- each sub-slice should re-query CoolProp at its
+    # own inlet rather than reuse the parent slice's inlet viscosity.
+    mu_user = mu
     if mu is None:
         try:
             mu = AS.viscosity()   # Pa*s
@@ -1112,7 +1180,7 @@ def compressible_hydraulics2(
 
     if Ma >= choke_mach_limit:
         raise RuntimeError(
-            f"compressible_hydraulics: inlet Mach number Ma={Ma:.4f} "
+            f"compressible_pipe_segment: inlet Mach number Ma={Ma:.4f} "
             f"is sonic or near-sonic.  Reduce flow rate or check geometry."
         )
 
@@ -1145,28 +1213,24 @@ def compressible_hydraulics2(
         # after MUCH REARRANGING, you get:
         # dP/dL = (f * rho * v^2/(2*D_h) * (1-v^2 * B / rho) + rho * g * dz/dL - v^2 * B/mdot * dq/dL)/(v^2*A + v^2 * B/rho - 1)
         # where     ^friction contribution                     ^elevation change contrib      ^heat transfer contribution
-        
+
         #We can use the Euler method to estimate the pressure at the end of a length slice dL
 
         #First, calculate those oddball partial derivatives
-        A = AS.first_partial_deriv(CP.iDmass, CP.iP, CP.iHmass) 
+        A = AS.first_partial_deriv(CP.iDmass, CP.iP, CP.iHmass)
         B = AS.first_partial_deriv(CP.iDmass, CP.iHmass, CP.iP)
         #Now, calculate each contributing component of the dP/dL.
         dP_dL_denominator_factor = v_in**2*A + v_in**2*B/rho_in - 1
         dP_dL_friction = (f_darcy*rho_in*v_in**2/(2*D_h)*(1-v_in**2*B/rho_in))/dP_dL_denominator_factor
         dP_dL_gravity = (rho_in * grav_constant * dz/dL)/dP_dL_denominator_factor
         dP_dL_heatxfr = (-v_in**2*B*q_wall/(mdot * dL))/dP_dL_denominator_factor
+        dPdL_in = dP_dL_friction + dP_dL_gravity + dP_dL_heatxfr
 
-        # print(f'friction contrib: {dP_dL_friction}')
-        # print(f'gravity contrib:{dP_dL_gravity}')
-        # print(f'heat contrib: {dP_dL_heatxfr}')
-
-        dP = dL * (dP_dL_friction+ dP_dL_gravity + dP_dL_heatxfr)
-
+        dP = dL * dPdL_in
         P_out = P_in + dP
 
-        #Ideally we would just calculate the output entropy and be good to go with that as our second state variable, and this works fine for single component systems. 
-        # change in entropy = change in entropy due to heat transfer (q_wall/(mdot * T)) + change in entropy due to friction (f_darcy * v^2/(2*D_h * Tin)) 
+        #Ideally we would just calculate the output entropy and be good to go with that as our second state variable, and this works fine for single component systems.
+        # change in entropy = change in entropy due to heat transfer (q_wall/(mdot * T)) + change in entropy due to friction (f_darcy * v^2/(2*D_h * Tin))
         # S_out = S_in + dS
         #   (From chapter 3 of "Fundamentals of Gas Dynamics, 2nd Ed." by Zucker and Biblarz". See equations 3.1 and 3.64)
 
@@ -1180,36 +1244,108 @@ def compressible_hydraulics2(
             q_wall / mdot - (T_in / rho_in**2) * drhodT_P * dP + f_darcy * v_in**2 / (2.0 * D_h) * dL
         )
         T_out = T_in + dT
-        _safe_update_PT(AS, P_out, T_out, T_cricondentherm, P_cricondenbar, T_critical, P_critical)
 
-        #We do however know the total (stagnation) enthalpy from our energy balance. Compare H(P, T) to what we would expect from an energy balance.
-        H_total_out = H_in + q_wall/mdot + v_in**2/2 - grav_constant*dz
+        # Try to land at the trial outlet and evaluate the splitter metrics.
+        # If the Euler step over-extrapolated into an unphysical region
+        # (P < 0, two-phase, EOS failure) the AS update raises -- treat that
+        # as an unambiguous "needs split" signal.
+        trial_eval_error = None
+        try:
+            _safe_update_PT(AS, P_out, T_out, T_cricondentherm, P_cricondenbar,
+                            T_critical, P_critical)
 
-        #And we can compare it to what would be given by our calculated temperature
-        rho_out_calc = AS.rhomass()
-        v_out_calc = mdot / (flow_area * rho_out_calc)
-        H_total_calc = AS.hmass() + v_out_calc**2/2
-        energy_error = H_total_out - H_total_calc
-        #We can figure out about how much we need to adjust our temperature to make our energy balance for a second guess.
-        #Differentiating the energy error:
+            # Pre-correction stagnation-enthalpy residual (first splitter metric).
+            H_total_out  = H_in + q_wall/mdot + v_in**2/2 - grav_constant*dz
+            rho_out_trial = AS.rhomass()
+            v_out_trial   = mdot / (flow_area * rho_out_trial)
+            H_total_calc  = AS.hmass() + v_out_trial**2/2
+            energy_error  = H_total_out - H_total_calc
+
+            # Recompute dP/dL at the trial outlet using the same derivation as
+            # at the inlet (second splitter metric).
+            if mu_user is not None:
+                mu_out = mu_user
+            else:
+                try:
+                    mu_out = AS.viscosity()
+                except:
+                    mu_out = viscosity_LGE(T_out, AS.molar_mass() * 1000.0, rho_out_trial)
+            Re_out      = fluids_Reynolds(V=v_out_trial, D=D_h, rho=rho_out_trial, mu=mu_out)
+            f_darcy_out = fluids_friction_factor(Re=Re_out, eD=roughness / D_h)
+            A_out = AS.first_partial_deriv(CP.iDmass, CP.iP,     CP.iHmass)
+            B_out = AS.first_partial_deriv(CP.iDmass, CP.iHmass, CP.iP)
+            denom_out     = v_out_trial**2 * A_out + v_out_trial**2 * B_out / rho_out_trial - 1.0
+            dPdL_fric_out = (f_darcy_out * rho_out_trial * v_out_trial**2 / (2 * D_h)
+                             * (1 - v_out_trial**2 * B_out / rho_out_trial)) / denom_out
+            dPdL_grav_out = (rho_out_trial * grav_constant * dz / dL) / denom_out
+            dPdL_heat_out = (-v_out_trial**2 * B_out * q_wall / (mdot * dL)) / denom_out
+            dPdL_out      = dPdL_fric_out + dPdL_grav_out + dPdL_heat_out
+
+            # Splitter decision: split if either metric is out of tolerance.
+            # The 1.0 Pa/m floor in dPdL_avg prevents division-by-zero artifacts
+            # when both slopes happen to be tiny (e.g. zero-q horizontal slice).
+            dPdL_avg    = max(abs(dPdL_in), abs(dPdL_out), 1.0)
+            dPdL_relchg = abs(dPdL_out - dPdL_in) / dPdL_avg
+            needs_split = (abs(energy_error) > energy_tol) or (dPdL_relchg > dPdL_rel_tol)
+        except (RuntimeError, ValueError) as exc:
+            # Trial state unevaluable -- definitely need to split.  Mark the
+            # metrics as undefined so the depth-exceeded message is informative.
+            trial_eval_error = exc
+            energy_error     = float('nan')
+            dPdL_relchg      = float('nan')
+            needs_split      = True
+
+        if needs_split:
+            if _split_depth >= _max_split_depth:
+                if trial_eval_error is not None:
+                    raise RuntimeError(
+                        f"compressible_pipe_segment: trial outlet state "
+                        f"(P={P_out:.4g} Pa, T={T_out:.4g} K) is unphysical "
+                        f"after {_max_split_depth} recursive splits "
+                        f"(dL={dL:.4g} m, P_in={P_in:.4g} Pa, T_in={T_in:.4g} K).  "
+                        f"Underlying error: {trial_eval_error}"
+                    ) from trial_eval_error
+                raise RuntimeError(
+                    f"compressible_pipe_segment: slice failed to converge after "
+                    f"{_max_split_depth} recursive splits "
+                    f"(dL={dL:.4g} m, P_in={P_in:.4g} Pa, T_in={T_in:.4g} K, "
+                    f"energy_error={energy_error:.3g} J/kg [tol={energy_tol:.3g}], "
+                    f"dPdL_relchg={dPdL_relchg:.3g} [tol={dPdL_rel_tol:.3g}]).  "
+                    f"Reduce upstream profile slice length, loosen tolerances, "
+                    f"or raise _max_split_depth."
+                )
+            # Restore AS to inlet conditions so the recursive halves start
+            # from the correct state.  This is the one extra EOS update the
+            # splitter costs us per split event.
+            _safe_update_PT(AS, P_in, T_in, T_cricondentherm, P_cricondenbar,
+                            T_critical, P_critical)
+            half_kwargs = dict(
+                mdot=mdot, dz=dz/2.0, D_h=D_h,
+                roughness=roughness, flow_area=flow_area,
+                q_wall=q_wall/2.0, isothermal=isothermal, mu=mu_user,
+                T_cricondentherm=T_cricondentherm, P_cricondenbar=P_cricondenbar,
+                T_critical=T_critical, P_critical=P_critical,
+                energy_tol=energy_tol, dPdL_rel_tol=dPdL_rel_tol,
+                _split_depth=_split_depth + 1,
+                _max_split_depth=_max_split_depth,
+            )
+            # First half: AS (P_in, T_in) -> (P_mid, T_mid)
+            compressible_pipe_segment(AS, dL=dL/2.0, **half_kwargs)
+            # Second half: AS (P_mid, T_mid) -> (P_out, T_out)
+            compressible_pipe_segment(AS, dL=dL/2.0, **half_kwargs)
+            return AS
+
+        # Converged: apply the one-iteration Newton correction to T_out so
+        # the final state satisfies stagnation enthalpy exactly.
+        # Differentiating the energy error:
         # d(error)/dT = (∂H/∂T)_P + (1/2) * (∂v/∂T)_P
-        #Use the continuity to convert v to rho
-        #d(error)/dT = Cp - mdot/(A*rho^2) * (∂ρ/∂T)_P <-- (that same isobaric compressibilityish factor from earlier)
-        # Use this to nudge T back closer to what it should be and update the abstract state
-        Cp = AS.cpmass()
-        drhodT_P = AS.first_partial_deriv(CP.iDmass, CP.iT, CP.iP)
-        T_out = T_out + energy_error / (Cp - (mdot/(flow_area*rho_out_calc))*drhodT_P)
-
-        #compute again
+        # Use continuity to convert v to rho:
+        # d(error)/dT = Cp - mdot/(A*rho^2) * (∂ρ/∂T)_P
+        Cp_out_state  = AS.cpmass()
+        drhodT_P_out  = AS.first_partial_deriv(CP.iDmass, CP.iT, CP.iP)
+        T_out = T_out + energy_error / (Cp_out_state - (mdot/(flow_area*rho_out_trial))*drhodT_P_out)
         _safe_update_PT(AS, P_out, T_out, T_cricondentherm, P_cricondenbar, T_critical, P_critical)
-        rho_out_calc = AS.rhomass()
-        v_out_calc = mdot / (flow_area * rho_out_calc)
-        H_total_calc = AS.hmass() + v_out_calc**2/2
-        energy_error2 = H_total_out - H_total_calc
 
-        # print(f'Energy error 1: {energy_error}')
-        # print(f'Energy error 2: {energy_error2}')
-        #If the energy error is still significant at this point, you really need a smaller length slice
     else:
         #For the isothermal case, we know the outlet temperature but need to estimate the outlet pressure.
         #We can go back to our energy and entropy balances:
@@ -1229,19 +1365,85 @@ def compressible_hydraulics2(
         drhodP_T = AS.first_partial_deriv(CP.iDmass, CP.iP, CP.iT)
 
         dP = (-rho_in * f_darcy*v_in**2*dL/(2*D_h) - rho_in * grav_constant * dz)/(1- v_in**2 * drhodP_T)
+        dPdL_in = dP / dL
         P_out = P_in + dP
         T_out = T_in
-        _safe_update_PT(AS, P_out, T_out, T_cricondentherm, P_cricondenbar, T_critical, P_critical)
 
-    #Check outlet Mach number
-    rho_out = AS.rhomass()   
-    a_out   = AS.speed_sound()   # m/s  (isentropic speed of sound)
-    v_out  = mdot / (rho_out * flow_area)   # m/s
-    Ma_out = v_out / a_out                       # Mach number
+        # Try to land at the trial outlet and evaluate the splitter metric.
+        # If the Euler step over-extrapolated into an unphysical region the AS
+        # update raises an error -- treat that as an unambiguous "needs split" signal.
+        trial_eval_error = None
+        try:
+            _safe_update_PT(AS, P_out, T_out, T_cricondentherm, P_cricondenbar,
+                            T_critical, P_critical)
+            # Recompute dP/dL at the trial outlet for the splitter check.  There's
+            # no energy balance to check in the isothermal case (T is fixed by
+            # assumption), so dP/dL change is the only convergence metric.
+            rho_out_trial = AS.rhomass()
+            v_out_trial   = mdot / (flow_area * rho_out_trial)
+            if mu_user is not None:
+                mu_out = mu_user
+            else:
+                try:
+                    mu_out = AS.viscosity()
+                except:
+                    mu_out = viscosity_LGE(T_out, AS.molar_mass() * 1000.0, rho_out_trial)
+            Re_out       = fluids_Reynolds(V=v_out_trial, D=D_h, rho=rho_out_trial, mu=mu_out)
+            f_darcy_out  = fluids_friction_factor(Re=Re_out, eD=roughness / D_h)
+            drhodP_T_out = AS.first_partial_deriv(CP.iDmass, CP.iP, CP.iT)
+            dPdL_out = (-rho_out_trial * f_darcy_out * v_out_trial**2 / (2 * D_h)
+                        - rho_out_trial * grav_constant * dz / dL) / (1 - v_out_trial**2 * drhodP_T_out)
 
+            dPdL_avg    = max(abs(dPdL_in), abs(dPdL_out), 1.0)
+            dPdL_relchg = abs(dPdL_out - dPdL_in) / dPdL_avg
+            needs_split = dPdL_relchg > dPdL_rel_tol
+        except (RuntimeError, ValueError) as exc:
+            trial_eval_error = exc
+            dPdL_relchg      = float('nan')
+            needs_split      = True
+
+        if needs_split:
+            if _split_depth >= _max_split_depth:
+                if trial_eval_error is not None:
+                    raise RuntimeError(
+                        f"compressible_pipe_segment: isothermal trial outlet state "
+                        f"(P={P_out:.4g} Pa, T={T_out:.4g} K) is unphysical after "
+                        f"{_max_split_depth} recursive splits "
+                        f"(dL={dL:.4g} m, P_in={P_in:.4g} Pa, T_in={T_in:.4g} K).  "
+                        f"Underlying error: {trial_eval_error}"
+                    ) from trial_eval_error
+                raise RuntimeError(
+                    f"compressible_pipe_segment: isothermal slice failed to converge "
+                    f"after {_max_split_depth} recursive splits "
+                    f"(dL={dL:.4g} m, P_in={P_in:.4g} Pa, T_in={T_in:.4g} K, "
+                    f"dPdL_relchg={dPdL_relchg:.3g} [tol={dPdL_rel_tol:.3g}]).  "
+                    f"Reduce upstream profile slice length, loosen tolerances, "
+                    f"or raise _max_split_depth."
+                )
+            _safe_update_PT(AS, P_in, T_in, T_cricondentherm, P_cricondenbar,
+                            T_critical, P_critical)
+            half_kwargs = dict(
+                mdot=mdot, dz=dz/2.0, D_h=D_h,
+                roughness=roughness, flow_area=flow_area,
+                q_wall=q_wall/2.0, isothermal=isothermal, mu=mu_user,
+                T_cricondentherm=T_cricondentherm, P_cricondenbar=P_cricondenbar,
+                T_critical=T_critical, P_critical=P_critical,
+                energy_tol=energy_tol, dPdL_rel_tol=dPdL_rel_tol,
+                _split_depth=_split_depth + 1,
+                _max_split_depth=_max_split_depth,
+            )
+            compressible_pipe_segment(AS, dL=dL/2.0, **half_kwargs)
+            compressible_pipe_segment(AS, dL=dL/2.0, **half_kwargs)
+            return AS
+
+    # Outlet Mach check.  AS is at the (converged) outlet state in both branches.
+    rho_out = AS.rhomass()
+    a_out   = AS.speed_sound()
+    v_out   = mdot / (rho_out * flow_area)
+    Ma_out  = v_out / a_out
     if Ma_out >= choke_mach_limit:
         raise RuntimeError(
-            f"compressible_hydraulics: outlet Mach number Ma={Ma_out:.4f} "
+            f"compressible_pipe_segment: outlet Mach number Ma={Ma_out:.4f} "
             f"is sonic or near-sonic.  Reduce flow rate or check geometry."
         )
 
@@ -1278,7 +1480,7 @@ def test_comp_hydraulics():
     print('\n')
     print(f'inputs: P = {P_gas}, Smass= {S_in}, velocity = {v_in}, Mach number = {Ma_in}')
     # print('\n')
-    result_g = compressible_hydraulics2(
+    result_g = compressible_pipe_segment(
         abstract_state=AS_g,   # already updated to (P_gas, T_gas) above
         mdot=mdot,
         dL=dL_gas,
@@ -1303,7 +1505,7 @@ def test_comp_hydraulics():
 
     AS_g.update(CP.PT_INPUTS, P_gas, T_gas) #reinitialize abstract state
 
-    result_g = compressible_hydraulics2(
+    result_g = compressible_pipe_segment(
         abstract_state=AS_g,   # already updated to (P_gas, T_gas) above
         mdot=mdot,
         dL=dL_gas,
@@ -1326,21 +1528,21 @@ def test_comp_hydraulics():
     print(f'outputs: P = {outlet_P}, T = {outlet_T}, Smass= {S_out}, velocity = {v_out}, Mach number = {Ma_out}')
 
 def test_line_segment_csv():
-    csv_path = os.path.join(os.path.dirname(__file__), "Example_Well_Survey.csv")
+    csv_path = os.path.join(os.path.dirname(__file__), "testprofile_crane.csv")
     roughness = ureg.Quantity(0.00015, "ft")
 
     seg = Line_Segment.from_csv(csv_path, roughness=roughness, name='1')
 
-    P_in = ureg.Quantity(8000, "psi").to("Pa").magnitude
-    T_in = 437.0   # K
-    Q_scfd = ureg.Quantity(10, "mmscf/day")
+    P_in = ureg.Quantity(1300, "psi").to("Pa").magnitude
+    T_in = ureg.Quantity(40, "degF").to("degK").magnitude   # K
+    Q_scfd = ureg.Quantity(125.5, "mmscf/day")
 
     AS = composition.define_composition(
-        y_Methane = 0.95,
-        y_Ethane = 0.05,
-        y_Propane=0.02,
-        y_n_Butane = 0.01,
-        y_CarbonDioxide= 0.02,
+        y_Methane = 0.75,
+        y_Ethane = 0.21,
+        y_Propane=0.04,
+        # y_n_Butane = 0.01,
+        # y_CarbonDioxide= 0.02,
         # y_Water = 1.0,
         eos = "HEOS"
     )
@@ -1353,7 +1555,7 @@ def test_line_segment_csv():
     print("\ntest_line_segment_csv")
     print(f"  inlet: P={P_in:.4g} Pa, T={T_in} K, Ma={Ma_in:.4f}")
 
-    AS, profile_points = seg.dP_dT(abstract_state=AS, flow_rate=Q_scfd, isothermal=False)
+    AS, profile_points = seg.dP_dT(abstract_state=AS, flow_rate=Q_scfd, isothermal=True, mu = 1.1e-5)
     P_out = AS.p()
     T_out = AS.T()
    
@@ -1390,7 +1592,7 @@ def test_line_segment_csv():
     # l2, = ax2.plot(dist_ft, v_fts, color="red",   label="Velocity(ft/s)")
     # ax2.set_ylabel("Velocity (ft/s)")
 
-    ax2.legend([l1, l2], ["Pressure [psi]", "Velocity (ft/s)"])
+    ax2.legend([l1, l2], ["Pressure [psi]", "Temperature (°F)"])
     plt.title(f'Pressure and temperature profile at {Q_scfd}')
     plt.tight_layout()
     plt.show()

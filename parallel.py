@@ -275,17 +275,15 @@ def test_parallel_compressible():
     Q_scfd = ureg.Quantity(30, "mmscf/day")
     print(f'Inlet P:{P_in}, T:{T_in}')
     AS = composition.define_composition(
-        y_Methane = 1,
-        # y_Ethane = 0.05,
-        # y_Propane=0.02,
-        # y_n_Butane = 0.01,
-        # y_CarbonDioxide= 0.02,
-        y_Hydrogen=0.8,
-        eos = "HEOS"
+        y_Methane = 0.9,
+        y_Ethane = 0.05,
+        y_Propane=0.02,
+        y_n_Butane = 0.01,
+        y_CarbonDioxide= 0.02,
+        # y_Hydrogen=0.8,
+        eos = "PR"
     )
-    # Raw AS.update(PT_INPUTS, ...) trips CoolProp's HEOS phase-stability
-    # analyzer for H2-rich mixtures at supercritical conditions.  Use the
-    # same helper parallel_compressible uses internally.
+
     _safe_update_PT(AS, P_in, T_in, *_build_phase_limits(AS))
 
     segment_list = []
