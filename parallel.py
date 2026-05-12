@@ -211,7 +211,7 @@ def parallel_compressible(line_segment_list, AS, total_flow_rate):
         for c in items:
             if hasattr(c, "total_length_m"):
                 # Line_Segment: forward precomputed phase-envelope limits.
-                AS_out, _ = c.dP_dT(
+                c.dP_dT(
                     AS, flow_rate,
                     T_cricondentherm=T_cric, P_cricondenbar=P_bar,
                     T_critical=T_c, P_critical=P_c,
@@ -221,12 +221,12 @@ def parallel_compressible(line_segment_list, AS, total_flow_rate):
                 # limits so internal PT updates can apply the same supercritical
                 # phase hint -- needed for some mixtures where HEOS phase
                 # stability analysis fails.
-                AS_out = c.dP_dT(
+                c.dP_dT(
                     AS, flow_rate,
                     T_cricondentherm=T_cric, P_cricondenbar=P_bar,
                     T_critical=T_c, P_critical=P_c,
                 )
-        return AS_out.p(), AS_out.T()
+        return AS.p(), AS.T()
 
     def _outlet(branch, ff):
         return _branch_outlet(branch, total_flow_rate * ff)

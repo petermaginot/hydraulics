@@ -17,9 +17,9 @@ Classes
 Line_Segment  (inherits Base_Line_Segment)
     Adds dP_dT() for compressible flow.  Steps through consecutive profile
     point pairs via compressible_pipe_segment(), applying isentropic
-    area-change corrections at inter-slice boundaries.  Returns the outlet
-    AbstractState together with a list of (distance, pressure, temperature,
-    velocity) tuples for profile plotting.
+    area-change corrections at inter-slice boundaries.  Updates the
+    AbstractState in place and returns a list of (distance, pressure,
+    temperature, velocity) tuples for profile plotting.
 
 Bend  (inherits Base_Bend)
     Adds dP_dT() using fluids.fittings.bend_rounded() to obtain K, then
@@ -173,11 +173,11 @@ class Line_Segment(Base_Line_Segment):
                              per profile slice.  Default 8 (=256x refinement).
 
         Returns:
-            (AS, profile_points) where AS is the updated CoolProp
-            AbstractState at outlet conditions, and profile_points is a list
-            of (distance_m, pressure_Pa, temperature_K, velocity_ms) tuples,
-            one per profile point (inlet through outlet), suitable for
-            constructing pressure, temperature, or velocity profile plots.
+            profile_points: a list of (distance_m, pressure_Pa, temperature_K,
+            velocity_ms) tuples, one per profile point (inlet through outlet),
+            suitable for constructing pressure, temperature, or velocity
+            profile plots.  abstract_state is updated in place to outlet
+            conditions.
 
         Raises:
             ValueError   : if the profile has fewer than two points or
@@ -259,11 +259,11 @@ class Line_Segment(Base_Line_Segment):
             # Area-change correction at the boundary to the next slice.
             area_ratio = abs(area_out - area_in) / max(area_in, area_out)
             if area_ratio > _AREA_TOL:
-                AS = compressible_changing_area_K(
+                compressible_changing_area_K(
                     AS, mdot, area_in, area_out, K=0.0,
                     T_cricondentherm=T_cric, P_cricondenbar=P_bar,
                     T_critical=T_c, P_critical=P_c,
-                ) #is it necessary to set AS = compressible_changing_area_K since the abstract state is updated in place?
+                )
 
             # Record conditions at this profile point after all corrections.
             P_cur   = AS.p()
@@ -273,7 +273,7 @@ class Line_Segment(Base_Line_Segment):
             msg = str(f"Segment {self.name} Step: {i+1} of {n-1}, P = {P_cur}, T = {T_cur}")
             print(msg, end="\r")
         print(f" "*len(msg), end="\r")
-        return AS, profile_points
+        return profile_points
 
 
 class Bend(Base_Bend):
@@ -321,7 +321,7 @@ class Bend(Base_Bend):
                              supercritical phase hint and bypass HEOS phase
                              stability analysis (which fails for some mixtures).
         Returns:
-            abstract_state updated to outlet (P, T) conditions.
+            None.  abstract_state is updated in place to outlet conditions.
         """
         AS   = abstract_state
         mdot = _resolve_mdot(flow_rate, AS)
@@ -345,7 +345,7 @@ class Bend(Base_Bend):
             Re=Re,
         )
 
-        return compressible_K(
+        compressible_K(
             AS, mdot, A, K,
             T_cricondentherm=T_cricondentherm,
             P_cricondenbar=P_cricondenbar,
@@ -398,7 +398,7 @@ class Contraction_Expansion(Base_Contraction_Expansion):
                              supercritical phase hint.
 
         Returns:
-            abstract_state updated to outlet (P, T) conditions.
+            None.  abstract_state is updated in place to outlet conditions.
         """
         AS   = abstract_state
         mdot = _resolve_mdot(flow_rate, AS)
@@ -407,7 +407,7 @@ class Contraction_Expansion(Base_Contraction_Expansion):
         Di_DS = self.Di_DS_si
 
         if abs(Di_US - Di_DS) < 1e-12:
-            return AS
+            return
 
         A_US = math.pi * Di_US ** 2 / 4.0
         A_DS = math.pi * Di_DS ** 2 / 4.0
@@ -420,7 +420,7 @@ class Contraction_Expansion(Base_Contraction_Expansion):
             # Expansion: fluids returns K w.r.t. upstream velocity directly.
             K = fluids.fittings.diffuser_sharp(Di1=Di_US, Di2=Di_DS)
 
-        return compressible_changing_area_K(
+        compressible_changing_area_K(
             AS, mdot, A_US, A_DS, K,
             T_cricondentherm=T_cricondentherm,
             P_cricondenbar=P_cricondenbar,
@@ -664,7 +664,6 @@ def _safe_update_PT(AS, P, T, T_cricondentherm=None, P_cricondenbar=None,
                 )
             raise RuntimeError(msg) from exc
 
-
 def compressible_changing_area(abstract_state, mdot, A_in, A_out):
     """Isentropic pressure and temperature correction for a ideal gas compressible fluid
     passing through a change in flow area.
@@ -821,8 +820,9 @@ def compressible_changing_area_K(
     an area change with a known loss coefficient K applied to inlet velocity.
 
     The caller must update abstract_state to the inlet (P, T) conditions before
-    calling.  The abstract state is updated before return - the calling function can 
-    retrieve the updated pressure and temperature from the returned abstract state.
+    calling.  The abstract state is updated in place to outlet conditions, so
+    the caller reads outlet pressure and temperature from the same object after
+    the call returns.
 
     Enforces two integrated balance equations simultaneously:
 
@@ -851,7 +851,7 @@ def compressible_changing_area_K(
                          head (dimensionless, >= 0).
 
     Returns:
-        (P_out, T_out) -- tuple of floats [Pa, K].
+        None.  abstract_state is updated in place to outlet conditions.
 
     Raises:
         ValueError   : if mdot, A_in, or A_out are non-positive, K is negative,
@@ -926,7 +926,6 @@ def compressible_changing_area_K(
 
     P_out, T_out = sol.x
     _safe_update_PT(AS, P_out, T_out, T_cricondentherm, P_cricondenbar, T_critical, P_critical)
-    return AS
 
 
 def compressible_K(
@@ -959,7 +958,7 @@ def compressible_K(
                          head (dimensionless, >= 0).
 
     Returns:
-        abstract_state updated to outlet (P, T) conditions.
+        None.  abstract_state is updated in place to outlet conditions.
 
     Raises:
         ValueError   : if mdot or flow_area are non-positive, or K is negative.
@@ -1030,8 +1029,6 @@ def compressible_K(
             f"compressible_K: outlet Mach number Ma={Ma_out:.4f} is near-sonic.  "
             f"Reduce flow rate or check geometry."
         )
-
-    return AS
 
 
 def compressible_pipe_segment(
@@ -1116,6 +1113,8 @@ def compressible_pipe_segment(
                           A RuntimeError is raised if convergence is not
                           achieved within this many splits.
 
+    Returns:
+        None.  abstract_state is updated in place to outlet conditions.
     """
     grav_constant    = 9.8066
     choke_mach_limit = 0.98
@@ -1187,6 +1186,8 @@ def compressible_pipe_segment(
     # Friction factor and Reynolds number at inlet conditions.
     Re = fluids_Reynolds(V=v_in, D=D_h, rho=rho_in, mu=mu)
     f_darcy = fluids_friction_factor(Re=Re, eD=roughness / D_h)
+    # print(f_darcy)
+
 
     if not isothermal:
         #We will first calculate dP for a known dL, using fluid properties at the inlet conditions and assuming they don't enough over the length slice to affect the calculation.
@@ -1333,7 +1334,7 @@ def compressible_pipe_segment(
             compressible_pipe_segment(AS, dL=dL/2.0, **half_kwargs)
             # Second half: AS (P_mid, T_mid) -> (P_out, T_out)
             compressible_pipe_segment(AS, dL=dL/2.0, **half_kwargs)
-            return AS
+            return
 
         # Converged: apply the one-iteration Newton correction to T_out so
         # the final state satisfies stagnation enthalpy exactly.
@@ -1434,7 +1435,7 @@ def compressible_pipe_segment(
             )
             compressible_pipe_segment(AS, dL=dL/2.0, **half_kwargs)
             compressible_pipe_segment(AS, dL=dL/2.0, **half_kwargs)
-            return AS
+            return
 
     # Outlet Mach check.  AS is at the (converged) outlet state in both branches.
     rho_out = AS.rhomass()
@@ -1446,8 +1447,6 @@ def compressible_pipe_segment(
             f"compressible_pipe_segment: outlet Mach number Ma={Ma_out:.4f} "
             f"is sonic or near-sonic.  Reduce flow rate or check geometry."
         )
-
-    return AS
 
 
 def test_comp_hydraulics():
@@ -1480,7 +1479,7 @@ def test_comp_hydraulics():
     print('\n')
     print(f'inputs: P = {P_gas}, Smass= {S_in}, velocity = {v_in}, Mach number = {Ma_in}')
     # print('\n')
-    result_g = compressible_pipe_segment(
+    compressible_pipe_segment(
         abstract_state=AS_g,   # already updated to (P_gas, T_gas) above
         mdot=mdot,
         dL=dL_gas,
@@ -1490,13 +1489,13 @@ def test_comp_hydraulics():
         flow_area=A_gas,
         isothermal=True,
     )
-    outlet_P = result_g.p()
-    outlet_T = result_g.T()
-    rho_out = result_g.rhomass()
-    a_out   = result_g.speed_sound()                # m/s
+    outlet_P = AS_g.p()
+    outlet_T = AS_g.T()
+    rho_out = AS_g.rhomass()
+    a_out   = AS_g.speed_sound()                # m/s
     v_out   = mdot / (rho_out * A_gas)          # m/s
     Ma_out = v_out/a_out
-    S_out = result_g.smass()
+    S_out = AS_g.smass()
 
     # print('\n')
     print('Isothermal case')
@@ -1505,7 +1504,7 @@ def test_comp_hydraulics():
 
     AS_g.update(CP.PT_INPUTS, P_gas, T_gas) #reinitialize abstract state
 
-    result_g = compressible_pipe_segment(
+    compressible_pipe_segment(
         abstract_state=AS_g,   # already updated to (P_gas, T_gas) above
         mdot=mdot,
         dL=dL_gas,
@@ -1516,13 +1515,13 @@ def test_comp_hydraulics():
         isothermal=False,
         q_wall = ureg.Quantity(0, "Btu/hr").to("watt").magnitude,
     )
-    outlet_P = result_g.p()
-    outlet_T = result_g.T()
-    rho_out = result_g.rhomass()
-    a_out   = result_g.speed_sound()                # m/s
+    outlet_P = AS_g.p()
+    outlet_T = AS_g.T()
+    rho_out = AS_g.rhomass()
+    a_out   = AS_g.speed_sound()                # m/s
     v_out   = mdot / (rho_out * A_gas)          # m/s
     Ma_out = v_out/a_out
-    S_out = result_g.smass()
+    S_out = AS_g.smass()
 
     print('Adiabadic case')
     print(f'outputs: P = {outlet_P}, T = {outlet_T}, Smass= {S_out}, velocity = {v_out}, Mach number = {Ma_out}')
@@ -1555,7 +1554,7 @@ def test_line_segment_csv():
     print("\ntest_line_segment_csv")
     print(f"  inlet: P={P_in:.4g} Pa, T={T_in} K, Ma={Ma_in:.4f}")
 
-    AS, profile_points = seg.dP_dT(abstract_state=AS, flow_rate=Q_scfd, isothermal=True, mu = 1.1e-5)
+    profile_points = seg.dP_dT(abstract_state=AS, flow_rate=Q_scfd, isothermal=True, mu = 1.1e-5)
     P_out = AS.p()
     T_out = AS.T()
    
@@ -1645,11 +1644,11 @@ def test_fittings():
     )
     AS.update(CP.PT_INPUTS, P_in, T_in)
 
-    AS = contraction_test.dP_dT(AS, Q_scfd)
+    contraction_test.dP_dT(AS, Q_scfd)
     print(f'After contraction P:{AS.p()}, T:{AS.T()}')
-    AS = expansion_test.dP_dT(AS, Q_scfd)
+    expansion_test.dP_dT(AS, Q_scfd)
     print(f'After expansion P:{AS.p()}, T:{AS.T()}')
-    AS = elbow.dP_dT(abstract_state=AS, flow_rate=Q_scfd)
+    elbow.dP_dT(abstract_state=AS, flow_rate=Q_scfd)
     print(f'After elbow P:{AS.p()}, T:{AS.T()}')
 
 
