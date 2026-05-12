@@ -102,6 +102,79 @@ def test_deNevers8_10():
             Q_scfd = Q_scfd * (P_2 / P_target)
     print('Textbook solution: mass flow rate = 0.317 lbm/s, outlet velocity = 675.5 ft/s, outlet temperature = 622 deg R, Mach #=0.553')
 
+def test_ZuckerBiblarz5_7():
+    #Example on pages 124-126 in "Fundamentals of Gas Dynamics, 2nd Ed" by Robert Zucker and Oscar Biblarz
+    #Isentropic changing area flow
+    #Air at stagnation conditions of 100 psia and 600 deg Rflows through a nozzle into a receiver at 80.2 psia
+    #Find final Mach number, temperature and velocity
+    #Assume an arbitrary large area initially for stagnation conditions, and a significantly smaller area for final conditions
+    A0 = 1000
+    A1 = 1
+
+    mdot = 1000 #kg/s, initial guess, iterate it until pressure matches target
+
+    P0    = ureg.Quantity(100, "psi").to("Pa").magnitude    # Pa
+    T0 = ureg.Quantity(600, "degR").to("degK").magnitude    # K
+
+    P_target  = ureg.Quantity(80.2, "psi").to("Pa").magnitude    # Pa
+
+    AS = composition.define_composition(
+        y_Nitrogen = 0.79,
+        y_Oxygen = 0.21,
+        eos = "HEOS"
+        )
+
+    phase_limits = _build_phase_limits(AS)
+    T_cricondentherm, P_cricondenbar, T_critical, P_critical = phase_limits
+
+    tolerance_Pa = ureg.Quantity(0.01, "psi").to("Pa").magnitude
+
+    # Bisection bracket in mscf/day; None until that side has been evaluated
+    mdot_low = None   # highest flow rate tried that gives P_2 > P_target (need more flow)
+    mdot_high = None  # lowest flow rate tried that gives P_2 < P_target (need less flow)
+
+    for iteration in range(30):
+        _safe_update_PT(AS, P0, T0, *phase_limits)
+
+        #For point 0 to point 1, gas undergoes isentropic acceleration through ideal converging nozzle.
+        #Assume a very large upstream area so velocity is approximately zero; K = 0 (lossless)
+        compressible_changing_area_K(
+            abstract_state=AS, mdot=mdot, A_in=A0, A_out=A1, K=0,
+            T_cricondentherm=T_cricondentherm, P_cricondenbar=P_cricondenbar,
+            T_critical=T_critical, P_critical=P_critical,
+        )
+
+        P_1 = AS.p()
+        T_1 = AS.T()
+        v_1 = mdot / AS.rhomass() / A1
+        m_1 = v_1 / AS.speed_sound()
+        error_psi = ureg.Quantity(P_1 - P_target, "Pa").to("psi").magnitude
+
+        print(f'Iteration {iteration + 1}: mdot = {ureg.Quantity(mdot,"kg/s").to("lb/s"):.4f}')
+        print(f'  P_0 = {ureg.Quantity(P0,"Pa").to("psi"):.4f}')
+        print(f'  P_1 = {ureg.Quantity(P_1,"Pa").to("psi"):.4f}, T_1 = {ureg.Quantity(T_1,"degK").to("degR"):.2f}')
+        print(f'  v_1 = {ureg.Quantity(v_1,"m/s").to("ft/s"):.2f}, Mach = {m_1:.4f}, P_error = {error_psi:+.4f} psi\n')
+
+
+        if abs(P_1 - P_target) < tolerance_Pa:
+            print(f'Converged after {iteration + 1} iteration(s).')
+            break
+
+        # Update bisection bracket: higher mdot → more pressure drop → lower P_2
+        mdot_val = mdot
+        if P_1 > P_target:
+            mdot_low = mdot_val   # need more flow; record as lower bound
+        else:
+            mdot_high = mdot_val  # need less flow; record as upper bound
+
+        if mdot_low is not None and mdot_high is not None:
+            # Both bracket sides known — bisect to guarantee convergence
+            mdot = (mdot_low + mdot_high) / 2
+        else:
+            # Only one side bracketed yet — scale proportionally to find the other side quickly
+            mdot = mdot * (P_1 / P_target)
+    print('Textbook solution: outlet velocity = 663 ft/s, outlet temperature = 563 deg R, Mach #=0.57')
+
 def test_ZuckerBiblarz9_3():
     #Example 9.3 on pages 259-260 in "Fundamentals of Gas Dynamics, 2nd Ed" by Robert Zucker and Oscar Biblarz
     #Adiabadic flow with friction (Fanno flow)
@@ -202,9 +275,15 @@ def test_ZuckerBiblarz10_3():
 
 
 if __name__ == "__main__":
-    print('de Nevers problem 8.10:')
-    test_deNevers8_10()
-    print('\nZucker & Biblarz problem 9.3:')
-    test_ZuckerBiblarz9_3()
-    print('\nZucker & Biblarz problem 10.3:')
-    test_ZuckerBiblarz10_3()
+    print('\nZucker & Biblarz unnumbered example in section 5.7 (isentropic converging nozzle):')
+    test_ZuckerBiblarz5_7()
+
+    # print('\nZucker & Biblarz example 9.3 (Fanno flow):')
+    # test_ZuckerBiblarz9_3()
+    
+    # print('de Nevers problem 8.10 (isentropic converging nozzle and Fanno flow):')
+    # test_deNevers8_10()
+
+    # print('\nZucker & Biblarz example 10.3 (Rayleigh flow):')
+    # test_ZuckerBiblarz10_3()
+
