@@ -25,6 +25,10 @@ Bend  (inherits Base_Bend)
     Adds dP_dT() using fluids.fittings.bend_rounded() to obtain K, then
     delegates to compressible_K().
 
+Valve  (inherits Base_Valve)
+    Adds dP_dT() using the pre-computed K-factor stored on the instance,
+    delegating to compressible_K().
+
 Contraction_Expansion  (inherits Base_Contraction_Expansion)
     Adds dP_dT() using fluids.fittings.contraction_sharp() or
     diffuser_sharp() to obtain K, then delegates to
@@ -90,6 +94,7 @@ from component_classes import (
     Base_Line_Segment,
     Base_Bend,
     Base_Contraction_Expansion,
+    Base_Valve,
     ureg,
 )
 
@@ -347,6 +352,64 @@ class Bend(Base_Bend):
 
         compressible_K(
             AS, mdot, A, K,
+            T_cricondentherm=T_cricondentherm,
+            P_cricondenbar=P_cricondenbar,
+            T_critical=T_critical,
+            P_critical=P_critical,
+        )
+
+
+class Valve(Base_Valve):
+    """Valve fitting with compressible pressure/temperature calculation.
+
+    Modeled as adiabatic.  Inherits geometry storage and validation from
+    Base_Valve.  Uses the pre-computed K-factor stored on the instance, so
+    no Reynolds-number or correlation lookup is performed.
+
+    Constructor arguments are identical to Base_Valve:
+        Di : pint Quantity or float (m if float).  Pipe inner diameter.
+        K  : float.  Resistance coefficient (K-factor), referenced to the
+             pipe velocity head.
+    """
+
+    def dP_dT(
+        self,
+        abstract_state,
+        flow_rate,
+        T_cricondentherm=None,
+        P_cricondenbar=None,
+        T_critical=None,
+        P_critical=None,
+    ):
+        """Outlet conditions for a compressible fluid passing through the valve.
+
+        The caller must update abstract_state to the inlet (P, T) conditions
+        before calling.  Delegates directly to compressible_K() using the
+        K-factor stored on the instance.
+
+        Args:
+            abstract_state : CoolProp AbstractState, pre-updated to inlet (P, T)
+                             by the caller.  Updated in-place on return.
+            flow_rate      : pint Quantity -- mass, molar, or volumetric flow.
+            T_cricondentherm,
+            P_cricondenbar,
+            T_critical,
+            P_critical     : optional precomputed phase-envelope limits, forwarded
+                             to compressible_K() so PT updates can specify a
+                             supercritical phase hint and bypass HEOS phase
+                             stability analysis (which fails for some mixtures).
+
+        Returns:
+            None.  abstract_state is updated in place to outlet conditions.
+        """
+        AS   = abstract_state
+        mdot = _resolve_mdot(flow_rate, AS)
+
+        Di = self.Di_si
+        A  = math.pi * Di ** 2 / 4.0
+
+        compressible_K(
+            AS, mdot, A, self.K,
             T_cricondentherm=T_cricondentherm,
             P_cricondenbar=P_cricondenbar,
             T_critical=T_critical,

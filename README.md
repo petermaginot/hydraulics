@@ -1,14 +1,14 @@
 # Hydraulics
 
-This software performs hydraulic analysis of piping systems for both incompressible (liquid) and compressible (gas) fluids. The general workflow is:
+This software performs hydraulic analysis of piping systems for both incompressible and compressible fluids. The general workflow is:
 
-1. Build the fluid conduit out of components (pipe segments with elevation profiles, bends, and abrupt contractions/expansions).
+1. Build the fluid conduit out of components (pipe segments with elevation profiles, bends, valves, and abrupt contractions/expansions).
 2. Set up the fluid properties — either via an `Incompressible_Fluid` instance (for liquids) or a CoolProp `AbstractState` (for gases/mixtures).
 3. Call the component's calculating method (`dP` for incompressible, `dP_dT` for compressible) to solve for outlet conditions at a given flow rate.
 
-Pipeline branches can be wired in parallel via the helpers in `parallel.py`, which solve the flow-split balance such that every branch ends up at the same outlet pressure.
+Pipeline branches can be wired in series and/or parallel via the helpers in `parallel.py`, which solve the flow-split balance such that every branch ends up at the same outlet pressure.
 
-All quantities accept [pint](https://pint.readthedocs.io/) `Quantity` inputs for unit-safe entry, and the unit registry includes custom standard-volume units (`scm`, `scf`, `mscf`, `mmscf`) defined as mole equivalents so they can be supplied directly as flow rates.
+Most quantities accept [pint](https://pint.readthedocs.io/) `Quantity` inputs for unit-safe entry, and the unit registry includes custom standard-volume units (`scm`, `scf`, `mscf`, `mmscf`) defined as mole equivalents so they can be supplied directly as flow rates.
 
 ---
 
@@ -30,7 +30,10 @@ Non-circular cross-sections are supported by supplying `hydraulic_diameter` and 
 Convenience properties: `total_length_m`, `net_elevation_change_m`, `volume_m3`.
 
 ### `Base_Bend`
-Geometry storage for a rounded pipe bend fitting. Stores the inner diameter, bend angle (degrees), and bend-radius-to-diameter ratio (e.g. 1.5 for a standard long-radius elbow). All values must be positive.
+Geometry storage for a rounded (non-mitred) pipe bend/elbow fitting. Stores the inner diameter, bend angle (degrees), and bend-radius-to-diameter ratio (e.g. 1.5 for a standard long-radius elbow). All values must be positive.
+
+### `Base_Valve`
+Geometry storage for a valve fitting. Stores the pipe inner diameter and a pre-computed K-factor (resistance coefficient) referenced to the pipe velocity head. The K-factor is supplied at initialization rather than computed by the class, leaving the caller free to use whatever correlation or vendor data is appropriate for the valve type and position. `Di` must be positive and `K` must be `>= 0`. This pairs nicely with the fluids library's K factor correlations for valves, and you can call that library when you create a Valve class object.
 
 ### `Base_Contraction_Expansion`
 Geometry storage for an abrupt contraction or expansion fitting. Stores upstream and downstream inner diameters. If `Di_US == Di_DS` there is no area change and the fitting has no effect.
@@ -68,6 +71,9 @@ Adds the methods:
 ### `Bend` (inherits `Base_Bend`)
 Adds `dP(fluid, flow_rate)` using the `fluids.fittings.bend_rounded()` K-factor correlation, which accounts for bend angle, bend radius, and Reynolds number. Result is always ≤ 0.
 
+### `Valve` (inherits `Base_Valve`)
+Adds `dP(fluid, flow_rate)` using the pre-computed K-factor stored on the instance: `dP = -K · ½ρv²`. No correlation or Reynolds-number lookup is performed. Result is always ≤ 0.
+
 ### `Contraction_Expansion` (inherits `Base_Contraction_Expansion`)
 Adds `dP(fluid, flow_rate)` returning the total static pressure change (Bernoulli velocity-head exchange + permanent K-factor loss). Returns 0 when `Di_US == Di_DS`.
 
@@ -101,52 +107,50 @@ Returns a list of `(distance_m, P_Pa, T_K, v_ms)` tuples — one per profile poi
 ### `Bend` (inherits `Base_Bend`)
 Modeled as adiabatic. Adds **`dP_dT(abstract_state, flow_rate, mu=None, ...)`** which uses `fluids.fittings.bend_rounded()` to obtain the K-factor and delegates to `compressible_K()`.
 
+### `Valve` (inherits `Base_Valve`)
+Modeled as adiabatic. Adds **`dP_dT(abstract_state, flow_rate, ...)`** which passes the pre-computed K-factor stored on the instance directly to `compressible_K()` — no viscosity, Reynolds-number, or correlation lookup is performed.
+
 ### `Contraction_Expansion` (inherits `Base_Contraction_Expansion`)
 Modeled as adiabatic. Adds **`dP_dT(abstract_state, flow_rate, ...)`** which obtains the K-factor from `fluids.fittings.contraction_sharp()` (for contractions; the result is converted from a downstream- to an upstream-velocity reference) or `diffuser_sharp()` (for expansions), then delegates to `compressible_changing_area_K()`.
 
-### Core integration functions
+### Core functions
 
-- **`compressible_pipe_segment(abstract_state, mdot, dL, dz, D_h, roughness, flow_area, q_wall=0.0, isothermal=False, mu=None, ...)`** — the workhorse. Solves the coupled dP/dL and dT/dL ODEs (or the simpler isothermal dP/dL equation) over a single pipe slice using a forward-Euler step with a one-iteration energy-balance correction.
+- **`compressible_pipe_segment(abstract_state, mdot, dL, dz, D_h, roughness, flow_area, q_wall=0.0, isothermal=False, mu=None, ...)`** — This one is the real beast!. It solves coupled dP/dL and dT/dL ODEs (or the simpler isothermal dP/dL equation) over a single pipe slice using a forward-Euler step with a one-iteration energy-balance correction.
 
   After the trial step, two convergence metrics are evaluated at the trial outlet:
-  1. (Non-isothermal only) stagnation-enthalpy residual `|H_in + q/mdot + v_in²/2 − g·dz − (H_out + v_out²/2)|` vs `energy_tol`.
-  2. Relative change in dP/dL between inlet and trial outlet vs `dPdL_rel_tol`.
+  1. If not isothermal, an energy balance is performed (Stagnation enthalpy + heat in in minus stagnation enthalpy out = residual) `|H_in + q/mdot + v_in²/2 − g·dz − (H_out + v_out²/2)|` vs `energy_tol`.
+  2. For all cases, the relative change in dP/dL between inlet and outlet fluid properties is compared to `dPdL_rel_tol`.
 
-  If either metric is out of tolerance, the slice is recursively bisected (halving `dL`, `dz`, and `q_wall`) until convergence or `_max_split_depth` is exhausted. A final one-step Newton correction is applied to `T_out` so the converged state satisfies stagnation enthalpy energy balance exactly. Sonic / two-phase / unphysical-EOS-update conditions raise `RuntimeError`.
+  If either metric is out of tolerance, the slice is recursively bisected (halving `dL`, `dz`, and `q_wall`) until convergence or `_max_split_depth` is exhausted. A final one-step Newton correction is applied to `T_out` so the converged state satisfies stagnation enthalpy energy balance (almost) exactly. Sonic / two-phase / unphysical-EOS-update conditions raise `RuntimeError`.
 
-  The dP/dL derivation begins from the energy balance `1/mdot · dq/dL = dH/dL − v²/ρ · dρ/dL + g·dz/dL`, combined with the continuity and entropy balances (Zucker & Biblarz, *Fundamentals of Gas Dynamics* 2nd ed., eqs 3.1 / 3.64) and the thermodynamic identity `dH = T·dS + dP/ρ`. After substitution, the result is:
+  The dP/dL derivation begins from the energy balance `1/mdot · dq/dL = dH/dL − v²/ρ · dρ/dL + g·dz/dL`, combined with the continuity and entropy balances (Zucker & Biblarz, *Fundamentals of Gas Dynamics* 2nd ed., eqs 3.1 / 3.64) and the thermodynamic identity `dH = T·dS + dP/ρ`.
 
-  ```
-  dP/dL = [ f·ρ·v²/(2·D_h)·(1 − v²·B/ρ)  +  ρ·g·dz/dL  −  v²·B/mdot · dq/dL ]
-          / [ v²·A + v²·B/ρ − 1 ]
-  ```
+  You can see a chicken scratch version of this derivation in the Derivation_images folder, or a more detailed discussion in the comments for the function.
 
-  where `A = (∂ρ/∂P)_H` and `B = (∂ρ/∂H)_P`. `T` then steps via the identity `dH = Cp·dT + [V − T·(∂V/∂T)_P]·dP`.
-
-- **`compressible_changing_area(abstract_state, mdot, A_in, A_out)`** — ideal gas isentropic outlet `(P, T)` for an area change, using the area-Mach relation to find the subsonic outlet Mach number and recovering static conditions from total-condition ratios. `gamma = Cp/Cv` is taken from the `AbstractState` at inlet. Returns `(P_out, T_out)` without mutating the state (used as the initial guess for the loss-coefficient form).
+- **`compressible_changing_area(abstract_state, mdot, A_in, A_out)`** — ideal gas isentropic outlet `(P, T)` for an area change, using the area-Mach relation to find the subsonic outlet Mach number and recovering static conditions from total-condition ratios. `gamma = Cp/Cv` is taken from the `AbstractState` at inlet. Returns `(P_out, T_out)` without mutating the state. This function is used as the initial guess for the compressible_changing_area_K.
 
 - **`compressible_changing_area_K(abstract_state, mdot, A_in, A_out, K, ...)`** — outlet conditions for an area change with a known loss coefficient `K` (referenced to inlet velocity head). Solves the simultaneous balance equations:
 
   1. Stagnation-enthalpy conservation: `H_out + v_out²/2 = H_in + v_in²/2`.
   2. Entropy generation from the irreversible loss: `S_out − S_in = K·v_in² / (2·T_avg)`.
 
-  via `scipy.optimize.root` (hybrid method), with the isentropic result as the initial guess. Updates the `AbstractState` in place.
+  via `scipy.optimize.root` (hybrid method), with the isentropic result as the initial guess. Updates the `AbstractState` in place. This function is rather slow, as the scipy root finding takes a lot of iterations with a lot of abstract state updates, but unfortunately there's no easy one-step process to estimate this.
 
-- **`compressible_K(abstract_state, mdot, flow_area, K, ...)`** — outlet conditions for a constant-area fitting (e.g. bend) with a known `K`. Applies a single-step analytical result derived from the combined energy + continuity + entropy + EOS equations with `dA = 0`:
+- **`compressible_K(abstract_state, mdot, flow_area, K, ...)`** — outlet conditions for a constant-area fitting (e.g. bend, valve) with a known `K`. Applies a single-step analytical result derived from the combined energy + continuity + entropy + EOS equations with `dA = 0`:
 
   ```
   dP = -K·v²·ρ/2  /  [1  −  v²·(∂ρ/∂P)_H / (1 − (v²/ρ)·(∂ρ/∂H)_P)]
   dT = [K·v²/2 + (1/ρ − (∂H/∂P)_T)·dP] / Cp
   ```
 
-  For low Mach numbers `dP` reduces to the familiar `−K·ρ·v²/2`. A one-iteration Newton correction is then applied to `T_out` to enforce stagnation-enthalpy conservation exactly.
+  For low Mach numbers `dP` reduces to the familiar `−K·ρ·v²/2`. A one-iteration Newton correction is then applied to `T_out` to enforce stagnation-enthalpy conservation exactly. A somewhat illegible handwritten derivation appears in the Derivation_images folder.
 
 ### Helpers
 
 - **`_resolve_mdot(flow_rate, abstract_state)`** — convert a pint `Quantity` to mass flow rate [kg/s]. Accepts mass (`kg/s`, `lb/hr`), molar / standard-volume (`mol/s`, `scf/day`, `mmscf/day`), or actual volumetric (`m³/s`, `ft³/min`). Standard-volume units are defined as mole equivalents in the unit registry, so they fall through the molar branch automatically.
-- **`viscosity_LGE(T, mol_wt, density)`** — Lee-Gonzalez-Eakin correlation for hydrocarbon gas viscosity. Used as a fallback when the chosen EOS (e.g. Peng-Robinson) does not support viscosity calculation.
+- **`viscosity_LGE(T, mol_wt, density)`** — Lee-Gonzalez-Eakin correlation for hydrocarbon gas viscosity. Used as a fallback when the chosen EOS (e.g. Peng-Robinson) does not support viscosity calculation. Note that this correlation is only valid for light hydrocarbon gases, so be careful. I should probably build in some sort of warning that displays if it is used with non-hydrocarbon components.
 - **`_build_phase_limits(AS)`** — builds the phase envelope on a temporary `AbstractState` (so the working state's solver isn't corrupted) and returns `(T_cricondentherm, P_cricondenbar, T_critical, P_critical)`. Returns `None` for any field that couldn't be computed; both queries failing yields `(None, None, None, None)`. The envelope tracer is fragile for some HEOS mixtures and the PR backend, which is why the critical-point query is wrapped separately.
-- **`_safe_update_PT(AS, P, T, ...)`** — wraps `AS.update(PT_INPUTS, ...)` with an explicit phase hint when the state is definitely outside the two-phase region. Bypasses CoolProp's internal phase-stability analysis, which can return false two-phase detections near the envelope for some mixtures.
+- **`_safe_update_PT(AS, P, T, ...)`** — wraps `AS.update(PT_INPUTS, ...)` with an explicit phase hint when the state is definitely outside the two-phase region. Bypasses CoolProp's internal phase-stability analysis, which can return false two-phase detections near the envelope for some mixtures. This function is dramatically faster and more reliable than using CoolProp's native abstract state update function when operating well outside of the two-phase region.
 
 ---
 
@@ -172,7 +176,7 @@ This module is currently a standalone calculator; the `q_wall` parameter in `com
 
 ## Parallel branches — [parallel.py](parallel.py)
 
-Solve the flow split between two or more parallel branches that share inlet and outlet nodes. Each branch may be a single component (`Line_Segment`, `Bend`, `Contraction_Expansion`) or a list of components run in series — in the series case the branch dP is the sum of its components, and (for compressible) the `AbstractState` is chained outlet-to-inlet through the components in order.
+Solve the flow split between two or more parallel branches that share inlet and outlet nodes. Each branch may be a single component (`Line_Segment`, `Bend`, `Valve`, `Contraction_Expansion`) or a list of components run in series — in the series case the branch dP is the sum of its components, and (for compressible) the `AbstractState` is chained outlet-to-inlet through the components in order.
 
 Both functions issue a warning when branch net elevation changes disagree by more than 0.1 m, since parallel branches must share inlet/outlet elevation to correspond to a physically realizable layout.
 
@@ -186,7 +190,7 @@ dP_target  = Σ(dP_i / s_i) / Σ(1 / s_i)
 Δff_i      = (dP_target − dP_i) / s_i
 ```
 
-Because elevation head is flow-independent, only the friction term enters the slope — this keeps Newton stable at low flow rates where elevation dominates and a ratio-based correction would stall. `Σ Δff_i = 0` by construction, so total flow is exactly preserved.
+Because elevation head is flow-independent, only the friction term enters the slope — this keeps Newton stable at low flow rates where elevation dominates and a ratio-based correction would stall. 
 
 ### `parallel_compressible(line_segment_list, AS, total_flow_rate)`
 Returns `(P_out_list, T_out_list, flow_fraction_list)`. The phase envelope is built once and forwarded into every `dP_dT` call so per-call `build_phase_envelope` is skipped (the composition does not change across iterations).

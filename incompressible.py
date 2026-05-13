@@ -21,6 +21,9 @@ Line_Segment  (inherits Base_Line_Segment)
 Bend  (inherits Base_Bend)
     Adds dP() using the fluids.fittings.bend_rounded() K-factor correlation.
 
+Valve  (inherits Base_Valve)
+    Adds dP() using the pre-computed K-factor stored on the instance.
+
 Contraction_Expansion  (inherits Base_Contraction_Expansion)
     Adds dP() using Bernoulli velocity-head exchange plus K-factor loss.
 
@@ -56,6 +59,7 @@ from component_classes import (
     Base_Line_Segment,
     Base_Bend,
     Base_Contraction_Expansion,
+    Base_Valve,
     _to_si,
     _resolve_id,
     _flow_props_from_id,
@@ -398,6 +402,47 @@ class Bend(Base_Bend):
             Re=Re,
         )
         return -K * 0.5 * rho * v ** 2
+
+
+# ---------------------------------------------------------------------------
+# Valve -- incompressible child class
+# ---------------------------------------------------------------------------
+
+class Valve(Base_Valve):
+    """Valve fitting with incompressible pressure-drop calculation.
+
+    Inherits geometry storage and validation from Base_Valve.  Adds dP() using
+    the pre-computed K-factor stored on the instance.
+
+    Constructor arguments are identical to Base_Valve:
+        Di : pint Quantity or float (m if float).  Pipe inner diameter.
+        K  : float.  Resistance coefficient (K-factor), referenced to the
+             pipe velocity head.
+    """
+
+    def dP(self, fluid, flow_rate):
+        """Permanent pressure loss through the valve [Pa].
+
+        Uses the K-factor stored on the instance:
+
+            dP = -K * (1/2) * rho * v^2
+
+        Args:
+            fluid     : Incompressible_Fluid instance.
+            flow_rate : pint Quantity -- volumetric or mass flow rate.
+                        Same conventions as Line_Segment.dP().
+
+        Returns:
+            float, pressure change [Pa].  Always <= 0 (loss).
+        """
+        rho = fluid.density_si
+        Di  = self.Di_si
+        A   = math.pi * Di ** 2 / 4.0
+
+        Q = _resolve_flow_rate(flow_rate, rho)
+        v = Q / A
+
+        return -self.K * 0.5 * rho * v ** 2
 
 
 # ---------------------------------------------------------------------------

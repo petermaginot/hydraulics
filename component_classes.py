@@ -19,6 +19,10 @@ Base_Bend
     A rounded pipe bend fitting.  Stores inner diameter, bend angle, and
     bend-radius-to-diameter ratio.
 
+Base_Valve
+    A valve fitting.  Stores pipe inner diameter and a pre-computed K-factor
+    (resistance coefficient).
+
 Base_Contraction_Expansion
     An abrupt contraction or expansion between two pipe diameters.  Stores
     upstream and downstream inner diameters.
@@ -631,6 +635,47 @@ class Base_Bend:
             f"Di={Di_q.to('inch'):.4f~P}, "
             f"angle={self.ang_deg:.1f} deg, "
             f"bend_diameters={self.bend_dias:.2f})"
+        )
+
+
+# ---------------------------------------------------------------------------
+# Base_Valve
+# ---------------------------------------------------------------------------
+
+class Base_Valve:
+    """Geometry storage for a valve fitting.
+
+    Stores the pipe inner diameter and a pre-computed K-factor (resistance
+    coefficient).  Subclasses add fluid-mechanics pressure-drop calculations
+    appropriate for the flow regime (incompressible, compressible, etc.).
+
+    Args:
+        Di : pint Quantity or float (m if float).  Pipe inner diameter.
+             Must be positive.
+        K  : float.  Resistance coefficient (K-factor), computed externally
+             and supplied at initialization.  Must be >= 0.
+    """
+
+    def __init__(self, Di, K, name=None):
+        self.name  = name
+        self.Di_si = _to_si(Di, "m")
+        self.K     = float(K)
+
+        if self.Di_si is None or self.Di_si <= 0.0:
+            raise ValueError(
+                f"{self.__class__.__name__}: Di must be a positive length."
+            )
+        if self.K < 0.0:
+            raise ValueError(
+                f"{self.__class__.__name__}: K must be >= 0."
+            )
+
+    def __repr__(self):
+        Di_q = ureg.Quantity(self.Di_si, "m")
+        return (
+            f"{self.__class__.__name__}("
+            f"Di={Di_q.to('inch'):.4f~P}, "
+            f"K={self.K:.4f})"
         )
 
 

@@ -1,4 +1,4 @@
-from compressible import Line_Segment, Bend, Contraction_Expansion, _build_phase_limits, _safe_update_PT, compressible_changing_area_K, _safe_update_PT, compressible_pipe_segment
+
 import CoolProp.CoolProp as CP
 from CoolProp.CoolProp import AbstractState
 import composition
@@ -7,6 +7,7 @@ import math
 import os
 
 def test_deNevers8_10():
+    from compressible import Line_Segment, Bend, Contraction_Expansion, _build_phase_limits, _safe_update_PT, compressible_changing_area_K, _safe_update_PT, compressible_pipe_segment
     #Example 8.10 on pages 315-317 in "Fluid Mechanics for Chemical Engineers, 3rd Ed" by Noel de Nevers
     #Adiabadic flow with friction (Fanno flow)
     #Given P0 (stagnation) = 30 psia, T0 (stagnation) = 200 F find flow rate if receiving reservoir P3 = 18 psia
@@ -103,6 +104,7 @@ def test_deNevers8_10():
     print('Textbook solution: mass flow rate = 0.317 lbm/s, outlet velocity = 675.5 ft/s, outlet temperature = 622 deg R, Mach #=0.553')
 
 def test_ZuckerBiblarz5_7():
+    from compressible import Line_Segment, Bend, Contraction_Expansion, _build_phase_limits, _safe_update_PT, compressible_changing_area_K, _safe_update_PT, compressible_pipe_segment
     #Example on pages 124-126 in "Fundamentals of Gas Dynamics, 2nd Ed" by Robert Zucker and Oscar Biblarz
     #Isentropic changing area flow
     #Air at stagnation conditions of 100 psia and 600 deg Rflows through a nozzle into a receiver at 80.2 psia
@@ -176,6 +178,7 @@ def test_ZuckerBiblarz5_7():
     print('Textbook solution: outlet velocity = 663 ft/s, outlet temperature = 563 deg R, Mach #=0.57')
 
 def test_ZuckerBiblarz9_3():
+    from compressible import Line_Segment, Bend, Contraction_Expansion, _build_phase_limits, _safe_update_PT, compressible_changing_area_K, _safe_update_PT, compressible_pipe_segment
     #Example 9.3 on pages 259-260 in "Fundamentals of Gas Dynamics, 2nd Ed" by Robert Zucker and Oscar Biblarz
     #Adiabadic flow with friction (Fanno flow)
     #Air flowing at P1 = 20 psia, T1 = 70 F , v1 = 406 ft/s in a 6" diameter galvanized iron duct (absolute roughness = 0.0005 ft)
@@ -230,7 +233,7 @@ def test_ZuckerBiblarz10_3():
     #Air flowing at P1 = 10.0 psia, T1 = 400 R , v1 = 402 ft/s. 50 btu/lbm of heat is added to the gas.
     #Rayleigh flow assumes no friction, so we will use roughness = 0, L = 0.01 m, and ID = 1 m
     #Find final Mach number, temperature, pressure
-    
+    from compressible import Line_Segment, Bend, Contraction_Expansion, _build_phase_limits, _safe_update_PT, compressible_changing_area_K, _safe_update_PT, compressible_pipe_segment
     P2    = ureg.Quantity(10, "psi").to("Pa").magnitude    # Pa
     T2 = ureg.Quantity(400, "degR").to("degK").magnitude    # K
     ID_pipe = 1.0    # m
@@ -272,18 +275,93 @@ def test_ZuckerBiblarz10_3():
 
     print(f'Textbook ideal gas solution: P_3 = 8.19 psia, T_3 = 580 deg R, Mach #=0.603') 
 
+def test_deNevers6_11():
+    #Example 6.11 and 6.12 on page 203-204 in "Fluid Mechanics for Chemical Engineers, 3rd Ed" by Noel de Nevers
+    #Calculate the pressure drop across 3000 ft of 3" pipe, two globe valves, a swing check valve, and nine standard radius 90 degree elbows.abs
+    #Note that in my copy of the book, the solution to 6.12 has a typo, it multiplies the globe valve K factor by 3 instead of 2, which affects the results. Instead of 31 psi, it should be 23 psi drop across the fittings.
 
+    from parallel import parallel_incompressible
+    from incompressible import Line_Segment, Bend, Incompressible_Fluid, Valve
+    from component_classes import ureg
+    from fluids import fittings
+    ID_pipe = ureg.Quantity(3.068, "inch").to("m").magnitude
+    eps  = ureg.Quantity(0.00015, "ft").to("m").magnitude
+    pipe_length = ureg.Quantity(3000, "ft").to("m").magnitude
+    mu = ureg.Quantity(50, "cP").to("Pa*s").magnitude
+    rho = ureg.Quantity(62.3, "lb/ft^3").to("kg/m^3").magnitude
+    flow_rate = ureg.Quantity(300, "gal/min")
+
+
+    #Initialize classes
+    fittinglist = []    
+    #Pipe
+    PipeSeg = Line_Segment(roughness= eps, id_val = ID_pipe, length= pipe_length, elevation_change = 0)
+    fittinglist.append(PipeSeg)
+
+    #globe valves
+    K_globe = fittings.K_globe_valve_Crane(D1=ID_pipe, D2=ID_pipe)
+    print(f'Globe valve K = {K_globe}')
+    GlobeValve1 = Valve(ID_pipe, K_globe, 'Globe valve 1')
+    GlobeValve2 = Valve(ID_pipe, K_globe, 'Globe valve 2')
+    fittinglist.append(GlobeValve1)
+    fittinglist.append(GlobeValve2)
+
+    #swing check
+    K_swing_check = fittings.K_swing_check_valve_Crane(D= ID_pipe, angled=True)
+    SwingCheck = Valve(ID_pipe, K_swing_check, 'Check')
+    fittinglist.append(SwingCheck)
+
+    print(f'Check valve K = {K_swing_check}')
+    #elbows
+    Elbows = []
+    for i in range(9):
+        fittinglist.append(Bend(ID_pipe, 90, 1, str(i)))
+
+    Fld = Incompressible_Fluid(density = rho, viscosity = mu)
+
+    dP, flow_fractions = parallel_incompressible([fittinglist], fluid = Fld, total_flow_rate = flow_rate )
+    dP_pipe = ureg.Quantity(PipeSeg.dP(Fld, flow_rate), "Pa")
+    dP_fittings = ureg.Quantity(dP, "Pa") - dP_pipe
+    print(f'Overall pressure drop:{ ureg.Quantity(dP, "Pa").to("psi")}')
+    print(f'Pipe friction = {dP_pipe.to("psi")}, fitting friction = {dP_fittings.to("psi")}')
+    print('Textbook solution = 529 psi overall, 484 psi due to pipe, 45 psi due to fittings using equivalent lengths (6.11) and 23 psi* using sum of K values (6.12)')
+    print('Pipe friction estimate agrees well, but the textbook K values for fittings are appreciably different from those calculated by the fluids library (Kglobe = 6.3 vs 5.9, Kcheck = 2.0 vs 1.7, Kelbow = 0.74 vs 0.54.')
+    print('*Note that in my copy of the book, the solution to 6.12 has a typo, it multiplies the globe valve K factor by 3 instead of 2. The 31 psi drop across the fittings shown in the text is incorrect, it should be 23 psi drop across the fittings.')
+
+def test_deNevers6_4():
+    #Example 6.4 on page 188 in "Fluid Mechanics for Chemical Engineers, 3rd Ed" by Noel de Nevers
+    #Calculate the pressure drop across 3000 ft of 3" pipe
+
+    from incompressible import Line_Segment, Incompressible_Fluid
+    from component_classes import ureg
+    ID_pipe = ureg.Quantity(3.068, "inch").to("m").magnitude
+    eps  = ureg.Quantity(0.00015, "ft").to("m").magnitude
+    pipe_length = ureg.Quantity(3000, "ft").to("m").magnitude
+    mu = ureg.Quantity(50, "cP").to("Pa*s").magnitude
+    rho = ureg.Quantity(62.3, "lb/ft^3").to("kg/m^3").magnitude
+    flow_rate = ureg.Quantity(300, "gal/min")
+
+    PipeSeg = Line_Segment(roughness= eps, id_val = ID_pipe, length= pipe_length, elevation_change = 0)
+    Fld = Incompressible_Fluid(density = rho, viscosity = mu)
+    dP = PipeSeg.dP(Fld, flow_rate)
+    print( ureg.Quantity(dP, "Pa").to("psi"))
+    print('Textbook solution dP = 484 psi')
 
 if __name__ == "__main__":
-    print('\nZucker & Biblarz unnumbered example in section 5.7 (isentropic converging nozzle):')
-    test_ZuckerBiblarz5_7()
+    # print('\nZucker & Biblarz unnumbered example in section 5.7 (isentropic converging nozzle):')
+    # test_ZuckerBiblarz5_7()
 
     # print('\nZucker & Biblarz example 9.3 (Fanno flow):')
     # test_ZuckerBiblarz9_3()
-    
-    # print('de Nevers problem 8.10 (isentropic converging nozzle and Fanno flow):')
+
+    # print('de Nevers example 8.10 (isentropic converging nozzle and Fanno flow):')
     # test_deNevers8_10()
 
     # print('\nZucker & Biblarz example 10.3 (Rayleigh flow):')
     # test_ZuckerBiblarz10_3()
 
+    print('de Nevers example 6.11 and 6.12 (incompressible fluid friction with pipe and fittings):')
+    test_deNevers6_11()
+
+    # print('de Nevers example 6.4 (incompressible fluid friction with pipe):')
+    # test_deNevers6_4()

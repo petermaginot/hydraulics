@@ -8,7 +8,7 @@ def parallel_incompressible(line_segment_list, fluid, total_flow_rate):
     # line_segment_list is a list of at least two parallel branches.  Each
     # branch is one of:
     #   - a Line_Segment instance,
-    #   - a fitting instance (Bend, Contraction_Expansion), or
+    #   - a fitting instance (Bend, Valve, Contraction_Expansion), or
     #   - a list of the above run in series (branch dP = sum of component dPs).
     # Every branch must implement .dP(fluid=..., flow_rate=...) returning Pa,
     # or, for series-list branches, every contained component must.
@@ -124,7 +124,7 @@ def parallel_compressible(line_segment_list, AS, total_flow_rate):
     # line_segment_list is a list of at least two parallel branches.  Each
     # branch is one of:
     #   - a Line_Segment instance (compressible),
-    #   - a fitting instance (Bend, Contraction_Expansion), or
+    #   - a fitting instance (Bend, Valve, Contraction_Expansion), or
     #   - a list of the above run in series (AS is chained outlet-to-inlet
     #     through the components in order).
     # AS is a CoolProp Abstract State pre-updated to the common inlet (P, T).
@@ -217,10 +217,10 @@ def parallel_compressible(line_segment_list, AS, total_flow_rate):
                     T_critical=T_c, P_critical=P_c,
                 )
             else:
-                # Fitting (Bend / Contraction_Expansion).  Forward phase-envelope
-                # limits so internal PT updates can apply the same supercritical
-                # phase hint -- needed for some mixtures where HEOS phase
-                # stability analysis fails.
+                # Fitting (Bend / Valve / Contraction_Expansion).  Forward
+                # phase-envelope limits so internal PT updates can apply the
+                # same supercritical phase hint -- needed for some mixtures
+                # where HEOS phase stability analysis fails.
                 c.dP_dT(
                     AS, flow_rate,
                     T_cricondentherm=T_cric, P_cricondenbar=P_bar,
