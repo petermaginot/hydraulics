@@ -807,7 +807,7 @@ def compressible_changing_area(abstract_state, mdot, A_in, A_out):
 
     # ------------------------------------------------------------------
     # Isentropic area-Mach function  A/A* = f(M, gamma)
-    # NASA Glenn Eq #9.
+    # NASA Eq #9.
     # ------------------------------------------------------------------
     exp_num = (gamma + 1.0) / (2.0 * (gamma - 1.0))
     def _area_ratio(M):
@@ -1082,7 +1082,7 @@ def compressible_K(
     energy_error = H_stag - (AS.hmass() + v_out_calc**2 / 2.0)
     Cp_out    = AS.cpmass()
     drhodT_P  = AS.first_partial_deriv(CP.iDmass, CP.iT, CP.iP)
-    T_out = T_out + energy_error / (Cp_out - (mdot / (flow_area * rho_out_calc)) * drhodT_P)
+    T_out = T_out + energy_error / (Cp_out - mdot**2/(flow_area**2*rho_out_calc**3) * drhodT_P)
     _safe_update_PT(AS, P_out, T_out, T_cricondentherm, P_cricondenbar, T_critical, P_critical)
 
     rho_out = AS.rhomass()
@@ -1229,12 +1229,11 @@ def compressible_pipe_segment(
     if mu is None:
         try:
             mu = AS.viscosity()   # Pa*s
-        except:
+        except Exception:
             # Fall back to Lee-Gonzalez-Eakin if the EOS (e.g. Peng-Robinson)
             # does not support viscosity.  LGE is for hydrocarbon gases only;
             # supply mu explicitly for other fluids.
             mu = viscosity_LGE(T_in, AS.molar_mass() * 1000.0, rho_in)
-    S_in = AS.smass()   # J/(kg*K) #NOTE not used, may be able to delete
     H_in = AS.hmass()   # J/kg
     a   = AS.speed_sound()   # m/s  (isentropic speed of sound)
     v_in  = mdot / (rho_in * flow_area)   # m/s
@@ -1253,32 +1252,34 @@ def compressible_pipe_segment(
 
 
     if not isothermal:
-        #We will first calculate dP for a known dL, using fluid properties at the inlet conditions and assuming they don't enough over the length slice to affect the calculation.
-        #From the energy balance, dq = mdot * dH + mdot/2 * d(v^2)/2 + mdot * g * dz
-        #From the continuity equation mdot = rho * flow_area * v
-        #Combine these two, take the derivative with respect to length, and do some rearranging (substituting dv^2 = 2vdv and dv = -v/rho * drho)
-        # 1/mdot * dq/dL = dH/dL - v^2/rho * drho/dL + g * dz/dL
-        # We will need to use an equation of state to relate pressure and density. If rho = f(H, P):
-        # drho/dL = (∂rho/∂P)_H * dP/dL + (∂rho/∂H)_P * dH/dL [chain rule for partial derivatives]
-        # We'll call (∂rho/∂P)_H  = A and (∂rho/∂H)_P = B and assume they are relatively constant over the length slice.
+        """
+        We will first calculate dP for a known dL, using fluid properties at the inlet conditions and assuming they don't change enough over the length slice to affect the calculation.
+        From the energy balance, dq = mdot * dH + mdot/2 * d(v^2)/2 + mdot * g * dz
+        From the continuity equation mdot = rho * flow_area * v
+        Combine these two, take the derivative with respect to length, and do some rearranging (substituting dv^2 = 2vdv and dv = -v/rho * drho)
+        1/mdot * dq/dL = dH/dL - v^2/rho * drho/dL + g * dz/dL
+        We will need to use an equation of state to relate pressure and density. If rho = f(H, P):
+        drho/dL = (∂rho/∂P)_H * dP/dL + (∂rho/∂H)_P * dH/dL [chain rule for partial derivatives]
+        We'll call (∂rho/∂P)_H  = A and (∂rho/∂H)_P = B and assume they are relatively constant over the length slice.
 
-        #Accounting for entropy, from "Fundamentals of Gas Dynamics, 2nd Ed." by Zucker and Biblarz", equation 3.1
-        # dS = dSe + dSi
-        #where dSe = entropy change due to heat transfer = 1/mdot * dq/T
-        # and dSi = entropy change due to friction = 1/T * K * v^2/2
-        # and K = f * dL/D_h, where f is Darcy friciton factor and D_h is the hydraulic diameter (or simply the diameter for a round pipe)
+        Accounting for entropy, from "Fundamentals of Gas Dynamics, 2nd Ed." by Zucker and Biblarz", equation 3.1
+        dS = dSe + dSi
+        where dSe = entropy change due to heat transfer = 1/mdot * dq/T
+        and dSi = entropy change due to friction = 1/T * K * v^2/2
+        and K = f * dL/D_h, where f is Darcy friciton factor and D_h is the hydraulic diameter (or simply the diameter for a round pipe)
 
-        #We can use a thermodynamic identity to relate enthalpy, entropy, and pressure:
-        # dH = T*dS + dP/rho (from table 6.2-1 in "Chemical, Biochemical, and Engineering Thermodynmics, 4th ed." by Sandler)
-        #Substituting for dS and taking derivative with respect to length
-        # dH/dL = 1/mdot * dq/dL + f * v^2 / (2 * D_h) + 1/rho * dP/dL
+        We can use a thermodynamic identity to relate enthalpy, entropy, and pressure:
+        dH = T*dS + dP/rho (from table 6.2-1 in "Chemical, Biochemical, and Engineering Thermodynmics, 4th ed." by Sandler)
+        Substituting for dS and taking derivative with respect to length
+        dH/dL = 1/mdot * dq/dL + f * v^2 / (2 * D_h) + 1/rho * dP/dL
 
-        #Then, taking the dH/dL from the partial derivatives chain rule above and plugging it in to eliminate drho/dL and eliminating dH/dL with the two equations for DH/dL,
-        # after MUCH REARRANGING, you get:
-        # dP/dL = (f * rho * v^2/(2*D_h) * (1-v^2 * B / rho) + rho * g * dz/dL - v^2 * B/mdot * dq/dL)/(v^2*A + v^2 * B/rho - 1)
-        # where     ^friction contribution                     ^elevation change contrib      ^heat transfer contribution
+        Then, taking the dH/dL from the partial derivatives chain rule above and plugging it in to eliminate drho/dL and eliminating dH/dL with the two equations for DH/dL,
+        after MUCH REARRANGING, you get:
+        dP/dL = (f * rho * v^2/(2*D_h) * (1-v^2 * B / rho) + rho * g * dz/dL - v^2 * B/mdot * dq/dL)/(v^2*A + v^2 * B/rho - 1)
+        where     ^friction contribution                     ^elevation change contrib      ^heat transfer contribution
 
-        #We can use the Euler method to estimate the pressure at the end of a length slice dL
+        We can use the Euler method to estimate the pressure at the end of a length slice dL
+        """
 
         #First, calculate those oddball partial derivatives
         A = AS.first_partial_deriv(CP.iDmass, CP.iP, CP.iHmass)
@@ -1298,7 +1299,8 @@ def compressible_pipe_segment(
         # S_out = S_in + dS
         #   (From chapter 3 of "Fundamentals of Gas Dynamics, 2nd Ed." by Zucker and Biblarz". See equations 3.1 and 3.64)
 
-        # However, with multicomponent systems, CoolProp has trouble using entropy as one of the inputs, so for robustness we need to use a thermodynamic identity to convert it to something easier to deal with, like temperature.
+        # However, with multicomponent systems, CoolProp has trouble using entropy as one of the inputs for an abstract state update,
+        #  so for robustness we need to use a thermodynamic identity to convert it to something easier to deal with, like temperature.
         # Use dH = TdS + VdP = Cp dT + [V - T (∂V/∂T)_P] dP (from table 6.2-1 in "Chemical, Biochemical, and Engineering Thermodynmics, 4th ed." by Sandler)
         #                                   ^ [V - T (∂V/∂T)_P] is the Joule Thompson coefficient μ times negative heat capacity [-μCp]
         #substitute (∂V/∂T)_P = -1/ρ^2 (∂ρ/∂T)_P and solve for dT
@@ -1332,7 +1334,7 @@ def compressible_pipe_segment(
             else:
                 try:
                     mu_out = AS.viscosity()
-                except:
+                except Exception:
                     mu_out = viscosity_LGE(T_out, AS.molar_mass() * 1000.0, rho_out_trial)
             Re_out      = fluids_Reynolds(V=v_out_trial, D=D_h, rho=rho_out_trial, mu=mu_out)
             f_darcy_out = fluids_friction_factor(Re=Re_out, eD=roughness / D_h)
@@ -1400,14 +1402,18 @@ def compressible_pipe_segment(
             return
 
         # Converged: apply the one-iteration Newton correction to T_out so
-        # the final state satisfies stagnation enthalpy exactly.
-        # Differentiating the energy error:
-        # d(error)/dT = (∂H/∂T)_P + (1/2) * (∂v/∂T)_P
-        # Use continuity to convert v to rho:
-        # d(error)/dT = Cp - mdot/(A*rho^2) * (∂ρ/∂T)_P
+        # the final state satisfies an energy balance. 
+        # H_stagnation = H + v^2/2 + gz
+        # H_stagnation_in + q_in = H_stagnation_out
+        # Error = H_stagnation_out_calculated - H_stagnation_in - q_in
+        # Differentiating the energy error with respect to temperature at constant pressure:
+        #   q_in, H_stagnation_in, and the gz term in the outlet stagnation enthalpy are constants with respect to temperature. H_out_calc and v_out vary with a change in outlet temperature. 
+        # d(error)/dT = (∂H/∂T)_P + (1/2) * (∂v^2/∂T)_P
+        # Use continuity to convert v to rho, and use Cp = (∂H/∂T)_P:
+        # d(error)/dT = Cp - mdot^2/(A^2*rho^3) * (∂ρ/∂T)_P
         Cp_out_state  = AS.cpmass()
         drhodT_P_out  = AS.first_partial_deriv(CP.iDmass, CP.iT, CP.iP)
-        T_out = T_out + energy_error / (Cp_out_state - (mdot/(flow_area*rho_out_trial))*drhodT_P_out)
+        T_out = T_out + energy_error / (Cp_out_state - mdot**2/(flow_area**2*rho_out_trial**3)*drhodT_P_out)
         _safe_update_PT(AS, P_out, T_out, T_cricondentherm, P_cricondenbar, T_critical, P_critical)
 
     else:
@@ -1450,7 +1456,7 @@ def compressible_pipe_segment(
             else:
                 try:
                     mu_out = AS.viscosity()
-                except:
+                except Exception:
                     mu_out = viscosity_LGE(T_out, AS.molar_mass() * 1000.0, rho_out_trial)
             Re_out       = fluids_Reynolds(V=v_out_trial, D=D_h, rho=rho_out_trial, mu=mu_out)
             f_darcy_out  = fluids_friction_factor(Re=Re_out, eD=roughness / D_h)
@@ -1586,7 +1592,7 @@ def test_comp_hydraulics():
     Ma_out = v_out/a_out
     S_out = AS_g.smass()
 
-    print('Adiabadic case')
+    print('Adiabatic case')
     print(f'outputs: P = {outlet_P}, T = {outlet_T}, Smass= {S_out}, velocity = {v_out}, Mach number = {Ma_out}')
 
 def test_line_segment_csv():
@@ -1693,6 +1699,7 @@ def test_fittings():
     D_large = ureg.Quantity(4.026, "in")
     contraction_test = Contraction_Expansion(Di_US=D_large, Di_DS= D_small)
     expansion_test = Contraction_Expansion(Di_US=D_small, Di_DS= D_large)
+    elbow = Bend(D_large, 90, 1.5)
     P_in = ureg.Quantity(1000, "psi").to("Pa").magnitude
     T_in = 300.0   # K
     Q_scfd = ureg.Quantity(60, "mmscf/day")

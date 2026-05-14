@@ -13,8 +13,7 @@ def test_deNevers8_10():
     #Given P0 (stagnation) = 30 psia, T0 (stagnation) = 200 F find flow rate if receiving reservoir P3 = 18 psia
     #Flow accelerates through a frictionless nozzle into an 8 ft long section of 1" Schedule 40 pipe
     #Example uses a two-iteration Fanno flow calculation and finds mass flow rate to be 0.317 lb/s. 
-    #The temperature at the outlet of the pipe is found to be 622 degrees R.
-    #The outlet velocity is 675.5 ft/s and the Mach number is 0.553
+    #The textbook solution for the outlet conditions is T=622 degrees R, outlet velocity = 675.5 ft/s and the Mach number = 0.553, mass flow rate = 0.317 lbm/s
     #Note that the textbook edition I have has a typo for the SI unit solution, listing it as 1.44 kg/s rather than the correct 0.144 kg/s.
     P_target = ureg.Quantity(18, "psi").to("Pa").magnitude
     P0    = ureg.Quantity(30, "psi").to("Pa").magnitude    # Pa
@@ -275,6 +274,29 @@ def test_ZuckerBiblarz10_3():
 
     print(f'Textbook ideal gas solution: P_3 = 8.19 psia, T_3 = 580 deg R, Mach #=0.603') 
 
+def dP_fittings():
+    from math import pi
+    import fluids.units as fittings
+    from fluids.units import u as ureg
+
+    ID_pipe = ureg.Quantity(3.068, "inch")
+
+    rho = ureg.Quantity(49.0, "lb/ft^3")
+    flow_rate = ureg.Quantity(10000, "bbl/day")
+    area = (ID_pipe**2)/4*pi
+
+    velocity = flow_rate / area
+
+    K_globe = fittings.K_globe_valve_Crane(D1=ID_pipe, D2=ID_pipe)
+    K_swing_check = fittings.K_swing_check_valve_Crane(D= ID_pipe, angled=True)
+
+    dP_globe = velocity**2 * K_globe * rho / 2
+    dP_check = velocity**2 * K_swing_check * rho / 2
+
+    print(f'Globe valve K factor: {K_globe}, pressure drop: {dP_globe.to("psi")}')
+    print(f'Check valve K factor: {K_swing_check}, pressure drop: {dP_check.to("psi")}')
+
+
 def test_deNevers6_11():
     #Example 6.11 and 6.12 on page 203-204 in "Fluid Mechanics for Chemical Engineers, 3rd Ed" by Noel de Nevers
     #Calculate the pressure drop across 3000 ft of 3" pipe, two globe valves, a swing check valve, and nine standard radius 90 degree elbows.abs
@@ -283,6 +305,7 @@ def test_deNevers6_11():
     from parallel import parallel_incompressible
     from incompressible import Line_Segment, Bend, Incompressible_Fluid, Valve
     from component_classes import ureg
+
     from fluids import fittings
     ID_pipe = ureg.Quantity(3.068, "inch").to("m").magnitude
     eps  = ureg.Quantity(0.00015, "ft").to("m").magnitude
@@ -347,6 +370,261 @@ def test_deNevers6_4():
     print( ureg.Quantity(dP, "Pa").to("psi"))
     print('Textbook solution dP = 484 psi')
 
+def test_Crane_air_line():
+    from compressible import Line_Segment, Bend, Contraction_Expansion, _build_phase_limits, _safe_update_PT, compressible_changing_area_K, _safe_update_PT, compressible_pipe_segment, _resolve_mdot
+
+    roughness = ureg.Quantity(0.00015, "ft")
+    seg_length = ureg.Quantity(75, "ft")
+    OD = ureg.Quantity(1.315, "inch")
+    WT = ureg.Quantity(0.133, "inch")
+    ID = OD - 2*WT
+    viscosity = None #use the abstract state viscosity
+    area = ID**2/4*math.pi
+
+    seg = Line_Segment(roughness = roughness, id_val = ID, length = seg_length, elevation_change=0.0)
+
+    P_in = ureg.Quantity(65+14.696, "psi").to("Pa").magnitude #65 psig
+    T_in = ureg.Quantity(115, "degF").to("degK").magnitude   # K
+
+    AS = composition.define_composition(
+        y_Nitrogen = 0.79,
+        y_Oxygen = 0.21,
+        eos = "HEOS"
+    )
+    T_cric, P_bar, T_c, P_c = _build_phase_limits(AS)
+
+    AS.update(CP.PT_INPUTS, P_in, T_in)
+
+    Q_scfd = ureg.Quantity(100.0, "scf/min")
+
+    mdot = _resolve_mdot(Q_scfd, AS)
+
+    v_in = mdot / AS.molar_mass()
+
+    Ma_in = v_in /AS.speed_sound()
+
+    print(f'  inlet: P={ureg.Quantity(P_in,"Pa").to("psi"):.4f}, T={T_in:.4g} K, Ma={Ma_in:.4f}')
+    seg.dP_dT(abstract_state=AS, flow_rate=Q_scfd, isothermal=True, mu=viscosity,
+    T_cricondentherm=T_cric,
+    P_cricondenbar=P_bar,
+    T_critical=T_c,
+    P_critical=P_c,)
+ 
+    P_out = AS.p()
+    T_out = AS.T()
+
+    rho_out = AS.rhomass()
+    area_out = seg.profile[-1][3]
+    v_out = _resolve_mdot(Q_scfd, AS) / (rho_out * area_out)
+    Ma_out = v_out / AS.speed_sound()
+
+    print(f'  outlet: P={ureg.Quantity(P_out,"Pa").to("psi"):.4f} psi, v = {ureg.Quantity(v_out,"m/s").to("ft/min"):.4f}, T = {T_out}K')
+    print(f'dP = {ureg.Quantity(P_out-P_in,"Pa").to("psi"):.4f}')
+
+
+
+
+def test_Crane_gas_pipeline():
+    from compressible import Line_Segment, Bend, Contraction_Expansion, _build_phase_limits, _safe_update_PT, compressible_changing_area_K, _safe_update_PT, compressible_pipe_segment, _resolve_mdot
+    csv_path = os.path.join(os.path.dirname(__file__), "testprofile_crane.csv")
+    roughness = ureg.Quantity(0.00015, "ft")
+    seg_length = ureg.Quantity(100, "miles")
+    OD = ureg.Quantity(14.0, "inch")
+    WT = ureg.Quantity(0.312, "inch")
+    ID = OD - 2*WT
+    # viscosity = 1.1e-5 #Pa*s, given in problem.
+    viscosity = None #use the abstract state viscosity
+
+    seg = Line_Segment(roughness = roughness, id_val = ID, length = seg_length, elevation_change=0.0)
+    P_target = ureg.Quantity(300, "psi").to("Pa").magnitude
+    P_in = ureg.Quantity(1300, "psi").to("Pa").magnitude
+    T_in = ureg.Quantity(40, "degF").to("degK").magnitude   # K
+
+    AS = composition.define_composition(
+        y_Methane = 0.75,
+        y_Ethane = 0.21,
+        y_Propane=0.04,
+        eos = "HEOS"
+    )
+    T_cric, P_bar, T_c, P_c = _build_phase_limits(AS)
+
+    tolerance_Pa = ureg.Quantity(0.01, "psi").to("Pa").magnitude
+
+    Q_mmscfd = 125.5  # initial guess, iterate until P_out matches P_target
+
+    # Bisection bracket in mmscf/day; None until that side has been evaluated
+    Q_low = None   # highest Q tried that gives P_out > P_target (need more flow)
+    Q_high = None  # lowest Q tried that gives P_out < P_target (need less flow)
+
+    for iteration in range(30):
+        AS.update(CP.PT_INPUTS, P_in, T_in)
+        Q_scfd = ureg.Quantity(Q_mmscfd, "mmscf/day")
+        print(f'Guess: {Q_scfd}')
+        rho_in = AS.rhomass()
+        area_in = seg.profile[0][3]
+        v_in = _resolve_mdot(Q_scfd, AS) / (rho_in * area_in)
+        Ma_in = v_in / AS.speed_sound()
+
+        try:
+            seg.dP_dT(abstract_state=AS, flow_rate=Q_scfd, isothermal=True, mu=viscosity, 
+            T_cricondentherm=T_cric, 
+            P_cricondenbar=P_bar, 
+            T_critical=T_c,
+            P_critical=P_c,)
+        except RuntimeError as e:
+            # Flow too high — segment failed to converge (likely approaching choked flow)
+            print(f'Iteration {iteration + 1}: Q = {Q_mmscfd:.4f} mmscf/day — solver failed, treating as upper bound')
+            print(f'  ({e})\n')
+            Q_high = Q_mmscfd
+            if Q_low is not None:
+                Q_mmscfd = (Q_low + Q_high) / 2
+            else:
+                Q_mmscfd = Q_mmscfd / 2
+            continue
+
+        P_out = AS.p()
+        T_out = AS.T()
+
+        rho_out = AS.rhomass()
+        area_out = seg.profile[-1][3]
+        v_out = _resolve_mdot(Q_scfd, AS) / (rho_out * area_out)
+        Ma_out = v_out / AS.speed_sound()
+
+        P_out_psi = ureg.Quantity(P_out, "Pa").to("psi").magnitude
+        dP_psi = ureg.Quantity(P_out - P_in, "Pa").to("psi").magnitude
+        error_psi = ureg.Quantity(P_out - P_target, "Pa").to("psi").magnitude
+
+        print(f'Iteration {iteration + 1}: Q = {Q_mmscfd:.4f} mmscf/day')
+        print(f'  inlet: P={ureg.Quantity(P_in,"Pa").to("psi"):.4f}, T={T_in:.4g} K, Ma={Ma_in:.4f}')
+        print(f'  outlet: P={P_out_psi:.4g} psi, T={T_out:.4g} K, Ma={Ma_out:.4f}')
+        print(f'  dP = {dP_psi:.4f} psi, P_error = {error_psi:+.4f} psi\n')
+
+        if abs(P_out - P_target) < tolerance_Pa:
+            print(f'Converged after {iteration + 1} iteration(s).')
+            break
+
+        # Higher Q → more pressure drop → lower P_out
+        if P_out > P_target:
+            Q_low = Q_mmscfd   # need more flow; record as lower bound
+        else:
+            Q_high = Q_mmscfd  # need less flow; record as upper bound
+
+        if Q_low is not None and Q_high is not None:
+            Q_mmscfd = (Q_low + Q_high) / 2
+        else:
+            Q_mmscfd = Q_mmscfd * (P_out / P_target)
+
+def test_Crane_choked_steam():
+    #NOTE this problem is a dead end for this program, because it starts as saturated vapor and immediately goes two-phase upon expansion.
+    from compressible import Line_Segment, Bend, Contraction_Expansion, Valve, _build_phase_limits, _safe_update_PT, compressible_changing_area_K, _safe_update_PT, compressible_pipe_segment, _resolve_mdot
+    from fluids import fittings
+    roughness = ureg.Quantity(0.00015, "ft")
+    seg_length = ureg.Quantity(30, "ft")
+    OD = ureg.Quantity(2.375, "inch")
+    WT = ureg.Quantity(0.154, "inch")
+    P_in = ureg.Quantity(170, "psi").to("Pa").magnitude
+    ID = OD - 2*WT
+
+    fitting_list = []
+
+    seg = Line_Segment(roughness = roughness, id_val = ID, length = seg_length, elevation_change=0.0)
+    fitting_list.append(seg)
+
+    elbow = Bend(Di = ID, ang_deg = 90, bend_dias = 1.0)
+    fitting_list.append(elbow)
+
+    k_valve = fittings.K_globe_valve_Crane(D1 = ID.to("m").magnitude, D2 = ID.to("m").magnitude)
+
+    valve = Valve(Di = ID, K = k_valve)
+    fitting_list.append(valve)
+
+
+    M_target = 0.97
+
+
+    AS = composition.define_composition(
+        y_Water = 1,
+        eos = "HEOS"
+    )
+    T_cric, P_bar, T_c, P_c = _build_phase_limits(AS)
+    
+    tolerance_Ma = 0.002
+
+    mdot =   ureg.Quantity(100, "lb/hr") # initial guess, iterate until P_out matches P_target
+
+    # Bisection bracket on mass flow rate; None until that side has been evaluated
+    mdot_low = None   # highest mdot tried that gives P_out > P_target (need more flow)
+    mdot_high = None  # lowest mdot tried that gives P_out < P_target (need less flow)
+
+    for iteration in range(30):
+        AS.update(CP.PQ_INPUTS, P_in, 1.0)
+        print(f'Guess: {mdot}')
+        rho_in = AS.rhomass()
+        area_in = seg.profile[0][3]
+        v_in = _resolve_mdot(mdot, AS) / (rho_in * area_in)
+        Ma_in = v_in / AS.speed_sound()
+
+        try:
+            seg.dP_dT(abstract_state=AS, flow_rate=mdot, isothermal=False,
+            T_cricondentherm=T_cric,
+            P_cricondenbar=P_bar,
+            T_critical=T_c,
+            P_critical=P_c,)
+            #next, the elbow
+            elbow.dP_dT(abstract_state=AS, flow_rate=mdot,
+            T_cricondentherm=T_cric,
+            P_cricondenbar=P_bar,
+            T_critical=T_c,
+            P_critical=P_c,)
+            #and the valve
+            valve.dP_dT(abstract_state=AS, flow_rate=mdot,
+            T_cricondentherm=T_cric,
+            P_cricondenbar=P_bar,
+            T_critical=T_c,
+            P_critical=P_c,)
+        except RuntimeError as e:
+            # Flow too high — segment failed to converge (likely approaching choked flow)
+            print(f'Iteration {iteration + 1}: mdot = {mdot.to("lb/hr").magnitude:.4f} lb/hr — solver failed, treating as upper bound')
+            print(f'  ({e})\n')
+            mdot_high = mdot
+            if mdot_low is not None:
+                mdot = (mdot_low + mdot_high) / 2
+            else:
+                mdot = mdot / 2
+            continue
+
+        P_out = AS.p()
+        T_out = AS.T()
+
+        rho_out = AS.rhomass()
+        area_out = seg.profile[-1][3]
+        v_out = _resolve_mdot(mdot, AS) / (rho_out * area_out)
+        Ma_out = v_out / AS.speed_sound()
+
+
+        error_Ma = Ma_out - M_target
+
+        print(f'Iteration {iteration + 1}: mdot = {mdot.to("lb/hr").magnitude:.4f} lb/hr')
+        print(f'  inlet:  P={ureg.Quantity(P_in,"Pa").to("psi"):.4f}, Ma={Ma_in:.4f}')
+        print(f'  outlet: P={ureg.Quantity(P_out,"Pa").to("psi"):.4f}, T={T_out:.4g} K, Ma={Ma_out:.4f}')
+        print(f'  Ma_error = {error_Ma:+.4f}\n')
+
+        if abs(error_Ma) < tolerance_Ma:
+            print(f'Converged after {iteration + 1} iteration(s).')
+            break
+
+        # Higher mdot → higher outlet Mach
+        if Ma_out < M_target:
+            mdot_low = mdot   # need more flow; record as lower bound
+        else:
+            mdot_high = mdot  # need less flow; record as upper bound
+
+        if mdot_low is not None and mdot_high is not None:
+            mdot = (mdot_low + mdot_high) / 2
+        else:
+            mdot = mdot * (M_target / Ma_out)
+
+
 if __name__ == "__main__":
     # print('\nZucker & Biblarz unnumbered example in section 5.7 (isentropic converging nozzle):')
     # test_ZuckerBiblarz5_7()
@@ -354,14 +632,20 @@ if __name__ == "__main__":
     # print('\nZucker & Biblarz example 9.3 (Fanno flow):')
     # test_ZuckerBiblarz9_3()
 
-    # print('de Nevers example 8.10 (isentropic converging nozzle and Fanno flow):')
+    # print('\nde Nevers example 8.10 (isentropic converging nozzle and Fanno flow):')
     # test_deNevers8_10()
 
     # print('\nZucker & Biblarz example 10.3 (Rayleigh flow):')
     # test_ZuckerBiblarz10_3()
 
-    print('de Nevers example 6.11 and 6.12 (incompressible fluid friction with pipe and fittings):')
-    test_deNevers6_11()
+    # print('\nde Nevers example 6.11 and 6.12 (incompressible fluid friction with pipe and fittings):')
+    # test_deNevers6_11()
 
-    # print('de Nevers example 6.4 (incompressible fluid friction with pipe):')
+    # print('\nde Nevers example 6.4 (incompressible fluid friction with pipe):')
     # test_deNevers6_4()
+
+    # print('\nCrane TP410 example')
+    # test_Crane_gas_pipeline()
+    test_Crane_air_line()
+
+    # test_Crane_choked_steam()
