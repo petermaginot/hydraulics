@@ -191,7 +191,7 @@ def parallel_compressible(line_segment_list, AS, total_flow_rate):
     # for multicomponent HEOS mixtures (seconds per call), and the composition
     # does not change across segments or iterations, so we forward the four
     # scalars into every dP_dT call to skip the per-call envelope build.
-    from compressible import _build_phase_limits, _safe_update_PT
+    from compressible_flow import _build_phase_limits, _safe_update_PT
     T_cric, P_bar, T_c, P_c = _build_phase_limits(AS)
     print(f"phase limits: T_cric={T_cric}, P_bar={P_bar}, T_c={T_c}, P_c={P_c}")
 
@@ -264,7 +264,7 @@ def parallel_compressible(line_segment_list, AS, total_flow_rate):
 
 
 def test_parallel_compressible():
-    from compressible import Line_Segment, Bend, Contraction_Expansion, _build_phase_limits, _safe_update_PT
+    from compressible_flow import Line_Segment, Bend, Contraction_Expansion, _build_phase_limits, _safe_update_PT
     import CoolProp.CoolProp as CP
     from CoolProp.CoolProp import AbstractState
     import composition

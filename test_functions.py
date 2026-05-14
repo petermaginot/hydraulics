@@ -7,7 +7,7 @@ import math
 import os
 
 def test_deNevers8_10():
-    from compressible import Line_Segment, Bend, Contraction_Expansion, _build_phase_limits, _safe_update_PT, compressible_changing_area_K, _safe_update_PT, compressible_pipe_segment
+    from compressible_flow import Line_Segment, Bend, Contraction_Expansion, _build_phase_limits, _safe_update_PT, compressible_changing_area_K, _safe_update_PT, compressible_pipe_segment
     #Example 8.10 on pages 315-317 in "Fluid Mechanics for Chemical Engineers, 3rd Ed" by Noel de Nevers
     #Adiabadic flow with friction (Fanno flow)
     #Given P0 (stagnation) = 30 psia, T0 (stagnation) = 200 F find flow rate if receiving reservoir P3 = 18 psia
@@ -103,7 +103,7 @@ def test_deNevers8_10():
     print('Textbook solution: mass flow rate = 0.317 lbm/s, outlet velocity = 675.5 ft/s, outlet temperature = 622 deg R, Mach #=0.553')
 
 def test_ZuckerBiblarz5_7():
-    from compressible import Line_Segment, Bend, Contraction_Expansion, _build_phase_limits, _safe_update_PT, compressible_changing_area_K, _safe_update_PT, compressible_pipe_segment
+    from compressible_flow import Line_Segment, Bend, Contraction_Expansion, _build_phase_limits, _safe_update_PT, compressible_changing_area_K, _safe_update_PT, compressible_pipe_segment
     #Example on pages 124-126 in "Fundamentals of Gas Dynamics, 2nd Ed" by Robert Zucker and Oscar Biblarz
     #Isentropic changing area flow
     #Air at stagnation conditions of 100 psia and 600 deg Rflows through a nozzle into a receiver at 80.2 psia
@@ -177,7 +177,7 @@ def test_ZuckerBiblarz5_7():
     print('Textbook solution: outlet velocity = 663 ft/s, outlet temperature = 563 deg R, Mach #=0.57')
 
 def test_ZuckerBiblarz9_3():
-    from compressible import Line_Segment, Bend, Contraction_Expansion, _build_phase_limits, _safe_update_PT, compressible_changing_area_K, _safe_update_PT, compressible_pipe_segment
+    from compressible_flow import Line_Segment, Bend, Contraction_Expansion, _build_phase_limits, _safe_update_PT, compressible_changing_area_K, _safe_update_PT, compressible_pipe_segment
     #Example 9.3 on pages 259-260 in "Fundamentals of Gas Dynamics, 2nd Ed" by Robert Zucker and Oscar Biblarz
     #Adiabadic flow with friction (Fanno flow)
     #Air flowing at P1 = 20 psia, T1 = 70 F , v1 = 406 ft/s in a 6" diameter galvanized iron duct (absolute roughness = 0.0005 ft)
@@ -222,7 +222,7 @@ def test_ZuckerBiblarz9_3():
     v_2 = mdot / AS.rhomass() / A_1
     m_2 = v_2 / AS.speed_sound()
 
-    print(f'  P_2 = {ureg.Quantity(P_2,"Pa").to("psi"):.4f}, T_2 = {ureg.Quantity(T_2,"degK").to("degR"):.2f}, Mach = {m_2:.4f}')
+    print(f'Outputs:  P_2 = {ureg.Quantity(P_2,"Pa").to("psi"):.4f}, T_2 = {ureg.Quantity(T_2,"degK").to("degR"):.2f}, Mach = {m_2:.4f}')
 
     print(f'Textbook ideal gas solution: P_2 = 11.28 psia, T_2 = 505 deg R, Mach #=0.623')
 
@@ -232,7 +232,7 @@ def test_ZuckerBiblarz10_3():
     #Air flowing at P1 = 10.0 psia, T1 = 400 R , v1 = 402 ft/s. 50 btu/lbm of heat is added to the gas.
     #Rayleigh flow assumes no friction, so we will use roughness = 0, L = 0.01 m, and ID = 1 m
     #Find final Mach number, temperature, pressure
-    from compressible import Line_Segment, Bend, Contraction_Expansion, _build_phase_limits, _safe_update_PT, compressible_changing_area_K, _safe_update_PT, compressible_pipe_segment
+    from compressible_flow import Line_Segment, Bend, Contraction_Expansion, _build_phase_limits, _safe_update_PT, compressible_changing_area_K, _safe_update_PT, compressible_pipe_segment
     P2    = ureg.Quantity(10, "psi").to("Pa").magnitude    # Pa
     T2 = ureg.Quantity(400, "degR").to("degK").magnitude    # K
     ID_pipe = 1.0    # m
@@ -270,7 +270,7 @@ def test_ZuckerBiblarz10_3():
     v_3 = mdot / AS.rhomass() / A_2
     m_3 = v_3 / AS.speed_sound()
 
-    print(f'  P_3 = {ureg.Quantity(P_3,"Pa").to("psi"):.4f}, T_3 = {ureg.Quantity(T_3,"degK").to("degR"):.2f}, Mach = {m_3:.4f}')
+    print(f'Outputs:  P_3 = {ureg.Quantity(P_3,"Pa").to("psi"):.4f}, T_3 = {ureg.Quantity(T_3,"degK").to("degR"):.2f}, Mach = {m_3:.4f}')
 
     print(f'Textbook ideal gas solution: P_3 = 8.19 psia, T_3 = 580 deg R, Mach #=0.603') 
 
@@ -371,7 +371,7 @@ def test_deNevers6_4():
     print('Textbook solution dP = 484 psi')
 
 def test_Crane_air_line():
-    from compressible import Line_Segment, Bend, Contraction_Expansion, _build_phase_limits, _safe_update_PT, compressible_changing_area_K, _safe_update_PT, compressible_pipe_segment, _resolve_mdot
+    from compressible_flow import Line_Segment, Bend, Contraction_Expansion, _build_phase_limits, _safe_update_PT, compressible_changing_area_K, _safe_update_PT, compressible_pipe_segment, _resolve_mdot
 
     roughness = ureg.Quantity(0.00015, "ft")
     seg_length = ureg.Quantity(75, "ft")
@@ -425,7 +425,7 @@ def test_Crane_air_line():
 
 
 def test_Crane_gas_pipeline():
-    from compressible import Line_Segment, Bend, Contraction_Expansion, _build_phase_limits, _safe_update_PT, compressible_changing_area_K, _safe_update_PT, compressible_pipe_segment, _resolve_mdot
+    from compressible_flow import Line_Segment, Bend, Contraction_Expansion, _build_phase_limits, _safe_update_PT, compressible_changing_area_K, _safe_update_PT, compressible_pipe_segment, _resolve_mdot
     csv_path = os.path.join(os.path.dirname(__file__), "testprofile_crane.csv")
     roughness = ureg.Quantity(0.00015, "ft")
     seg_length = ureg.Quantity(100, "miles")
@@ -516,7 +516,7 @@ def test_Crane_gas_pipeline():
 
 def test_Crane_choked_steam():
     #NOTE this problem is a dead end for this program, because it starts as saturated vapor and immediately goes two-phase upon expansion.
-    from compressible import Line_Segment, Bend, Contraction_Expansion, Valve, _build_phase_limits, _safe_update_PT, compressible_changing_area_K, _safe_update_PT, compressible_pipe_segment, _resolve_mdot
+    from compressible_flow import Line_Segment, Bend, Contraction_Expansion, Valve, _build_phase_limits, _safe_update_PT, compressible_changing_area_K, _safe_update_PT, compressible_pipe_segment, _resolve_mdot
     from fluids import fittings
     roughness = ureg.Quantity(0.00015, "ft")
     seg_length = ureg.Quantity(30, "ft")
@@ -626,26 +626,33 @@ def test_Crane_choked_steam():
 
 
 if __name__ == "__main__":
-    # print('\nZucker & Biblarz unnumbered example in section 5.7 (isentropic converging nozzle):')
-    # test_ZuckerBiblarz5_7()
 
-    # print('\nZucker & Biblarz example 9.3 (Fanno flow):')
-    # test_ZuckerBiblarz9_3()
+    print('Zucker & Biblarz unnumbered example in section 5.7 (isentropic converging nozzle):')
+    test_ZuckerBiblarz5_7()
 
-    # print('\nde Nevers example 8.10 (isentropic converging nozzle and Fanno flow):')
-    # test_deNevers8_10()
+    print('--------------------------------------------------------')
+    print('Zucker & Biblarz example 9.3 (Fanno flow):')
+    test_ZuckerBiblarz9_3()
 
-    # print('\nZucker & Biblarz example 10.3 (Rayleigh flow):')
-    # test_ZuckerBiblarz10_3()
+    print('--------------------------------------------------------')
+    print('de Nevers example 8.10 (isentropic converging nozzle and Fanno flow):')
+    test_deNevers8_10()
 
-    # print('\nde Nevers example 6.11 and 6.12 (incompressible fluid friction with pipe and fittings):')
-    # test_deNevers6_11()
+    print('--------------------------------------------------------')
+    print('Zucker & Biblarz example 10.3 (Rayleigh flow):')
+    test_ZuckerBiblarz10_3()
 
-    # print('\nde Nevers example 6.4 (incompressible fluid friction with pipe):')
-    # test_deNevers6_4()
+    print('--------------------------------------------------------')
+    print('de Nevers example 6.11 and 6.12 (incompressible fluid friction with pipe and fittings):')
+    test_deNevers6_11()
 
-    # print('\nCrane TP410 example')
-    # test_Crane_gas_pipeline()
+    print('--------------------------------------------------------')
+    print('de Nevers example 6.4 (incompressible fluid friction with pipe):')
+    test_deNevers6_4()
+
+    print('--------------------------------------------------------')
+    print('\nCrane TP410 example')
+    test_Crane_gas_pipeline()
     test_Crane_air_line()
 
     # test_Crane_choked_steam()

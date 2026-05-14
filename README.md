@@ -14,7 +14,7 @@ Most quantities accept [pint](https://pint.readthedocs.io/) `Quantity` inputs fo
 
 ## Base component classes — [component_classes.py](component_classes.py)
 
-Geometry storage, input validation, CSV loading, and convenience properties for the three component types. These classes contain no fluid-mechanics calculations; the physics-specific subclasses for liquid and gas flow live in [incompressible.py](incompressible.py) and [compressible.py](compressible.py) and inherit from them.
+Geometry storage, input validation, CSV loading, and convenience properties for the three component types. These classes contain no fluid-mechanics calculations; the physics-specific subclasses for liquid and gas flow live in [incompressible.py](incompressible.py) and [compressible_flow.py](compressible_flow.py) and inherit from them.
 
 ### `Base_Line_Segment`
 A pipe segment defined by a distance/elevation/geometry profile. The segment is internally stored as a list of `(distance_m, elevation_m, D_h_m, flow_area_m2)` 4-tuples using the inlet-point / forward-Euler convention (each point's geometry applies from that point forward to the next).
@@ -86,7 +86,7 @@ Adds `dP(fluid, flow_rate)` returning the total static pressure change (Bernoull
 
 ---
 
-## Compressible hydraulics — [compressible.py](compressible.py)
+## Compressible hydraulics — [compressible_flow.py](compressible_flow.py)
 
 Single-phase compressible (gas) pipeline hydraulics. CoolProp `AbstractState` objects are used throughout for real-gas equation-of-state calculations, so any fluid or mixture supported by CoolProp can be used without modification. Component `dP_dT` methods mutate the `AbstractState` in place as conditions evolve along the pipe.
 

@@ -1,4 +1,4 @@
-"""compressible.py
+"""compressible_flow.py
 
 Single-phase Compressible (gas) pipeline hydraulics.
 
@@ -646,7 +646,8 @@ def _build_phase_limits(AS):
     """
     AS_tmp = AbstractState("HEOS", "&".join(AS.fluid_names()))
     AS_tmp.set_mole_fractions(list(AS.get_mole_fractions()))
-    print('Building phase limits - this can take a while', end='\r')
+    msg = str('Building phase limits - this can take a while')
+    print(msg, end='\r')
     try:
         AS_tmp.build_phase_envelope("")
         PE = AS_tmp.get_phase_envelope_data()
@@ -660,6 +661,8 @@ def _build_phase_limits(AS):
         P_c = AS_tmp.p_critical()
     except Exception:
         T_c, P_c = None, None
+
+    print(f" "*len(msg), end="\r")
 
     return T_cric, P_bar, T_c, P_c
 
