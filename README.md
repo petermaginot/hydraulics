@@ -14,12 +14,12 @@ Most quantities accept [pint](https://pint.readthedocs.io/) `Quantity` inputs fo
 
 ## Base component classes — [component_classes.py](component_classes.py)
 
-Geometry storage, input validation, CSV loading, and convenience properties for the three component types. These classes contain no fluid-mechanics calculations; the physics-specific subclasses for liquid and gas flow live in [incompressible.py](incompressible.py) and [compressible_flow.py](compressible_flow.py) and inherit from them.
+Dimension storage, input validation, CSV loading, and convenience properties for the three component types. These classes contain no fluid-mechanics calculations; the physics-specific subclasses for liquid and gas flow live in [incompressible.py](incompressible.py) and [compressible_flow.py](compressible_flow.py) and inherit from them.
 
 ### `Base_Line_Segment`
 A pipe segment defined by a distance/elevation/geometry profile. The segment is internally stored as a list of `(distance_m, elevation_m, D_h_m, flow_area_m2)` 4-tuples using the inlet-point / forward-Euler convention (each point's geometry applies from that point forward to the next).
 
-Geometry can be supplied two ways:
+Dimensions can be supplied two ways:
 - **Uniform geometry** — pass scalar `id_val`, `od_val`+`wt_val`, or `hydraulic_diameter`+`flow_area`, plus a `profile` of 2-tuples `(distance, elevation)` or a `length`+`elevation_change`.
 - **Per-point geometry** — pass a `profile` of 4-tuples `(distance, elevation, D_h, flow_area)` for variable-diameter runs (reducers, custom bore profiles, etc.).
 
@@ -30,13 +30,13 @@ Non-circular cross-sections are supported by supplying `hydraulic_diameter` and 
 Convenience properties: `total_length_m`, `net_elevation_change_m`, `volume_m3`.
 
 ### `Base_Bend`
-Geometry storage for a rounded (non-mitred) pipe bend/elbow fitting. Stores the inner diameter, bend angle (degrees), and bend-radius-to-diameter ratio (e.g. 1.5 for a standard long-radius elbow). All values must be positive.
+Dimension storage for a rounded (non-mitred) pipe bend/elbow fitting. Stores the inner diameter, bend angle (degrees), and bend-radius-to-diameter ratio (e.g. 1.5 for a standard long-radius elbow). All values must be positive.
 
 ### `Base_Valve`
-Geometry storage for a valve fitting. Stores the pipe inner diameter and a pre-computed K-factor (resistance coefficient) referenced to the pipe velocity head. The K-factor is supplied at initialization rather than computed by the class, leaving the caller free to use whatever correlation or vendor data is appropriate for the valve type and position. `Di` must be positive and `K` must be `>= 0`. This pairs nicely with the fluids library's K factor correlations for valves, and you can call that library when you create a Valve class object.
+Dimension storage for a valve fitting. Stores the pipe inner diameter and a pre-computed K-factor (resistance coefficient) referenced to the pipe velocity head. The K-factor is supplied at initialization rather than computed by the class, leaving the caller free to use whatever correlation or vendor data is appropriate for the valve type and position. `Di` must be positive and `K` must be `>= 0`. This pairs nicely with the fluids library's K factor correlations for valves, and you can call that library when you create a Valve class object.
 
 ### `Base_Contraction_Expansion`
-Geometry storage for an abrupt contraction or expansion fitting. Stores upstream and downstream inner diameters. If `Di_US == Di_DS` there is no area change and the fitting has no effect.
+Dimension storage for an abrupt contraction or expansion fitting. Stores upstream and downstream inner diameters. If `Di_US == Di_DS` there is no area change and the fitting has no effect.
 
 ### Module-level helpers
 - `_to_si(val, unit)` — convert a pint `Quantity` or plain float to an SI float magnitude.
@@ -127,14 +127,14 @@ Modeled as adiabatic. Adds **`dP_dT(abstract_state, flow_rate, ...)`** which obt
 
   You can see a chicken scratch version of this derivation in the Derivation_images folder, or a more detailed discussion in the comments for the function.
 
-- **`compressible_changing_area(abstract_state, mdot, A_in, A_out)`** — ideal gas isentropic outlet `(P, T)` for an area change, using the area-Mach relation to find the subsonic outlet Mach number and recovering static conditions from total-condition ratios. `gamma = Cp/Cv` is taken from the `AbstractState` at inlet. Returns `(P_out, T_out)` without mutating the state. This function is used as the initial guess for the compressible_changing_area_K.
+- **`compressible_changing_area(abstract_state, mdot, A_in, A_out)`** — ideal gas isentropic outlet `(P, T)` for an area change, using the area-Mach relation to find the subsonic outlet Mach number and recovering static conditions from total-condition ratios. `gamma = Cp/Cv` is taken from the `AbstractState` at inlet. Returns `(P_out, T_out)` without mutating the state. This function is used to compute the initial guess for the compressible_changing_area_K function.
 
 - **`compressible_changing_area_K(abstract_state, mdot, A_in, A_out, K, ...)`** — outlet conditions for an area change with a known loss coefficient `K` (referenced to inlet velocity head). Solves the simultaneous balance equations:
 
   1. Stagnation-enthalpy conservation: `H_out + v_out²/2 = H_in + v_in²/2`.
   2. Entropy generation from the irreversible loss: `S_out − S_in = K·v_in² / (2·T_avg)`.
 
-  via `scipy.optimize.root` (hybrid method), with the isentropic result as the initial guess. Updates the `AbstractState` in place. This function is rather slow, as the scipy root finding takes a lot of iterations with a lot of abstract state updates, but unfortunately there's no easy one-step process to estimate this.
+  via `scipy.optimize.root` (hybrid method), with the isentropic ideal gas result as the initial guess. Updates the `AbstractState` in place. This function is rather slow, as the scipy root finding takes a lot of iterations with a lot of abstract state updates, but unfortunately there's no easy one-step process to estimate this.
 
 - **`compressible_K(abstract_state, mdot, flow_area, K, ...)`** — outlet conditions for a constant-area fitting (e.g. bend, valve) with a known `K`. Applies a single-step analytical result derived from the combined energy + continuity + entropy + EOS equations with `dA = 0`:
 
@@ -149,7 +149,13 @@ Modeled as adiabatic. Adds **`dP_dT(abstract_state, flow_rate, ...)`** which obt
 
 - **`_resolve_mdot(flow_rate, abstract_state)`** — convert a pint `Quantity` to mass flow rate [kg/s]. Accepts mass (`kg/s`, `lb/hr`), molar / standard-volume (`mol/s`, `scf/day`, `mmscf/day`), or actual volumetric (`m³/s`, `ft³/min`). Standard-volume units are defined as mole equivalents in the unit registry, so they fall through the molar branch automatically.
 - **`viscosity_LGE(T, mol_wt, density)`** — Lee-Gonzalez-Eakin correlation for hydrocarbon gas viscosity. Used as a fallback when the chosen EOS (e.g. Peng-Robinson) does not support viscosity calculation. Note that this correlation is only valid for light hydrocarbon gases, so be careful. I should probably build in some sort of warning that displays if it is used with non-hydrocarbon components.
-- **`_build_phase_limits(AS)`** — builds the phase envelope on a temporary `AbstractState` (so the working state's solver isn't corrupted) and returns `(T_cricondentherm, P_cricondenbar, T_critical, P_critical)`. Returns `None` for any field that couldn't be computed; both queries failing yields `(None, None, None, None)`. The envelope tracer is fragile for some HEOS mixtures and the PR backend, which is why the critical-point query is wrapped separately.
+- **`_build_phase_limits(AS)`** —     This function builds a phase envelope for a CoolProp abstract state to calculate the critical properties to aid in determining if a pressure/temperature combination is obviously in a single phase state or not by comparing it to the critical pressure/temperature and/or cricondenbar and cricondentherm. This enables us to pass a phase hint to CoolProp's abstract state update function, which increases its speed appreciably. If you don't supply a phase hint, CoolProp needs to determine the phase with every update calculation. Its routine for determining the phase also fails to converge for some cases even though it is clearly in a single phase region. This process helps avoid that error from rearing its head.
+
+  The increase in calculation speed is very helpful when you need to perform thousands of abstract state updates to iterate over a segment or solve a convergence problem. 
+
+  This function builds the phase envelope on a temporary abstract state so the working abstract state's internal solver state is not corrupted.  CoolProp's build_phase_envelope leaves the AbstractState at the last envelope point it visited; subsequent update() calls on the same object then fail unpredictably.
+
+  The envelope tracer is fragile (some HEOS mixtures and the PR backend can fail to converge), so the critical-point query is wrapped separately.  When the envelope fails but the critical point succeeds, returns (None, None, T_critical, P_critical) -- callers can still use the critical point as a coarser phase hint via _safe_update_PT.
 - **`_safe_update_PT(AS, P, T, ...)`** — wraps `AS.update(PT_INPUTS, ...)` with an explicit phase hint when the state is definitely outside the two-phase region. Bypasses CoolProp's internal phase-stability analysis, which can return false two-phase detections near the envelope for some mixtures. This function is dramatically faster and more reliable than using CoolProp's native abstract state update function when operating well outside of the two-phase region.
 
 ---
@@ -199,6 +205,10 @@ Each iteration resets `AS` to the common inlet `(P0, T0)` before walking a branc
 
 ---
 
-## Test functions — [test_functions.py](test_functions.py)
+## Test functions — [textbook_test_functions.py](textbook_test_functions.py)
 
 End-to-end examples that check the program's calculations against textbook problems to validate its output.
+
+## Utilities - [utilities.py](utilities.py)
+
+File for containing utility functions.

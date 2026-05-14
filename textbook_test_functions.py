@@ -1,3 +1,6 @@
+"""
+A selection of solved problems from various textbooks, used to validate the program's output for different scenarios
+"""
 
 import CoolProp.CoolProp as CP
 from CoolProp.CoolProp import AbstractState

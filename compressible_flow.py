@@ -630,10 +630,18 @@ _SINGLE_PHASE_CODES = frozenset([
 
 def _build_phase_limits(AS):
     """Return (T_cricondentherm, P_cricondenbar, T_critical, P_critical) [K, Pa].
+    This function builds a phase envelope for a CoolProp abstract state to calculate the critical properties to aid in determining if
+    a pressure/temperature combination is obviously in a single phase state or not by comparing it to the critical pressure/temperature 
+    and/or cricondenbar and cricondentherm. This enables us to pass a phase hint to CoolProp's
+    abstract state update function, which increases its speed appreciably. If you don't supply a phase hint, CoolProp needs
+    to determine the phase with every update calculation. Its routine for determining the phase also fails to converge for some cases 
+    even though it is clearly in a single phase region. This process helps avoid that error from rearing its head.
 
-    Builds the phase envelope on a temporary AS so the working AS's internal
-    solver state is not corrupted.  CoolProp's build_phase_envelope leaves the
-    AbstractState at the last envelope point it visited; subsequent update()
+    The increase in calculation speed is very helpful when you need to perform thousands of abstract state updates to iterate over a 
+    segment or solve a convergence problem. 
+
+    This function builds the phase envelope on a temporary abstract state so the working abstract state's internal
+    solver state is not corrupted.  CoolProp's build_phase_envelope leaves the AbstractState at the last envelope point it visited; subsequent update()
     calls on the same object then fail unpredictably.
 
     The envelope tracer is fragile (some HEOS mixtures and the PR backend can
@@ -1255,34 +1263,36 @@ def compressible_pipe_segment(
 
 
     if not isothermal:
-        """
-        We will first calculate dP for a known dL, using fluid properties at the inlet conditions and assuming they don't change enough over the length slice to affect the calculation.
-        From the energy balance, dq = mdot * dH + mdot/2 * d(v^2)/2 + mdot * g * dz
-        From the continuity equation mdot = rho * flow_area * v
-        Combine these two, take the derivative with respect to length, and do some rearranging (substituting dv^2 = 2vdv and dv = -v/rho * drho)
-        1/mdot * dq/dL = dH/dL - v^2/rho * drho/dL + g * dz/dL
-        We will need to use an equation of state to relate pressure and density. If rho = f(H, P):
-        drho/dL = (∂rho/∂P)_H * dP/dL + (∂rho/∂H)_P * dH/dL [chain rule for partial derivatives]
-        We'll call (∂rho/∂P)_H  = A and (∂rho/∂H)_P = B and assume they are relatively constant over the length slice.
 
-        Accounting for entropy, from "Fundamentals of Gas Dynamics, 2nd Ed." by Zucker and Biblarz", equation 3.1
-        dS = dSe + dSi
-        where dSe = entropy change due to heat transfer = 1/mdot * dq/T
-        and dSi = entropy change due to friction = 1/T * K * v^2/2
-        and K = f * dL/D_h, where f is Darcy friciton factor and D_h is the hydraulic diameter (or simply the diameter for a round pipe)
+        # We will first calculate dP for a known dL, using fluid properties at the inlet conditions and assuming they don't change enough over the length slice to affect the calculation.
+        # From the energy balance, dq = mdot * dH + mdot/2 * d(v^2)/2 + mdot * g * dz
+        # From the continuity equation mdot = rho * flow_area * v
+        # Combine these two, take the derivative with respect to length, and do some rearranging (substituting dv^2 = 2vdv and dv = -v/rho * drho)
+        # 1/mdot * dq/dL = dH/dL - v^2/rho * drho/dL + g * dz/dL
+        # We will need to use an equation of state to relate pressure and density. If rho = f(H, P):
+        # drho/dL = (∂rho/∂P)_H * dP/dL + (∂rho/∂H)_P * dH/dL [chain rule for partial derivatives]
+        # We'll call (∂rho/∂P)_H  = A and (∂rho/∂H)_P = B and assume they are relatively constant over the length slice.
 
-        We can use a thermodynamic identity to relate enthalpy, entropy, and pressure:
-        dH = T*dS + dP/rho (from table 6.2-1 in "Chemical, Biochemical, and Engineering Thermodynmics, 4th ed." by Sandler)
-        Substituting for dS and taking derivative with respect to length
-        dH/dL = 1/mdot * dq/dL + f * v^2 / (2 * D_h) + 1/rho * dP/dL
+        # Accounting for entropy, from "Fundamentals of Gas Dynamics, 2nd Ed." by Zucker and Biblarz", equation 3.1
+        # dS = dSe + dSi
+        # where dSe = entropy change due to heat transfer = 1/mdot * dq/T
+        # and dSi = entropy change due to friction = 1/T * K * v^2/2
+        # and K = f * dL/D_h, where f is Darcy friciton factor and D_h is the hydraulic diameter (or simply the diameter for a round pipe)
 
-        Then, taking the dH/dL from the partial derivatives chain rule above and plugging it in to eliminate drho/dL and eliminating dH/dL with the two equations for DH/dL,
-        after MUCH REARRANGING, you get:
-        dP/dL = (f * rho * v^2/(2*D_h) * (1-v^2 * B / rho) + rho * g * dz/dL - v^2 * B/mdot * dq/dL)/(v^2*A + v^2 * B/rho - 1)
-        where     ^friction contribution                     ^elevation change contrib      ^heat transfer contribution
+        # We can use a thermodynamic identity to relate enthalpy, entropy, and pressure:
+        # dH = T*dS + dP/rho (from table 6.2-1 in "Chemical, Biochemical, and Engineering Thermodynmics, 4th ed." by Sandler)
+        # Substituting for dS and taking derivative with respect to length
+        # dH/dL = 1/mdot * dq/dL + f * v^2 / (2 * D_h) + 1/rho * dP/dL
 
-        We can use the Euler method to estimate the pressure at the end of a length slice dL
-        """
+        # Then, taking the dH/dL from the partial derivatives chain rule above and plugging it in to eliminate drho/dL and eliminating dH/dL with the two equations for DH/dL,
+        # after MUCH REARRANGING, you get:
+        # dP/dL = (f * rho * v^2/(2*D_h) * (1-v^2 * B / rho) + rho * g * dz/dL - v^2 * B/mdot * dq/dL)/(v^2*A + v^2 * B/rho - 1)
+        # where     ^friction contribution                     ^elevation change contrib      ^heat transfer contribution
+
+        # For full details, see a hand-derivation in the /Derivation_images/dP_dL folder in the repo
+
+        # We can use the Euler method to estimate the pressure at the end of a length slice dL
+
 
         #First, calculate those oddball partial derivatives
         A = AS.first_partial_deriv(CP.iDmass, CP.iP, CP.iHmass)
@@ -1314,10 +1324,13 @@ def compressible_pipe_segment(
         )
         T_out = T_in + dT
 
-        # Try to land at the trial outlet and evaluate the splitter metrics.
-        # If the Euler step over-extrapolated into an unphysical region
-        # (P < 0, two-phase, EOS failure) the AS update raises -- treat that
-        # as an unambiguous "needs split" signal.
+        #Next, we will update the abstract state to the calculated outlet conditions. After that, we will evaluate all of the properties and recalculate what dP/dL and dT/dL
+        #would be at the outlet conditions. If it is dramatically different (an energy balance error is greater than energy_tol and the difference in calculated 
+        # dP/dL is greater than dPdL_rel_tol), we split the segment in half and re-run the Euler step on each, again checking against the tolerance specs at the end. This is 
+        # done recursively as necessary until the errors are smaller than the tolerance and/or we reach the specified number of splits (up to 8 splits/256x reduction in segment length by default)
+        # If the Euler step over-extrapolated into an unphysical or two-phase region
+        # (P < 0, two-phase, EOS failure) the AS update raises an error -- also treat that as an unambiguous "needs split" signal.
+        
         trial_eval_error = None
         try:
             _safe_update_PT(AS, P_out, T_out, T_cricondentherm, P_cricondenbar,
@@ -1404,8 +1417,9 @@ def compressible_pipe_segment(
             compressible_pipe_segment(AS, dL=dL/2.0, **half_kwargs)
             return
 
-        # Converged: apply the one-iteration Newton correction to T_out so
-        # the final state satisfies an energy balance. 
+        # Converged: Finally, apply a one-step energy balance correction to the temperature so that the final state satisfies an energy balance. This costs one additional
+        # abstract state update but does substantially improve the solution when operating at Mach numbers close to 1.
+        
         # H_stagnation = H + v^2/2 + gz
         # H_stagnation_in + q_in = H_stagnation_out
         # Error = H_stagnation_out_calculated - H_stagnation_in - q_in
@@ -1432,7 +1446,7 @@ def compressible_pipe_segment(
         # drho/dL = (∂ρ/∂T)_P * dT/dL + (∂ρ/∂P)_T * dP/dL (chain rule for partial derivatives)
         # Since this case is isothermal, dT/dL = 0 so we can eliminate the first term.
         # drho/dL = (∂ρ/∂P)_T * dP/dL
-        #Substitute this back in and solve for dP/dL
+        #Substitute this back in to our energy/entropy balance equation and solve for dP/dL
         # dP/dL = (rho * f * v^2 / (2 * D_h) - rho * g * dz/dL) / (1 - v^2 * (∂ρ/∂P)_T)
         # We can now Euler method a dP/dL step
         drhodP_T = AS.first_partial_deriv(CP.iDmass, CP.iP, CP.iT)
@@ -1442,9 +1456,13 @@ def compressible_pipe_segment(
         P_out = P_in + dP
         T_out = T_in
 
-        # Try to land at the trial outlet and evaluate the splitter metric.
-        # If the Euler step over-extrapolated into an unphysical region the AS
-        # update raises an error -- treat that as an unambiguous "needs split" signal.
+        #Next, we will update the abstract state to the calculated outlet conditions. After that, we will evaluate all of the properties and recalculate what dP/dL and dT/dL
+        #would be at the outlet conditions. If it is dramatically different (an energy balance error is greater than energy_tol and the difference in calculated 
+        # dP/dL is greater than dPdL_rel_tol), we split the segment in half and re-run the Euler step on each, again checking against the tolerance specs at the end. This is 
+        # done recursively as necessary until the errors are smaller than the tolerance and/or we reach the specified number of splits (up to 8 splits/256x reduction in segment length by default)
+        # If the Euler step over-extrapolated into an unphysical or two-phase region
+        # (P < 0, two-phase, EOS failure) the AS update raises an error -- also treat that as an unambiguous "needs split" signal.
+        
         trial_eval_error = None
         try:
             _safe_update_PT(AS, P_out, T_out, T_cricondentherm, P_cricondenbar,
@@ -1519,214 +1537,3 @@ def compressible_pipe_segment(
             f"compressible_pipe_segment: outlet Mach number Ma={Ma_out:.4f} "
             f"is sonic or near-sonic.  Reduce flow rate or check geometry."
         )
-
-
-def test_comp_hydraulics():
-
-    P_gas    = ureg.Quantity(1000, "psi").to("Pa").magnitude    # Pa
-    T_gas    = 300.0    # K
-    D_gas    = ureg.Quantity(4.026, "inch").to("m").magnitude
-    A_gas    = math.pi * D_gas**2 / 4.0
-    eps_gas  = ureg.Quantity(0.00015, "ft").to("m").magnitude
-    dL_gas   = ureg.Quantity(40.0,    "feet").to("m").magnitude
-    dz_gas   = ureg.Quantity(40.0,    "feet").to("m").magnitude
-    AS_g = composition.define_composition(
-        y_Methane = 0.9,
-        y_Ethane = 0.05,
-        y_Propane=0.02,
-        y_n_Butane = 0.01,
-        y_CarbonDioxide= 0.02,
-        eos = "HEOS"
-        )
-    AS_g.update(CP.PT_INPUTS, P_gas, T_gas)
-    rho_gas = AS_g.rhomass()
-    S_in = AS_g.smass()
-    Q_scfd   = ureg.Quantity(200.0, "mmscf/day")
-    mdot     = Q_scfd.to("mol/s").magnitude * AS_g.molar_mass()   # kg/s from mol wt
-    G_gas    = mdot / A_gas
-    a_in   = AS_g.speed_sound()                # m/s
-    v_in   = mdot / (rho_gas * A_gas)          # m/s
-    Ma_in = v_in/a_in
-
-    print('\n')
-    print(f'inputs: P = {P_gas}, Smass= {S_in}, velocity = {v_in}, Mach number = {Ma_in}')
-    # print('\n')
-    compressible_pipe_segment(
-        abstract_state=AS_g,   # already updated to (P_gas, T_gas) above
-        mdot=mdot,
-        dL=dL_gas,
-        dz=dz_gas,
-        D_h=D_gas,
-        roughness=eps_gas,
-        flow_area=A_gas,
-        isothermal=True,
-    )
-    outlet_P = AS_g.p()
-    outlet_T = AS_g.T()
-    rho_out = AS_g.rhomass()
-    a_out   = AS_g.speed_sound()                # m/s
-    v_out   = mdot / (rho_out * A_gas)          # m/s
-    Ma_out = v_out/a_out
-    S_out = AS_g.smass()
-
-    # print('\n')
-    print('Isothermal case')
-    print(f'outputs: P = {outlet_P}, T = {outlet_T}, Smass= {S_out}, velocity = {v_out}, Mach number = {Ma_out}')
-    print('\n')
-
-    AS_g.update(CP.PT_INPUTS, P_gas, T_gas) #reinitialize abstract state
-
-    compressible_pipe_segment(
-        abstract_state=AS_g,   # already updated to (P_gas, T_gas) above
-        mdot=mdot,
-        dL=dL_gas,
-        dz=dz_gas,
-        D_h=D_gas,
-        roughness=eps_gas,
-        flow_area=A_gas,
-        isothermal=False,
-        q_wall = ureg.Quantity(0, "Btu/hr").to("watt").magnitude,
-    )
-    outlet_P = AS_g.p()
-    outlet_T = AS_g.T()
-    rho_out = AS_g.rhomass()
-    a_out   = AS_g.speed_sound()                # m/s
-    v_out   = mdot / (rho_out * A_gas)          # m/s
-    Ma_out = v_out/a_out
-    S_out = AS_g.smass()
-
-    print('Adiabatic case')
-    print(f'outputs: P = {outlet_P}, T = {outlet_T}, Smass= {S_out}, velocity = {v_out}, Mach number = {Ma_out}')
-
-def test_line_segment_csv():
-    csv_path = os.path.join(os.path.dirname(__file__), "testprofile_crane.csv")
-    roughness = ureg.Quantity(0.00015, "ft")
-
-    seg = Line_Segment.from_csv(csv_path, roughness=roughness, name='1')
-
-    P_in = ureg.Quantity(1300, "psi").to("Pa").magnitude
-    T_in = ureg.Quantity(40, "degF").to("degK").magnitude   # K
-    Q_scfd = ureg.Quantity(125.5, "mmscf/day")
-
-    AS = composition.define_composition(
-        y_Methane = 0.75,
-        y_Ethane = 0.21,
-        y_Propane=0.04,
-        # y_n_Butane = 0.01,
-        # y_CarbonDioxide= 0.02,
-        # y_Water = 1.0,
-        eos = "HEOS"
-    )
-    AS.update(CP.PT_INPUTS, P_in, T_in)
-    rho_in = AS.rhomass()
-    area_in = seg.profile[0][3]
-    v_in = _resolve_mdot(Q_scfd, AS) / (rho_in * area_in)
-    Ma_in = v_in / AS.speed_sound()
-
-    print("\ntest_line_segment_csv")
-    print(f"  inlet: P={P_in:.4g} Pa, T={T_in} K, Ma={Ma_in:.4f}")
-
-    profile_points = seg.dP_dT(abstract_state=AS, flow_rate=Q_scfd, isothermal=True, mu = 1.1e-5)
-    P_out = AS.p()
-    T_out = AS.T()
-   
-    rho_out = AS.rhomass()
-    area_out = seg.profile[-1][3]
-    v_out = _resolve_mdot(Q_scfd, AS) / (rho_out * area_out)
-    Ma_out = v_out / AS.speed_sound()
-
-    P_out_psi = ureg.Quantity(P_out, "Pa").to("psi").magnitude
-    dP_psi = ureg.Quantity(P_out - P_in, "Pa").to("psi").magnitude
-    print(f"  outlet: P={P_out_psi:.4g} psi, T={T_out:.4g} K, Ma={Ma_out:.4f}")
-    print(f"  dP = {dP_psi:.4f} psi")
-
-    import matplotlib.pyplot as plt
-
-    dist_ft = [ureg.Quantity(pt[0], "m").to("ft").magnitude  for pt in profile_points]
-    P_psi   = [ureg.Quantity(pt[1], "Pa").to("psi").magnitude for pt in profile_points]
-    T_degF  = [ureg.Quantity(pt[2], "degK").to("degF").magnitude for pt in profile_points]
-    v_fts = [ureg.Quantity(pt[3], "m").to("ft").magnitude for pt in profile_points]
-
-    plt.rcParams["font.family"] = "Consolas"
-    fig, ax1 = plt.subplots()
-
-    l1, = ax1.plot(dist_ft, P_psi,  color="black", label="Pressure [psi]")
-    ax1.set_xlabel("Distance [ft]")
-    ax1.set_ylabel("Pressure [psi]")
-    
-
-    ax2 = ax1.twinx() 
-
-    l2, = ax2.plot(dist_ft, T_degF, color="red",   label="Temperature [°F]")
-    ax2.set_ylabel("Temperature [°F]")
-
-    # l2, = ax2.plot(dist_ft, v_fts, color="red",   label="Velocity(ft/s)")
-    # ax2.set_ylabel("Velocity (ft/s)")
-
-    ax2.legend([l1, l2], ["Pressure [psi]", "Temperature (°F)"])
-    plt.title(f'Pressure and temperature profile at {Q_scfd}')
-    plt.tight_layout()
-    plt.show()
-
-def phase_env():
-    import matplotlib.pyplot as plt
-    AS_g = composition.define_composition(
-        y_Methane = 0.9,
-        y_Ethane = 0.05,
-        y_Propane=0.02,
-        y_n_Butane = 0.01,
-        y_CarbonDioxide= 0.02,
-        eos = "HEOS"
-        )
-    try:
-        AS_g.build_phase_envelope("dummy")
-        PE = AS_g.get_phase_envelope_data()
-        plt.plot(PE.T, PE.p, '-', label='Composition')
-        plt.xlabel('Temperature [K]')
-    except ValueError as VE:
-        print(VE)
-
-    plt.ylabel('Pressure [Pa]')
-    plt.yscale('log')
-    plt.title('Phase Envelope for Selected Composition')
-    plt.legend(loc='lower right', shadow=True)
-    plt.savefig('methane-ethane.png')
-
-    # AS_g.update(CP.PT_INPUTS, 4.32036e+06, 285.88)
-    # phase = AS_g.phase()
-    # if phase == _CP_PHASE_TWOPHASE:
-    #     print('two phase')
-
-def test_fittings():
-    D_small = ureg.Quantity(3.826, "in")
-    D_large = ureg.Quantity(4.026, "in")
-    contraction_test = Contraction_Expansion(Di_US=D_large, Di_DS= D_small)
-    expansion_test = Contraction_Expansion(Di_US=D_small, Di_DS= D_large)
-    elbow = Bend(D_large, 90, 1.5)
-    P_in = ureg.Quantity(1000, "psi").to("Pa").magnitude
-    T_in = 300.0   # K
-    Q_scfd = ureg.Quantity(60, "mmscf/day")
-    print(f'Inlet P:{P_in}, T:{T_in}')
-    AS = composition.define_composition(
-        y_Methane = 0.0,
-        y_Ethane = 0.00,
-        y_Propane=0.00,
-        y_n_Butane = 1,
-        y_CarbonDioxide= 0.0,
-        eos = "HEOS"
-    )
-    AS.update(CP.PT_INPUTS, P_in, T_in)
-
-    contraction_test.dP_dT(AS, Q_scfd)
-    print(f'After contraction P:{AS.p()}, T:{AS.T()}')
-    expansion_test.dP_dT(AS, Q_scfd)
-    print(f'After expansion P:{AS.p()}, T:{AS.T()}')
-    elbow.dP_dT(abstract_state=AS, flow_rate=Q_scfd)
-    print(f'After elbow P:{AS.p()}, T:{AS.T()}')
-
-
-if __name__ == "__main__":
-    # test_fittings()
-    # phase_env()
-    test_line_segment_csv()
-    # test_comp_hydraulics()
