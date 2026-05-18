@@ -1,6 +1,18 @@
+import csv
+
 import CoolProp.CoolProp as CP
 from CoolProp.CoolProp import AbstractState
 from component_classes import ureg
+
+# Component names recognised by define_composition / parse_composition_csv.
+# Underscored CoolProp aliases (n_Butane -> CoolProp's n-Butane) -- the
+# underscore form is what the y_<Component> kwargs use.
+KNOWN_COMPONENTS = [
+    "Methane", "Ethane", "Propane", "n_Butane", "IsoButane",
+    "n_Pentane", "Isopentane", "n_Hexane", "n_Heptane", "n_Octane",
+    "n_Nonane", "n_Decane", "Benzene", "CarbonDioxide", "Water", "Nitrogen",
+    "Oxygen", "Argon", "Hydrogen", "HydrogenSulfide",
+]
 
 
 def define_combination(
@@ -169,18 +181,10 @@ def define_composition(
     ):
     # ------------------------------------
 
-    # The list of suffixes based on CoolProp's registry names
-    components = [
-        "Methane", "Ethane", "Propane", "n_Butane", "IsoButane",
-        "n_Pentane", "Isopentane", "n_Hexane", "n_Heptane", "n_Octane",
-        "n_Nonane", "n_Decane", "Benzene", "CarbonDioxide", "Water", "Nitrogen",
-        "Oxygen", "Argon", "Hydrogen", "HydrogenSulfide"
-    ]
-
     active_cp_names = []
     fractions = []
 
-    for comp in components:
+    for comp in KNOWN_COMPONENTS:
         val = locals().get(f"y_{comp}", 0.0)
         if val > 0:
             # CoolProp uses hyphens (n-Butane) while Python uses underscores (n_Butane)
@@ -200,6 +204,111 @@ def define_composition(
     AS.set_mole_fractions(fractions)
 
     return AS
+
+
+def parse_composition_csv(csv_path):
+    """Read a composition CSV into a {component: mole_fraction} dict.
+
+    The CSV must have a header row with columns named 'Component' and
+    'Mole fraction' (matched case-insensitively).  Blank mole-fraction cells
+    are skipped, so a single template CSV listing every supported component
+    can be used by leaving the unused rows empty.  Component names must
+    match KNOWN_COMPONENTS exactly (underscore form, e.g. 'n_Butane',
+    'CarbonDioxide').
+
+    Fractions are NOT normalised here -- the dict is meant to feed
+    define_composition (directly or via define_composition_from_csv), which
+    normalises internally.
+
+    Args:
+        csv_path : path to the composition CSV.
+
+    Returns:
+        dict mapping component name to a positive mole fraction (float).
+
+    Raises:
+        ValueError : empty file, missing header columns, unknown component,
+                     non-numeric fraction, or no rows with a positive value.
+    """
+    out = {}
+    # utf-8-sig transparently strips a UTF-8 BOM, which Excel routinely
+    # writes at the start of CSV exports and would otherwise attach to
+    # the first header name ('﻿Component' != 'Component').
+    with open(csv_path, newline="", encoding="utf-8-sig") as f:
+        reader = csv.DictReader(f)
+        if reader.fieldnames is None:
+            raise ValueError(f"Composition CSV '{csv_path}' is empty.")
+
+        # Match the two required headers case-insensitively while keeping
+        # the original key (DictReader keys by the exact header text).
+        header_map = {h.strip().lower(): h for h in reader.fieldnames if h}
+        comp_col = header_map.get("component")
+        frac_col = header_map.get("mole fraction") or header_map.get("fraction")
+        if comp_col is None or frac_col is None:
+            raise ValueError(
+                f"Composition CSV '{csv_path}' must have 'Component' and "
+                f"'Mole fraction' columns (got {reader.fieldnames})."
+            )
+
+        for row in reader:
+            name = (row.get(comp_col) or "").strip()
+            frac_str = (row.get(frac_col) or "").strip()
+            if not name or not frac_str:
+                continue
+            if name not in KNOWN_COMPONENTS:
+                raise ValueError(
+                    f"Composition CSV '{csv_path}': unknown component "
+                    f"'{name}'.  Valid names: {KNOWN_COMPONENTS}."
+                )
+            try:
+                val = float(frac_str)
+            except ValueError as e:
+                raise ValueError(
+                    f"Composition CSV '{csv_path}': non-numeric mole "
+                    f"fraction '{frac_str}' for component '{name}'."
+                ) from e
+            if val > 0:
+                # Duplicate detection mirrors the GUI table backstop: a
+                # repeated component is almost always a user mistake, and
+                # silently overwriting (or summing) hides it.  Reject so
+                # the caller knows to fix the CSV.
+                if name in out:
+                    raise ValueError(
+                        f"Composition CSV '{csv_path}': duplicate component "
+                        f"'{name}'.  Combine the rows or remove the redundant "
+                        f"entry."
+                    )
+                out[name] = val
+
+    if not out:
+        raise ValueError(
+            f"Composition CSV '{csv_path}': no components with a positive "
+            f"mole fraction."
+        )
+    return out
+
+
+def define_composition_from_csv(csv_path, eos="HEOS"):
+    """Build an AbstractState by loading mole fractions from a CSV file.
+
+    Convenience wrapper around parse_composition_csv + define_composition,
+    intended for headless / scripting use.  GUI callers typically want to
+    use parse_composition_csv directly so the parsed values can be shown
+    (and edited) before the AbstractState is built.
+
+    Args:
+        csv_path : path to the composition CSV.
+        eos      : CoolProp backend (default 'HEOS').
+
+    Returns:
+        CoolProp AbstractState with the mole fractions applied.  As with
+        define_composition, the state has NOT been updated to a (P, T)
+        yet -- call AS.update(CP.PT_INPUTS, P, T) before querying.
+    """
+    fractions = parse_composition_csv(csv_path)
+    kwargs = {f"y_{name}": val for name, val in fractions.items()}
+    kwargs["eos"] = eos
+    return define_composition(**kwargs)
 
 
 def mass_flow_rate():

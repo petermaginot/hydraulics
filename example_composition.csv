@@ -1,0 +1,21 @@
+﻿Component,Mole fraction
+Methane,0.9
+Ethane,0.05
+Propane,0.03
+n_Butane,0.02
+IsoButane,
+n_Pentane,
+Isopentane,
+n_Hexane,
+n_Heptane,
+n_Octane,
+n_Nonane,
+n_Decane,
+Benzene,
+CarbonDioxide,
+Water,
+Nitrogen,
+Oxygen,
+Argon,
+Hydrogen,
+HydrogenSulfide,

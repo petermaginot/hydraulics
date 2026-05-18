@@ -1,5 +1,6 @@
 """
-Calculates flow partitioning on parallel line segments
+Simple calculator to solve flow partitioning on parallel line segments. Multiple components in series can be included on each parallel path by passing them
+to the function as a list within the line_segment_list.
 """
 import warnings
 

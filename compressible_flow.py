@@ -125,6 +125,7 @@ class Line_Segment(Base_Line_Segment):
         energy_tol=10.0,
         dPdL_rel_tol=0.05,
         max_split_depth=8,
+        verbose=False,
     ):
         """Calculate outlet pressure and temperature for compressible flow
         through the segment.
@@ -275,9 +276,11 @@ class Line_Segment(Base_Line_Segment):
             T_cur   = AS.T()
             v_cur   = mdot / (AS.rhomass() * area_out)
             profile_points.append((dist_out, P_cur, T_cur, v_cur))
-            msg = str(f"Segment {self.name} Step: {i+1} of {n-1}, P = {P_cur}, T = {T_cur}")
-            print(msg, end="\r")
-        print(f" "*len(msg), end="\r")
+            if verbose:
+                msg = str(f"Segment {self.name} Step: {i+1} of {n-1}, P = {P_cur}, T = {T_cur}")
+                print(msg, end="\r")
+        if verbose:
+            print(f" "*len(msg), end="\r")
         return profile_points
 
 
@@ -628,7 +631,7 @@ _SINGLE_PHASE_CODES = frozenset([
 ])
 
 
-def _build_phase_limits(AS):
+def _build_phase_limits(AS, verbose=False):
     """Return (T_cricondentherm, P_cricondenbar, T_critical, P_critical) [K, Pa].
     This function builds a phase envelope for a CoolProp abstract state to calculate the critical properties to aid in determining if
     a pressure/temperature combination is obviously in a single phase state or not by comparing it to the critical pressure/temperature 
@@ -654,8 +657,9 @@ def _build_phase_limits(AS):
     """
     AS_tmp = AbstractState("HEOS", "&".join(AS.fluid_names()))
     AS_tmp.set_mole_fractions(list(AS.get_mole_fractions()))
-    msg = str('Building phase limits - this can take a while')
-    print(msg, end='\r')
+    if verbose:
+        msg = str('Building phase limits - this can take a while')
+        print(msg, end='\r')
     try:
         AS_tmp.build_phase_envelope("")
         PE = AS_tmp.get_phase_envelope_data()
@@ -670,7 +674,8 @@ def _build_phase_limits(AS):
     except Exception:
         T_c, P_c = None, None
 
-    print(f" "*len(msg), end="\r")
+    if verbose:
+        print(f" "*len(msg), end="\r")
 
     return T_cric, P_bar, T_c, P_c
 
@@ -750,7 +755,8 @@ def compressible_changing_area(abstract_state, mdot, A_in, A_out):
     outlet Mach number satisfying continuity on the same isentropic curve, then
     recovers outlet static conditions from total-condition ratios.  
     The heat-capacity ratio gamma is obtained from the
-    AbstractState at inlet conditions.
+    AbstractState at inlet conditions. Note that this is only valid for an ideal gas - this function
+    is only used for an initial guess for the non-ideal solver function.
 
     Area-Mach relation (from https://www.grc.nasa.gov/www/k-12/airplane/isentrop.html):
 
@@ -912,7 +918,8 @@ def compressible_changing_area_K(
 
     The two-equation system in (P_out, T_out) is solved with
     scipy.optimize.root using the isentropic area-change result as the
-    initial guess.
+    initial guess. Note that this routine can take a lot of iterations (and corresponding
+    abstract updates) to converge, which can take quite a long time!
 
     Args:
         abstract_state : CoolProp AbstractState, pre-updated to inlet (P, T)
@@ -1021,6 +1028,13 @@ def compressible_K(
 
     For low Mach numbers the dP formula reduces to the familiar
     incompressible result dP = -K*rho*v^2/2.
+
+    See the hand-derivation in /Derivation_images/dP_for_K
+    Note that for the entropy accounting, no change in temperature is assumed across the fitting.
+    The error introduced by this is probably less than the uncertainty of the K-factor correlation for most realistic
+    scenarios. If a dramatic temperature change occurs over the fitting, you may be better off with
+    the compressible_changing_area_K function which uses the average temperature in its entropy balance.
+    That function is more rigorous but substantially more computationally intensive.
 
     Args:
         abstract_state : CoolProp AbstractState, pre-updated to inlet (P, T)
@@ -1265,7 +1279,7 @@ def compressible_pipe_segment(
     if not isothermal:
 
         # We will first calculate dP for a known dL, using fluid properties at the inlet conditions and assuming they don't change enough over the length slice to affect the calculation.
-        # From the energy balance, dq = mdot * dH + mdot/2 * d(v^2)/2 + mdot * g * dz
+        # From the energy balance, dq = mdot * dH + mdot * d(v^2)/2 + mdot * g * dz
         # From the continuity equation mdot = rho * flow_area * v
         # Combine these two, take the derivative with respect to length, and do some rearranging (substituting dv^2 = 2vdv and dv = -v/rho * drho)
         # 1/mdot * dq/dL = dH/dL - v^2/rho * drho/dL + g * dz/dL

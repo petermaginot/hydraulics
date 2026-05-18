@@ -285,7 +285,7 @@ def dP_fittings():
     ID_pipe = ureg.Quantity(3.068, "inch")
 
     rho = ureg.Quantity(49.0, "lb/ft^3")
-    flow_rate = ureg.Quantity(10000, "bbl/day")
+    flow_rate = ureg.Quantity(10000, "oil_bbl/day")
     area = (ID_pipe**2)/4*pi
 
     velocity = flow_rate / area
@@ -374,6 +374,7 @@ def test_deNevers6_4():
     print('Textbook solution dP = 484 psi')
 
 def test_Crane_air_line():
+    #Crane TP 410 example 4-16. Air at 65 psig, 110 F flows through 75 ft of 1" S/40 pipe at 100 scf/minute rate. Find pressure drop and velocity in ft/minute
     from compressible_flow import Line_Segment, Bend, Contraction_Expansion, _build_phase_limits, _safe_update_PT, compressible_changing_area_K, _safe_update_PT, compressible_pipe_segment, _resolve_mdot
 
     roughness = ureg.Quantity(0.00015, "ft")
@@ -402,11 +403,10 @@ def test_Crane_air_line():
 
     mdot = _resolve_mdot(Q_scfd, AS)
 
-    v_in = mdot / AS.molar_mass()
+    v_in = ureg.Quantity(mdot / AS.rhomass() / area.to("m^2").magnitude, "m/s").to("ft/min")
 
-    Ma_in = v_in /AS.speed_sound()
 
-    print(f'  inlet: P={ureg.Quantity(P_in,"Pa").to("psi"):.4f}, T={T_in:.4g} K, Ma={Ma_in:.4f}')
+    print(f'  inlet: P={ureg.Quantity(P_in,"Pa").to("psi"):.4f}, T={T_in:.4g} K, v_in = {v_in}')
     seg.dP_dT(abstract_state=AS, flow_rate=Q_scfd, isothermal=True, mu=viscosity,
     T_cricondentherm=T_cric,
     P_cricondenbar=P_bar,
@@ -423,6 +423,106 @@ def test_Crane_air_line():
 
     print(f'  outlet: P={ureg.Quantity(P_out,"Pa").to("psi"):.4f} psi, v = {ureg.Quantity(v_out,"m/s").to("ft/min"):.4f}, T = {T_out}K')
     print(f'dP = {ureg.Quantity(P_out-P_in,"Pa").to("psi"):.4f}')
+    print('Textbook solution: 3367 ft/min upstream, 3483 ft/min downstream, dP = 2.61 psi')
+
+def test_Crane_4_10():
+    #Crane example 4-10 - pressure drop of 600 psig, 850F steam through 400 ft of 6" S/80 pipe at 90,000 lb/hr rate. 
+    # The problem statement doesn't say what sequence the fittings are in, so we willjust evaluate pipe -> elbows -> valves
+    from compressible_flow import Line_Segment, Bend, Contraction_Expansion,Valve, _build_phase_limits, _safe_update_PT, compressible_changing_area_K, _safe_update_PT, compressible_pipe_segment, _resolve_mdot
+    import fluids.units as fittings
+    roughness = ureg.Quantity(0.00015, "ft")
+    seg_length = ureg.Quantity(400, "ft")
+    OD = ureg.Quantity(6.625, "inch")
+    WT = ureg.Quantity(0.432, "inch")
+    ID = OD - 2*WT
+    viscosity = None #use the abstract state viscosity
+    area = ID**2/4*math.pi
+
+    
+    #initialize components
+    #line segment
+    seg = Line_Segment(roughness = roughness, id_val = ID, length = seg_length, elevation_change=0.0)
+    
+    #three elbows
+    elbow = []
+    for i in range(3):
+        elbow.append(Bend(Di=ID, ang_deg = 90, bend_dias=1.5))
+    
+    #6x4 gate valve - "angle" given as 2 * arctan(0.110) = 12.56 degrees in problem statement
+    k_gate = fittings.K_gate_valve_Crane(D1=ureg.Quantity(4.0, "inch"), D2 = ID, angle=12.56*ureg.degrees) 
+    print(f'K gate valve = {k_gate}')
+    Gate_valve = Valve(Di = ID, K = k_gate)
+
+    #6" y-pattern globe valve - seat diameter 0.9x ID of S/80 pipe
+    k_globe = fittings.K_angle_valve_Crane(D1 = 0.9*ID, D2 = ID)
+    print(f'K globe valve = {k_globe}')
+    Globe_valve = Valve(Di = ID, K = k_globe)
+
+    P_in = ureg.Quantity(600+14.696, "psi").to("Pa").magnitude #600 psig
+    T_in = ureg.Quantity(850, "degF").to("degK").magnitude   # K
+
+    AS = composition.define_composition(
+        y_Water = 1.0,
+        eos = "HEOS"
+    )
+    T_cric, P_bar, T_c, P_c = _build_phase_limits(AS)
+
+    AS.update(CP.PT_INPUTS, P_in, T_in)
+
+    mass_flow_rate = ureg.Quantity(90000.0, "lb/hr")
+
+    mdot = _resolve_mdot(mass_flow_rate, AS)
+
+    v_in = mdot / AS.rhomass() / area.to("m^2").magnitude
+
+    Ma_in = v_in /AS.speed_sound()
+
+    print(f'  inlet: P={ureg.Quantity(P_in,"Pa").to("psi"):.4f}, T={T_in:.4g} K, Ma={Ma_in:.4f}')
+
+    P_cur = P_in
+    seg.dP_dT(abstract_state=AS, flow_rate=mass_flow_rate, isothermal=False,
+        T_cricondentherm=T_cric,
+        P_cricondenbar=P_bar,
+        T_critical=T_c,
+        P_critical=P_c,)
+
+    print(f' dP pipe={ureg.Quantity(AS.p() - P_cur,"Pa").to("psi"):.4f} psid')
+    P_cur = AS.p()
+    #three elbows
+    for i in range(3):
+        elbow[i].dP_dT(abstract_state=AS, flow_rate=mass_flow_rate,
+        T_cricondentherm=T_cric,
+        P_cricondenbar=P_bar,
+        T_critical=T_c,
+        P_critical=P_c,)
+        print(f' dP elbow {i+1}={ureg.Quantity(AS.p() - P_cur,"Pa").to("psi"):.4f} psid')
+        P_cur = AS.p()
+
+    Gate_valve.dP_dT(abstract_state=AS, flow_rate=mass_flow_rate,
+        T_cricondentherm=T_cric,
+        P_cricondenbar=P_bar,
+        T_critical=T_c,
+        P_critical=P_c,)
+    print(f' dP gate={ureg.Quantity(AS.p() - P_cur,"Pa").to("psi"):.4f} psid')
+    P_cur = AS.p()
+    Globe_valve.dP_dT(abstract_state=AS, flow_rate=mass_flow_rate,
+        T_cricondentherm=T_cric,
+        P_cricondenbar=P_bar,
+        T_critical=T_c,
+        P_critical=P_c,)
+    print(f' dP globe={ureg.Quantity(AS.p() - P_cur,"Pa").to("psi"):.4f} psid')
+    P_cur = AS.p()
+    P_out = AS.p()
+    T_out = AS.T()
+
+    rho_out = AS.rhomass()
+    area_out = seg.profile[-1][3]
+    v_out = mdot / (rho_out * area_out)
+    Ma_out = v_out / AS.speed_sound()
+
+    print(f'  outlet: P={ureg.Quantity(P_out,"Pa").to("psi"):.4f} psi, v = {ureg.Quantity(v_out,"m/s").to("ft/s"):.4f}, T = {T_out}K')
+    print(f'dP = {ureg.Quantity(P_out-P_in,"Pa").to("psi"):.4f}')
+    print('Textbook solution: 40.1 psi drop')
 
 
 
@@ -630,32 +730,37 @@ def test_Crane_choked_steam():
 
 if __name__ == "__main__":
 
-    print('Zucker & Biblarz unnumbered example in section 5.7 (isentropic converging nozzle):')
-    test_ZuckerBiblarz5_7()
+    # print('Zucker & Biblarz unnumbered example in section 5.7 (isentropic converging nozzle):')
+    # test_ZuckerBiblarz5_7()
+
+    # print('--------------------------------------------------------')
+    # print('Zucker & Biblarz example 9.3 (Fanno flow):')
+    # test_ZuckerBiblarz9_3()
+
+    # print('--------------------------------------------------------')
+    # print('de Nevers example 8.10 (isentropic converging nozzle and Fanno flow):')
+    # test_deNevers8_10()
+
+    # print('--------------------------------------------------------')
+    # print('Zucker & Biblarz example 10.3 (Rayleigh flow):')
+    # test_ZuckerBiblarz10_3()
+
+    # print('--------------------------------------------------------')
+    # print('de Nevers example 6.11 and 6.12 (incompressible fluid friction with pipe and fittings):')
+    # test_deNevers6_11()
+
+    # print('--------------------------------------------------------')
+    # print('de Nevers example 6.4 (incompressible fluid friction with pipe):')
+    # test_deNevers6_4()
+
+    # print('--------------------------------------------------------')
+    # print('\nCrane TP410 example 4-18')
+    # test_Crane_gas_pipeline()
 
     print('--------------------------------------------------------')
-    print('Zucker & Biblarz example 9.3 (Fanno flow):')
-    test_ZuckerBiblarz9_3()
-
-    print('--------------------------------------------------------')
-    print('de Nevers example 8.10 (isentropic converging nozzle and Fanno flow):')
-    test_deNevers8_10()
-
-    print('--------------------------------------------------------')
-    print('Zucker & Biblarz example 10.3 (Rayleigh flow):')
-    test_ZuckerBiblarz10_3()
-
-    print('--------------------------------------------------------')
-    print('de Nevers example 6.11 and 6.12 (incompressible fluid friction with pipe and fittings):')
-    test_deNevers6_11()
-
-    print('--------------------------------------------------------')
-    print('de Nevers example 6.4 (incompressible fluid friction with pipe):')
-    test_deNevers6_4()
-
-    print('--------------------------------------------------------')
-    print('\nCrane TP410 example')
-    test_Crane_gas_pipeline()
+    print('\nCrane TP410 example 4-16')
     test_Crane_air_line()
 
-    # test_Crane_choked_steam()
+    print('--------------------------------------------------------')
+    print('\nCrane TP410 example 4-10')
+    test_Crane_4_10()

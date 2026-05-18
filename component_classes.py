@@ -45,6 +45,15 @@ import warnings
 from pint import UnitRegistry
 
 ureg = UnitRegistry()
+
+# Remove pint's default 'bbl' / 'barrel' (31.5 US gal, the fluid barrel).  In
+# pipeline work "barrel" always means the 42-gal petroleum barrel, which pint
+# spells 'oil_bbl'.  Deleting forces a UndefinedUnitError on accidental use
+# rather than silently scaling flow rates by 0.75.  Touches a pint internal
+# (ureg._units); revisit if pint changes its registry layout.
+del ureg._units['bbl']
+del ureg._units['barrel']
+
 #need to register standard cubic foot (scf), thousand standard cubic feet (mscf), million standard cubic feet (mmscf), and standard cubic meter (scm) as custom units in the unit registry
 
 # ---------------------------------------------------------------------------
