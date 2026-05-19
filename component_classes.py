@@ -23,6 +23,11 @@ Base_Valve
     A valve fitting.  Stores pipe inner diameter and a pre-computed K-factor
     (resistance coefficient).
 
+Base_CheckValve
+    A check valve fitting.  Same layout as Base_Valve (Di + K_forward) but
+    carries check_valve=True so network._reversed_component can substitute a
+    very-high-K shadow, modelling a perfectly-sealing valve under reverse flow.
+
 Base_Contraction_Expansion
     An abrupt contraction or expansion between two pipe diameters.  Stores
     upstream and downstream inner diameters.
@@ -685,6 +690,49 @@ class Base_Valve:
             f"{self.__class__.__name__}("
             f"Di={Di_q.to('inch'):.4f~P}, "
             f"K={self.K:.4f})"
+        )
+
+
+# ---------------------------------------------------------------------------
+# Base_CheckValve
+# ---------------------------------------------------------------------------
+
+class Base_CheckValve:
+    """Geometry storage for a check valve fitting.
+
+    Identical in layout to Base_Valve (Di + K) but carries a class-level
+    ``check_valve = True`` marker.  network._reversed_component detects this
+    and returns a copy with K replaced by a very large sealing value, so the
+    solver sees near-infinite resistance for reverse flow.
+
+    Args:
+        Di : pint Quantity or float (m if float).  Pipe inner diameter used
+             as the velocity-head reference for dP.  Must be positive.
+        K  : float.  Forward-flow resistance coefficient.  Must be >= 0.
+    """
+
+    check_valve = True
+
+    def __init__(self, Di, K, name=None):
+        self.name  = name
+        self.Di_si = _to_si(Di, "m")
+        self.K     = float(K)
+
+        if self.Di_si is None or self.Di_si <= 0.0:
+            raise ValueError(
+                f"{self.__class__.__name__}: Di must be a positive length."
+            )
+        if self.K < 0.0:
+            raise ValueError(
+                f"{self.__class__.__name__}: K must be >= 0."
+            )
+
+    def __repr__(self):
+        Di_q = ureg.Quantity(self.Di_si, "m")
+        return (
+            f"{self.__class__.__name__}("
+            f"Di={Di_q.to('inch'):.4f~P}, "
+            f"K_fwd={self.K:.4f})"
         )
 
 

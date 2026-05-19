@@ -55,7 +55,11 @@ from NodeGraphQt import BaseNode, NodeGraph
 from component_classes import ureg
 from gui import units as U
 from gui.screens.segment import _LabeledField
-from incompressible import Incompressible_Fluid, Line_Segment
+import fluids.fittings
+from incompressible import (
+    Incompressible_Fluid, Line_Segment, Bend, Contraction_Expansion, Valve,
+    CheckValve,
+)
 from network import Network
 
 
@@ -63,6 +67,9 @@ from network import Network
 SOURCE_SINK_TYPE_ID  = "pipe.SourceSinkNode"
 JUNCTION_TYPE_ID     = "pipe.JunctionNode"
 PIPE_SEGMENT_TYPE_ID = "pipe.PipeSegmentNode"
+FITTING_NODE_TYPE_ID     = "pipe.FittingNode"
+VALVE_NODE_TYPE_ID       = "pipe.ValveNode"
+CHECKVALVE_NODE_TYPE_ID  = "pipe.CheckValveNode"
 
 # Pint dimensionalities used to dispatch flow display units to either the
 # mass-flow source (mdot_kgs) or the volumetric-flow source (Q_m3s).
@@ -135,6 +142,66 @@ class PipeSegmentNode(BaseNode):
         self.add_text_input("Q_result", label="", text="")
 
 
+class FittingNode(BaseNode):
+    """Inline fitting (bend or sudden contraction/expansion).
+
+    Single in + single out.  Stored parameters feed a Bend or
+    Contraction_Expansion built at solve time.
+    """
+    __identifier__ = "pipe"
+    NODE_NAME = "Fitting"
+
+    def __init__(self):
+        super().__init__()
+        self.add_input("in",   multi_input=False)
+        self.add_output("out", multi_output=False)
+        self.add_text_input(
+            "dP_result", label="", text="",
+            placeholder_text="(solve to see)",
+        )
+        self.add_text_input("Q_result", label="", text="")
+
+
+class ValveNode(BaseNode):
+    """Inline valve fitting (globe or gate).
+
+    Single in + single out.  Stored parameters feed a Valve built at
+    solve time via the Crane K-factor correlations.
+    """
+    __identifier__ = "pipe"
+    NODE_NAME = "Valve"
+
+    def __init__(self):
+        super().__init__()
+        self.add_input("in",   multi_input=False)
+        self.add_output("out", multi_output=False)
+        self.add_text_input(
+            "dP_result", label="", text="",
+            placeholder_text="(solve to see)",
+        )
+        self.add_text_input("Q_result", label="", text="")
+
+
+class CheckValveNode(BaseNode):
+    """Inline check valve that seals on reverse flow.
+
+    Single in + single out.  Forward K from Crane correlations;
+    reverse K = _SEALING_K (handled by _reversed_component in network.py).
+    """
+    __identifier__ = "pipe"
+    NODE_NAME = "Check Valve"
+
+    def __init__(self):
+        super().__init__()
+        self.add_input("in",   multi_input=False)
+        self.add_output("out", multi_output=False)
+        self.add_text_input(
+            "dP_result", label="", text="",
+            placeholder_text="(solve to see)",
+        )
+        self.add_text_input("Q_result", label="", text="")
+
+
 # ---------------------------------------------------------------------------
 # NetworkScreen
 # ---------------------------------------------------------------------------
@@ -168,25 +235,37 @@ class NetworkScreen(QWidget):
         self.graph.register_node(SourceSinkNode)
         self.graph.register_node(JunctionNode)
         self.graph.register_node(PipeSegmentNode)
+        self.graph.register_node(FittingNode)
+        self.graph.register_node(ValveNode)
+        self.graph.register_node(CheckValveNode)
         self.graph.node_selected.connect(self._on_node_selected)
         self.graph.nodes_deleted.connect(self._on_nodes_deleted)
 
         # ---- Toolbar ----
-        add_src_btn  = QPushButton("+ Source/Sink")
+        add_src_btn   = QPushButton("+ Source/Sink")
         add_src_btn.clicked.connect(self._add_source_sink)
-        add_jct_btn  = QPushButton("+ Junction")
+        add_jct_btn   = QPushButton("+ Junction")
         add_jct_btn.clicked.connect(self._add_junction)
-        add_pipe_btn = QPushButton("+ Pipe")
+        add_pipe_btn  = QPushButton("+ Pipe")
         add_pipe_btn.clicked.connect(self._add_pipe_segment)
-        del_btn      = QPushButton("- Delete selected")
+        add_fit_btn   = QPushButton("+ Fitting")
+        add_fit_btn.clicked.connect(self._add_fitting)
+        add_valve_btn = QPushButton("+ Valve")
+        add_valve_btn.clicked.connect(self._add_valve)
+        add_cv_btn    = QPushButton("+ Check Valve")
+        add_cv_btn.clicked.connect(self._add_check_valve)
+        del_btn       = QPushButton("- Delete selected")
         del_btn.clicked.connect(self._delete_selected)
-        solve_btn    = QPushButton("Solve")
+        solve_btn     = QPushButton("Solve")
         solve_btn.clicked.connect(self._solve)
 
         toolbar = QHBoxLayout()
         toolbar.addWidget(add_src_btn)
         toolbar.addWidget(add_jct_btn)
         toolbar.addWidget(add_pipe_btn)
+        toolbar.addWidget(add_fit_btn)
+        toolbar.addWidget(add_valve_btn)
+        toolbar.addWidget(add_cv_btn)
         toolbar.addWidget(del_btn)
         toolbar.addStretch()
         toolbar.addWidget(solve_btn)
@@ -260,6 +339,45 @@ class NetworkScreen(QWidget):
             "rough_str":  "0.00015", "rough_unit": "ft",
         }
 
+    @staticmethod
+    def _default_fitting_fields():
+        return {
+            "type":          "fitting",
+            "fitting_type":  "bend",
+            "Di_str":        "4.026",  "Di_unit":    "inch",
+            "angle_str":     "90",
+            "bend_dias_str": "1.5",
+            "Di_US_str":     "4.026",  "Di_US_unit": "inch",
+            "Di_DS_str":     "3.0",    "Di_DS_unit": "inch",
+        }
+
+    @staticmethod
+    def _default_valve_fields():
+        return {
+            "type":       "valve",
+            "valve_type": "globe",
+            "D1_str":     "4.026",  "D1_unit": "inch",
+            "D2_str":     "4.026",  "D2_unit": "inch",
+            "angle_str":  "0",
+            "D_str":      "4.026",  "D_unit":  "inch",
+            "style_str":  "0",
+        }
+
+    @staticmethod
+    def _default_check_valve_fields():
+        return {
+            "type":            "check_valve",
+            "cv_type":         "swing",
+            # swing / tilting_disk: single D
+            "D_str":           "4.026",  "D_unit":  "inch",
+            "angle_str":       "5",
+            "angled_str":      "1",      # 1 = angled body, 0 = straight
+            "style_str":       "0",
+            # lift / angle_stop / globe_stop: D1 + D2
+            "D1_str":          "4.026",  "D1_unit": "inch",
+            "D2_str":          "4.026",  "D2_unit": "inch",
+        }
+
     # ------------------------------------------------------------------
     # Side-panel builders
     # ------------------------------------------------------------------
@@ -278,10 +396,13 @@ class NetworkScreen(QWidget):
         via QStackedWidget when a node is selected.
         """
         self.editor_stack = QStackedWidget()
-        self._build_empty_editor()      # index 0
+        self._build_empty_editor()        # index 0
         self._build_source_sink_editor()  # index 1
         self._build_junction_editor()     # index 2
         self._build_pipe_editor()         # index 3
+        self._build_fitting_editor()       # index 4
+        self._build_valve_editor()         # index 5
+        self._build_check_valve_editor()   # index 6
 
         self.editor_box = QGroupBox("Selected node")
         v = QVBoxLayout(self.editor_box)
@@ -407,6 +528,338 @@ class NetworkScreen(QWidget):
         v.addStretch()
         self.editor_stack.addWidget(page)
 
+    def _build_fitting_editor(self):
+        self.fit_name = QLineEdit()
+        self.fit_type_combo = QComboBox()
+        self.fit_type_combo.addItems(["Bend", "Sudden Contraction/Expansion"])
+        self.fit_type_combo.currentIndexChanged.connect(self._on_fitting_type_changed)
+
+        # Bend sub-page
+        self.fit_bend_Di    = _LabeledField("4.026", U.DIAMETER, "inch")
+        self.fit_bend_angle = QLineEdit("90")
+        self.fit_bend_angle.setPlaceholderText("degrees")
+        self.fit_bend_dias  = QLineEdit("1.5")
+        self.fit_bend_dias.setPlaceholderText("R/D ratio")
+        bend_form = QFormLayout()
+        bend_form.addRow("Pipe ID:",     self.fit_bend_Di.widget())
+        bend_form.addRow("Angle (deg):", self.fit_bend_angle)
+        bend_form.addRow("Bend R/D:",    self.fit_bend_dias)
+        bend_hint = QLabel(
+            "R/D = bend centerline radius ÷ pipe ID "
+            "(e.g. 1.5 = standard long-radius elbow)."
+        )
+        bend_hint.setWordWrap(True)
+        bend_hint.setStyleSheet("color: #777; font-style: italic;")
+        bend_page = QWidget()
+        bv = QVBoxLayout(bend_page)
+        bv.setContentsMargins(0, 0, 0, 0)
+        bv.addLayout(bend_form)
+        bv.addWidget(bend_hint)
+
+        # Contraction/expansion sub-page
+        self.fit_ce_Di_US = _LabeledField("4.026", U.DIAMETER, "inch")
+        self.fit_ce_Di_DS = _LabeledField("3.0",   U.DIAMETER, "inch")
+        ce_form = QFormLayout()
+        ce_form.addRow("Upstream ID:",   self.fit_ce_Di_US.widget())
+        ce_form.addRow("Downstream ID:", self.fit_ce_Di_DS.widget())
+        ce_hint = QLabel(
+            "Sharp-edged (abrupt) transition.  "
+            "Contraction or expansion is inferred from the two diameters."
+        )
+        ce_hint.setWordWrap(True)
+        ce_hint.setStyleSheet("color: #777; font-style: italic;")
+        ce_page = QWidget()
+        cv = QVBoxLayout(ce_page)
+        cv.setContentsMargins(0, 0, 0, 0)
+        cv.addLayout(ce_form)
+        cv.addWidget(ce_hint)
+
+        self.fit_input_stack = QStackedWidget()
+        self.fit_input_stack.addWidget(bend_page)   # index 0
+        self.fit_input_stack.addWidget(ce_page)     # index 1
+
+        self.fit_apply = QPushButton("Apply")
+        self.fit_apply.clicked.connect(self._apply_fitting_edits)
+
+        top_form = QFormLayout()
+        top_form.addRow("Name:", self.fit_name)
+        top_form.addRow("Type:", self.fit_type_combo)
+
+        page = QWidget()
+        v = QVBoxLayout(page)
+        v.addLayout(top_form)
+        v.addWidget(self.fit_input_stack)
+        v.addWidget(self.fit_apply)
+        v.addStretch()
+        self.editor_stack.addWidget(page)
+
+    def _build_valve_editor(self):
+        self.valve_name = QLineEdit()
+        self.valve_type_combo = QComboBox()
+        self.valve_type_combo.addItems(["Globe", "Gate", "Butterfly", "Plug", "Ball"])
+        self.valve_type_combo.currentIndexChanged.connect(self._on_valve_type_changed)
+
+        # Globe sub-page (index 0)
+        self.valve_globe_D1 = _LabeledField("4.026", U.DIAMETER, "inch")
+        self.valve_globe_D2 = _LabeledField("4.026", U.DIAMETER, "inch")
+        globe_form = QFormLayout()
+        globe_form.addRow("Seat bore D1:", self.valve_globe_D1.widget())
+        globe_form.addRow("Pipe ID D2:",   self.valve_globe_D2.widget())
+        globe_hint = QLabel(
+            "D1 ≤ D2.  Set D1 = D2 for a full-bore globe valve "
+            "(K ≈ 340×fₐ, typically 6–12)."
+        )
+        globe_hint.setWordWrap(True)
+        globe_hint.setStyleSheet("color: #777; font-style: italic;")
+        globe_page = QWidget()
+        gv = QVBoxLayout(globe_page)
+        gv.setContentsMargins(0, 0, 0, 0)
+        gv.addLayout(globe_form)
+        gv.addWidget(globe_hint)
+
+        # Gate sub-page (index 1)
+        self.valve_gate_D1    = _LabeledField("4.026", U.DIAMETER, "inch")
+        self.valve_gate_D2    = _LabeledField("4.026", U.DIAMETER, "inch")
+        self.valve_gate_angle = QLineEdit("0")
+        self.valve_gate_angle.setPlaceholderText("degrees")
+        gate_form = QFormLayout()
+        gate_form.addRow("Seat bore D1:",        self.valve_gate_D1.widget())
+        gate_form.addRow("Pipe ID D2:",          self.valve_gate_D2.widget())
+        gate_form.addRow("Reducer angle (deg):", self.valve_gate_angle)
+        gate_hint = QLabel(
+            "D1 ≤ D2.  Angle is the cone half-angle of the port reducer. "
+            "Use 0 for a full-bore gate valve (K ≈ 8×fₐ, typically 0.1–0.2)."
+        )
+        gate_hint.setWordWrap(True)
+        gate_hint.setStyleSheet("color: #777; font-style: italic;")
+        gate_page = QWidget()
+        gtv = QVBoxLayout(gate_page)
+        gtv.setContentsMargins(0, 0, 0, 0)
+        gtv.addLayout(gate_form)
+        gtv.addWidget(gate_hint)
+
+        # Butterfly sub-page (index 2)
+        self.valve_butterfly_D     = _LabeledField("4.026", U.DIAMETER, "inch")
+        self.valve_butterfly_style = QComboBox()
+        self.valve_butterfly_style.addItems(
+            ["Centric (0)", "Double offset (1)", "Triple offset (2)"]
+        )
+        butterfly_form = QFormLayout()
+        butterfly_form.addRow("Pipe ID:", self.valve_butterfly_D.widget())
+        butterfly_form.addRow("Style:",   self.valve_butterfly_style)
+        butterfly_hint = QLabel(
+            "Single pipe diameter (no reducer).  "
+            "N factor by size: 45/74/218 (2“–8“), "
+            "35/52/96 (10“–14“), 25/43/55 (16“–24“)."
+        )
+        butterfly_hint.setWordWrap(True)
+        butterfly_hint.setStyleSheet("color: #777; font-style: italic;")
+        butterfly_page = QWidget()
+        bfv = QVBoxLayout(butterfly_page)
+        bfv.setContentsMargins(0, 0, 0, 0)
+        bfv.addLayout(butterfly_form)
+        bfv.addWidget(butterfly_hint)
+
+        # Plug sub-page (index 3)
+        self.valve_plug_D1    = _LabeledField("4.026", U.DIAMETER, "inch")
+        self.valve_plug_D2    = _LabeledField("4.026", U.DIAMETER, "inch")
+        self.valve_plug_angle = QLineEdit("0")
+        self.valve_plug_angle.setPlaceholderText("degrees")
+        self.valve_plug_style = QComboBox()
+        self.valve_plug_style.addItems(
+            ["Straight-through (0)", "3-way, flow straight (1)", "3-way, flow 90° (2)"]
+        )
+        plug_form = QFormLayout()
+        plug_form.addRow("Plug bore D1:",        self.valve_plug_D1.widget())
+        plug_form.addRow("Pipe ID D2:",          self.valve_plug_D2.widget())
+        plug_form.addRow("Reducer angle (deg):", self.valve_plug_angle)
+        plug_form.addRow("Style:",               self.valve_plug_style)
+        plug_hint = QLabel(
+            "D1 ≤ D2.  Use angle = 0 and D1 = D2 for a full-bore "
+            "straight-through plug valve (K ≈ 18×fₐ)."
+        )
+        plug_hint.setWordWrap(True)
+        plug_hint.setStyleSheet("color: #777; font-style: italic;")
+        plug_page = QWidget()
+        plv = QVBoxLayout(plug_page)
+        plv.setContentsMargins(0, 0, 0, 0)
+        plv.addLayout(plug_form)
+        plv.addWidget(plug_hint)
+
+        # Ball sub-page (index 4)
+        self.valve_ball_D1    = _LabeledField("4.026", U.DIAMETER, "inch")
+        self.valve_ball_D2    = _LabeledField("4.026", U.DIAMETER, "inch")
+        self.valve_ball_angle = QLineEdit("0")
+        self.valve_ball_angle.setPlaceholderText("degrees")
+        ball_form = QFormLayout()
+        ball_form.addRow("Seat bore D1:",        self.valve_ball_D1.widget())
+        ball_form.addRow("Pipe ID D2:",          self.valve_ball_D2.widget())
+        ball_form.addRow("Reducer angle (deg):", self.valve_ball_angle)
+        ball_hint = QLabel(
+            "D1 ≤ D2.  Use 0 for a full-bore ball valve "
+            "(K ≈ 3×fₐ, typically 0.05–0.10)."
+        )
+        ball_hint.setWordWrap(True)
+        ball_hint.setStyleSheet("color: #777; font-style: italic;")
+        ball_page = QWidget()
+        blv = QVBoxLayout(ball_page)
+        blv.setContentsMargins(0, 0, 0, 0)
+        blv.addLayout(ball_form)
+        blv.addWidget(ball_hint)
+
+        self.valve_input_stack = QStackedWidget()
+        self.valve_input_stack.addWidget(globe_page)      # index 0
+        self.valve_input_stack.addWidget(gate_page)       # index 1
+        self.valve_input_stack.addWidget(butterfly_page)  # index 2
+        self.valve_input_stack.addWidget(plug_page)       # index 3
+        self.valve_input_stack.addWidget(ball_page)       # index 4
+
+        self.valve_apply = QPushButton("Apply")
+        self.valve_apply.clicked.connect(self._apply_valve_edits)
+
+        top_form = QFormLayout()
+        top_form.addRow("Name:", self.valve_name)
+        top_form.addRow("Type:", self.valve_type_combo)
+
+        page = QWidget()
+        v = QVBoxLayout(page)
+        v.addLayout(top_form)
+        v.addWidget(self.valve_input_stack)
+        v.addWidget(self.valve_apply)
+        v.addStretch()
+        self.editor_stack.addWidget(page)
+
+    def _build_check_valve_editor(self):
+        self.cv_name = QLineEdit()
+        self.cv_type_combo = QComboBox()
+        self.cv_type_combo.addItems([
+            "Swing", "Lift", "Tilting disk", "Angle stop", "Globe stop",
+        ])
+        self.cv_type_combo.currentIndexChanged.connect(self._on_cv_type_changed)
+
+        # Swing sub-page (index 0) -- single D + angled
+        self.cv_swing_D      = _LabeledField("4.026", U.DIAMETER, "inch")
+        self.cv_swing_angled = QComboBox()
+        self.cv_swing_angled.addItems(["Angled body", "Straight body"])
+        swing_form = QFormLayout()
+        swing_form.addRow("Pipe ID:", self.cv_swing_D.widget())
+        swing_form.addRow("Body:",    self.cv_swing_angled)
+        swing_hint = QLabel(
+            "Crane K = 100×fₐ (angled) or 600×fₐ (straight).  "
+            "Typical angled K ≈ 2–3."
+        )
+        swing_hint.setWordWrap(True)
+        swing_hint.setStyleSheet("color: #777; font-style: italic;")
+        swing_page = QWidget()
+        sv = QVBoxLayout(swing_page)
+        sv.setContentsMargins(0, 0, 0, 0)
+        sv.addLayout(swing_form)
+        sv.addWidget(swing_hint)
+
+        # Lift sub-page (index 1) -- D1 + D2 + angled
+        self.cv_lift_D1      = _LabeledField("4.026", U.DIAMETER, "inch")
+        self.cv_lift_D2      = _LabeledField("4.026", U.DIAMETER, "inch")
+        self.cv_lift_angled  = QComboBox()
+        self.cv_lift_angled.addItems(["Angled body", "Straight body"])
+        lift_form = QFormLayout()
+        lift_form.addRow("Seat bore D1:", self.cv_lift_D1.widget())
+        lift_form.addRow("Pipe ID D2:",   self.cv_lift_D2.widget())
+        lift_form.addRow("Body:",         self.cv_lift_angled)
+        lift_hint = QLabel(
+            "D1 ≤ D2.  Crane K = 55×fₐ (angled) or 600×fₐ (straight) "
+            "at D1 = D2; scaled by (D2/D1)^4 for reducers."
+        )
+        lift_hint.setWordWrap(True)
+        lift_hint.setStyleSheet("color: #777; font-style: italic;")
+        lift_page = QWidget()
+        lv = QVBoxLayout(lift_page)
+        lv.setContentsMargins(0, 0, 0, 0)
+        lv.addLayout(lift_form)
+        lv.addWidget(lift_hint)
+
+        # Tilting disk sub-page (index 2) -- single D + angle
+        self.cv_tilt_D     = _LabeledField("4.026", U.DIAMETER, "inch")
+        self.cv_tilt_angle = QLineEdit("5")
+        self.cv_tilt_angle.setPlaceholderText("degrees")
+        tilt_form = QFormLayout()
+        tilt_form.addRow("Pipe ID:",       self.cv_tilt_D.widget())
+        tilt_form.addRow("Disk angle (deg):", self.cv_tilt_angle)
+        tilt_hint = QLabel(
+            "Disk angle from centerline (5°, 10°, or 15°).  "
+            "Crane K ≈ 0.5–1.5 depending on size and angle."
+        )
+        tilt_hint.setWordWrap(True)
+        tilt_hint.setStyleSheet("color: #777; font-style: italic;")
+        tilt_page = QWidget()
+        tv = QVBoxLayout(tilt_page)
+        tv.setContentsMargins(0, 0, 0, 0)
+        tv.addLayout(tilt_form)
+        tv.addWidget(tilt_hint)
+
+        # Angle stop sub-page (index 3) -- D1 + D2 + style
+        self.cv_angstop_D1    = _LabeledField("4.026", U.DIAMETER, "inch")
+        self.cv_angstop_D2    = _LabeledField("4.026", U.DIAMETER, "inch")
+        self.cv_angstop_style = QComboBox()
+        self.cv_angstop_style.addItems(["Style 0 (piston)", "Style 1 (no stem guide)"])
+        angstop_form = QFormLayout()
+        angstop_form.addRow("Seat bore D1:", self.cv_angstop_D1.widget())
+        angstop_form.addRow("Pipe ID D2:",   self.cv_angstop_D2.widget())
+        angstop_form.addRow("Style:",        self.cv_angstop_style)
+        angstop_hint = QLabel(
+            "D1 ≤ D2.  Crane K = 55×fₐ (style 0) or 150×fₐ (style 1) "
+            "at D1 = D2; scaled by (D2/D1)^4 for reducers."
+        )
+        angstop_hint.setWordWrap(True)
+        angstop_hint.setStyleSheet("color: #777; font-style: italic;")
+        angstop_page = QWidget()
+        av = QVBoxLayout(angstop_page)
+        av.setContentsMargins(0, 0, 0, 0)
+        av.addLayout(angstop_form)
+        av.addWidget(angstop_hint)
+
+        # Globe stop sub-page (index 4) -- D1 + D2 + style
+        self.cv_globestop_D1    = _LabeledField("4.026", U.DIAMETER, "inch")
+        self.cv_globestop_D2    = _LabeledField("4.026", U.DIAMETER, "inch")
+        self.cv_globestop_style = QComboBox()
+        self.cv_globestop_style.addItems(["Style 0 (piston)", "Style 1 (no stem guide)"])
+        globestop_form = QFormLayout()
+        globestop_form.addRow("Seat bore D1:", self.cv_globestop_D1.widget())
+        globestop_form.addRow("Pipe ID D2:",   self.cv_globestop_D2.widget())
+        globestop_form.addRow("Style:",        self.cv_globestop_style)
+        globestop_hint = QLabel(
+            "D1 ≤ D2.  Crane K = 340×fₐ (style 0) or 600×fₐ (style 1) "
+            "at D1 = D2; scaled by (D2/D1)^4 for reducers."
+        )
+        globestop_hint.setWordWrap(True)
+        globestop_hint.setStyleSheet("color: #777; font-style: italic;")
+        globestop_page = QWidget()
+        gv = QVBoxLayout(globestop_page)
+        gv.setContentsMargins(0, 0, 0, 0)
+        gv.addLayout(globestop_form)
+        gv.addWidget(globestop_hint)
+
+        self.cv_input_stack = QStackedWidget()
+        self.cv_input_stack.addWidget(swing_page)     # index 0
+        self.cv_input_stack.addWidget(lift_page)      # index 1
+        self.cv_input_stack.addWidget(tilt_page)      # index 2
+        self.cv_input_stack.addWidget(angstop_page)   # index 3
+        self.cv_input_stack.addWidget(globestop_page) # index 4
+
+        self.cv_apply = QPushButton("Apply")
+        self.cv_apply.clicked.connect(self._apply_check_valve_edits)
+
+        top_form = QFormLayout()
+        top_form.addRow("Name:", self.cv_name)
+        top_form.addRow("Type:", self.cv_type_combo)
+
+        page = QWidget()
+        v = QVBoxLayout(page)
+        v.addLayout(top_form)
+        v.addWidget(self.cv_input_stack)
+        v.addWidget(self.cv_apply)
+        v.addStretch()
+        self.editor_stack.addWidget(page)
+
     def _build_display_units_box(self):
         """Pressure + flow unit combos that re-render the last solve
         without re-running it (mirrors the point-to-point Results screen).
@@ -454,6 +907,18 @@ class NetworkScreen(QWidget):
     def _add_pipe_segment(self):
         n = self.graph.create_node(PIPE_SEGMENT_TYPE_ID)
         self.node_specs[n.id] = self._default_pipe_fields()
+
+    def _add_fitting(self):
+        n = self.graph.create_node(FITTING_NODE_TYPE_ID)
+        self.node_specs[n.id] = self._default_fitting_fields()
+
+    def _add_valve(self):
+        n = self.graph.create_node(VALVE_NODE_TYPE_ID)
+        self.node_specs[n.id] = self._default_valve_fields()
+
+    def _add_check_valve(self):
+        n = self.graph.create_node(CHECKVALVE_NODE_TYPE_ID)
+        self.node_specs[n.id] = self._default_check_valve_fields()
 
     def _delete_selected(self):
         nodes = self.graph.selected_nodes()
@@ -510,6 +975,82 @@ class NetworkScreen(QWidget):
             self.editor_box.setTitle(f"Selected node: {n.name()}  [Pipe Segment]")
             self.p_name.setText(n.name())
             self._sync_pipe_editor_to_spec(spec)
+        elif t == "fitting":
+            self.editor_stack.setCurrentIndex(4)
+            self.editor_box.setTitle(f"Selected node: {n.name()}  [Fitting]")
+            self.fit_name.setText(n.name())
+            ft  = spec.get("fitting_type", "bend")
+            idx = 0 if ft == "bend" else 1
+            self.fit_type_combo.setCurrentIndex(idx)
+            self.fit_input_stack.setCurrentIndex(idx)
+            self.fit_bend_Di.edit.setText(spec.get("Di_str", "4.026"))
+            self.fit_bend_Di.combo.setCurrentText(spec.get("Di_unit", "inch"))
+            self.fit_bend_angle.setText(spec.get("angle_str", "90"))
+            self.fit_bend_dias.setText(spec.get("bend_dias_str", "1.5"))
+            self.fit_ce_Di_US.edit.setText(spec.get("Di_US_str", "4.026"))
+            self.fit_ce_Di_US.combo.setCurrentText(spec.get("Di_US_unit", "inch"))
+            self.fit_ce_Di_DS.edit.setText(spec.get("Di_DS_str", "3.0"))
+            self.fit_ce_Di_DS.combo.setCurrentText(spec.get("Di_DS_unit", "inch"))
+        elif t == "valve":
+            self.editor_stack.setCurrentIndex(5)
+            self.editor_box.setTitle(f"Selected node: {n.name()}  [Valve]")
+            self.valve_name.setText(n.name())
+            vt   = spec.get("valve_type", "globe")
+            _VT  = ["globe", "gate", "butterfly", "plug", "ball"]
+            idx  = _VT.index(vt) if vt in _VT else 0
+            self.valve_type_combo.setCurrentIndex(idx)
+            self.valve_input_stack.setCurrentIndex(idx)
+            # Populate D1/D2 on all pages that share those keys
+            for w1, w2 in [
+                (self.valve_globe_D1, self.valve_globe_D2),
+                (self.valve_gate_D1,  self.valve_gate_D2),
+                (self.valve_plug_D1,  self.valve_plug_D2),
+                (self.valve_ball_D1,  self.valve_ball_D2),
+            ]:
+                w1.edit.setText(spec.get("D1_str", "4.026"))
+                w1.combo.setCurrentText(spec.get("D1_unit", "inch"))
+                w2.edit.setText(spec.get("D2_str", "4.026"))
+                w2.combo.setCurrentText(spec.get("D2_unit", "inch"))
+            angle = spec.get("angle_str", "0")
+            self.valve_gate_angle.setText(angle)
+            self.valve_plug_angle.setText(angle)
+            self.valve_ball_angle.setText(angle)
+            self.valve_butterfly_D.edit.setText(spec.get("D_str", "4.026"))
+            self.valve_butterfly_D.combo.setCurrentText(spec.get("D_unit", "inch"))
+            style_idx = int(spec.get("style_str", "0") or "0")
+            self.valve_butterfly_style.setCurrentIndex(style_idx)
+            self.valve_plug_style.setCurrentIndex(style_idx)
+        elif t == "check_valve":
+            self.editor_stack.setCurrentIndex(6)
+            self.editor_box.setTitle(f"Selected node: {n.name()}  [Check Valve]")
+            self.cv_name.setText(n.name())
+            _CVT = ["swing", "lift", "tilting_disk", "angle_stop", "globe_stop"]
+            cvt  = spec.get("cv_type", "swing")
+            idx  = _CVT.index(cvt) if cvt in _CVT else 0
+            self.cv_type_combo.setCurrentIndex(idx)
+            self.cv_input_stack.setCurrentIndex(idx)
+            # Single-D fields
+            self.cv_swing_D.edit.setText(spec.get("D_str", "4.026"))
+            self.cv_swing_D.combo.setCurrentText(spec.get("D_unit", "inch"))
+            self.cv_tilt_D.edit.setText(spec.get("D_str", "4.026"))
+            self.cv_tilt_D.combo.setCurrentText(spec.get("D_unit", "inch"))
+            self.cv_tilt_angle.setText(spec.get("angle_str", "5"))
+            angled_idx = 0 if spec.get("angled_str", "1") == "1" else 1
+            self.cv_swing_angled.setCurrentIndex(angled_idx)
+            self.cv_lift_angled.setCurrentIndex(angled_idx)
+            # D1/D2 fields
+            for w1, w2 in [
+                (self.cv_lift_D1,      self.cv_lift_D2),
+                (self.cv_angstop_D1,   self.cv_angstop_D2),
+                (self.cv_globestop_D1, self.cv_globestop_D2),
+            ]:
+                w1.edit.setText(spec.get("D1_str", "4.026"))
+                w1.combo.setCurrentText(spec.get("D1_unit", "inch"))
+                w2.edit.setText(spec.get("D2_str", "4.026"))
+                w2.combo.setCurrentText(spec.get("D2_unit", "inch"))
+            style_idx = int(spec.get("style_str", "0") or "0")
+            self.cv_angstop_style.setCurrentIndex(style_idx)
+            self.cv_globestop_style.setCurrentIndex(style_idx)
         else:
             self.editor_stack.setCurrentIndex(0)
 
@@ -634,6 +1175,167 @@ class NetworkScreen(QWidget):
                 spec[f"{name}_unit"] = field.combo.currentText()
         self.editor_box.setTitle(f"Selected node: {n.name()}  [Pipe Segment]")
 
+    def _on_fitting_type_changed(self, index):
+        self.fit_input_stack.setCurrentIndex(index)
+
+    def _on_valve_type_changed(self, index):
+        self.valve_input_stack.setCurrentIndex(index)
+
+    def _on_cv_type_changed(self, index):
+        self.cv_input_stack.setCurrentIndex(index)
+
+    def _apply_fitting_edits(self):
+        n = self._cur_node
+        if n is None or self.node_specs.get(n.id, {}).get("type") != "fitting":
+            return
+        new_name = self.fit_name.text().strip()
+        if new_name and new_name != n.name():
+            n.set_name(new_name)
+        ft = "bend" if self.fit_type_combo.currentIndex() == 0 else "contraction_expansion"
+        self.node_specs[n.id] = {
+            "type":          "fitting",
+            "fitting_type":  ft,
+            "Di_str":        self.fit_bend_Di.edit.text().strip(),
+            "Di_unit":       self.fit_bend_Di.combo.currentText(),
+            "angle_str":     self.fit_bend_angle.text().strip(),
+            "bend_dias_str": self.fit_bend_dias.text().strip(),
+            "Di_US_str":     self.fit_ce_Di_US.edit.text().strip(),
+            "Di_US_unit":    self.fit_ce_Di_US.combo.currentText(),
+            "Di_DS_str":     self.fit_ce_Di_DS.edit.text().strip(),
+            "Di_DS_unit":    self.fit_ce_Di_DS.combo.currentText(),
+        }
+        self.editor_box.setTitle(f"Selected node: {n.name()}  [Fitting]")
+
+    def _apply_valve_edits(self):
+        n = self._cur_node
+        if n is None or self.node_specs.get(n.id, {}).get("type") != "valve":
+            return
+        new_name = self.valve_name.text().strip()
+        if new_name and new_name != n.name():
+            n.set_name(new_name)
+        _VT = ["globe", "gate", "butterfly", "plug", "ball"]
+        vt  = _VT[self.valve_type_combo.currentIndex()]
+        if vt == "globe":
+            spec = {
+                "type": "valve", "valve_type": vt,
+                "D1_str":  self.valve_globe_D1.edit.text().strip(),
+                "D1_unit": self.valve_globe_D1.combo.currentText(),
+                "D2_str":  self.valve_globe_D2.edit.text().strip(),
+                "D2_unit": self.valve_globe_D2.combo.currentText(),
+                "angle_str": "", "D_str": "", "D_unit": "inch", "style_str": "",
+            }
+        elif vt == "gate":
+            spec = {
+                "type": "valve", "valve_type": vt,
+                "D1_str":  self.valve_gate_D1.edit.text().strip(),
+                "D1_unit": self.valve_gate_D1.combo.currentText(),
+                "D2_str":  self.valve_gate_D2.edit.text().strip(),
+                "D2_unit": self.valve_gate_D2.combo.currentText(),
+                "angle_str": self.valve_gate_angle.text().strip(),
+                "D_str": "", "D_unit": "inch", "style_str": "",
+            }
+        elif vt == "butterfly":
+            spec = {
+                "type": "valve", "valve_type": vt,
+                "D_str":  self.valve_butterfly_D.edit.text().strip(),
+                "D_unit": self.valve_butterfly_D.combo.currentText(),
+                "style_str": str(self.valve_butterfly_style.currentIndex()),
+                "D1_str": "", "D1_unit": "inch",
+                "D2_str": "", "D2_unit": "inch", "angle_str": "",
+            }
+        elif vt == "plug":
+            spec = {
+                "type": "valve", "valve_type": vt,
+                "D1_str":  self.valve_plug_D1.edit.text().strip(),
+                "D1_unit": self.valve_plug_D1.combo.currentText(),
+                "D2_str":  self.valve_plug_D2.edit.text().strip(),
+                "D2_unit": self.valve_plug_D2.combo.currentText(),
+                "angle_str": self.valve_plug_angle.text().strip(),
+                "style_str": str(self.valve_plug_style.currentIndex()),
+                "D_str": "", "D_unit": "inch",
+            }
+        else:  # ball
+            spec = {
+                "type": "valve", "valve_type": vt,
+                "D1_str":  self.valve_ball_D1.edit.text().strip(),
+                "D1_unit": self.valve_ball_D1.combo.currentText(),
+                "D2_str":  self.valve_ball_D2.edit.text().strip(),
+                "D2_unit": self.valve_ball_D2.combo.currentText(),
+                "angle_str": self.valve_ball_angle.text().strip(),
+                "D_str": "", "D_unit": "inch", "style_str": "",
+            }
+        self.node_specs[n.id] = spec
+        self.editor_box.setTitle(f"Selected node: {n.name()}  [Valve]")
+
+    def _apply_check_valve_edits(self):
+        n = self._cur_node
+        if n is None or self.node_specs.get(n.id, {}).get("type") != "check_valve":
+            return
+        new_name = self.cv_name.text().strip()
+        if new_name and new_name != n.name():
+            n.set_name(new_name)
+        _CVT = ["swing", "lift", "tilting_disk", "angle_stop", "globe_stop"]
+        cvt  = _CVT[self.cv_type_combo.currentIndex()]
+        angled_str = "0" if (
+            self.cv_swing_angled.currentIndex() == 1
+            or self.cv_lift_angled.currentIndex() == 1
+        ) else "1"
+        if cvt == "swing":
+            spec = {
+                "type": "check_valve", "cv_type": cvt,
+                "D_str":  self.cv_swing_D.edit.text().strip(),
+                "D_unit": self.cv_swing_D.combo.currentText(),
+                "angled_str": angled_str,
+                "angle_str": "", "style_str": "",
+                "D1_str": "", "D1_unit": "inch",
+                "D2_str": "", "D2_unit": "inch",
+            }
+        elif cvt == "lift":
+            spec = {
+                "type": "check_valve", "cv_type": cvt,
+                "D1_str":  self.cv_lift_D1.edit.text().strip(),
+                "D1_unit": self.cv_lift_D1.combo.currentText(),
+                "D2_str":  self.cv_lift_D2.edit.text().strip(),
+                "D2_unit": self.cv_lift_D2.combo.currentText(),
+                "angled_str": angled_str,
+                "D_str": "", "D_unit": "inch",
+                "angle_str": "", "style_str": "",
+            }
+        elif cvt == "tilting_disk":
+            spec = {
+                "type": "check_valve", "cv_type": cvt,
+                "D_str":    self.cv_tilt_D.edit.text().strip(),
+                "D_unit":   self.cv_tilt_D.combo.currentText(),
+                "angle_str": self.cv_tilt_angle.text().strip(),
+                "angled_str": "", "style_str": "",
+                "D1_str": "", "D1_unit": "inch",
+                "D2_str": "", "D2_unit": "inch",
+            }
+        elif cvt == "angle_stop":
+            spec = {
+                "type": "check_valve", "cv_type": cvt,
+                "D1_str":  self.cv_angstop_D1.edit.text().strip(),
+                "D1_unit": self.cv_angstop_D1.combo.currentText(),
+                "D2_str":  self.cv_angstop_D2.edit.text().strip(),
+                "D2_unit": self.cv_angstop_D2.combo.currentText(),
+                "style_str": str(self.cv_angstop_style.currentIndex()),
+                "D_str": "", "D_unit": "inch",
+                "angle_str": "", "angled_str": "",
+            }
+        else:  # globe_stop
+            spec = {
+                "type": "check_valve", "cv_type": cvt,
+                "D1_str":  self.cv_globestop_D1.edit.text().strip(),
+                "D1_unit": self.cv_globestop_D1.combo.currentText(),
+                "D2_str":  self.cv_globestop_D2.edit.text().strip(),
+                "D2_unit": self.cv_globestop_D2.combo.currentText(),
+                "style_str": str(self.cv_globestop_style.currentIndex()),
+                "D_str": "", "D_unit": "inch",
+                "angle_str": "", "angled_str": "",
+            }
+        self.node_specs[n.id] = spec
+        self.editor_box.setTitle(f"Selected node: {n.name()}  [Check Valve]")
+
     def _update_PQ_exclusivity(self):
         """Disable whichever of P / Q_ext on the Source/Sink editor the
         user isn't using.  Triggered by textChanged on either field and
@@ -735,6 +1437,12 @@ class NetworkScreen(QWidget):
                 self._apply_junction_edits()
             elif t == "pipe":
                 self._apply_pipe_edits()
+            elif t == "fitting":
+                self._apply_fitting_edits()
+            elif t == "valve":
+                self._apply_valve_edits()
+            elif t == "check_valve":
+                self._apply_check_valve_edits()
 
         # Partition canvas nodes by type.
         boundary_nodes = []
@@ -819,10 +1527,9 @@ class NetworkScreen(QWidget):
         return kwargs
 
     def _walk_chain(self, target_node, visited_pipes, source_name):
-        """Walk forward through pipe-type nodes starting at target_node,
-        collecting their Line_Segment components, until hitting a
-        boundary node.  Returns (component_list, end_boundary_node) or
-        (component_list, None) if no boundary node terminates the chain.
+        """Walk forward through inline nodes (pipe/fitting/valve) starting at
+        target_node, collecting components, until hitting a boundary node.
+        Returns (component_list, end_boundary_node) or (component_list, None).
         """
         components = []
         cur = target_node
@@ -830,24 +1537,30 @@ class NetworkScreen(QWidget):
             t = self.node_specs.get(cur.id, {}).get("type")
             if t in ("source_sink", "junction"):
                 return components, cur
-            if t != "pipe":
+            if t not in ("pipe", "fitting", "valve", "check_valve"):
                 return components, None
             if cur.id in visited_pipes:
                 raise ValueError(
-                    f"Pipe '{cur.name()}' is part of more than one chain "
+                    f"Node '{cur.name()}' is part of more than one chain "
                     f"(should be a single in/out node)."
                 )
             visited_pipes.add(cur.id)
-            seg = self._build_line_segment_for_pipe(cur)
-            self._pipe_components[cur.id] = seg
-            components.append(seg)
-            # Pipe nodes are single-out: at most one outgoing connection.
+            if t == "pipe":
+                comp = self._build_line_segment_for_pipe(cur)
+            elif t == "fitting":
+                comp = self._build_fitting_component(cur)
+            elif t == "valve":
+                comp = self._build_valve_component(cur)
+            else:
+                comp = self._build_check_valve_component(cur)
+            self._pipe_components[cur.id] = comp
+            components.append(comp)
             outs = []
             for port, targets in cur.connected_output_nodes().items():
                 outs.extend(targets)
             if not outs:
                 raise ValueError(
-                    f"Pipe '{cur.name()}' has no outgoing connection."
+                    f"Node '{cur.name()}' has no outgoing connection."
                 )
             cur = outs[0]
 
@@ -886,6 +1599,142 @@ class NetworkScreen(QWidget):
             length           = _opt("L"),
             elevation_change = _opt("dz"),
         )
+
+    def _build_fitting_component(self, node):
+        spec = self.node_specs[node.id]
+        ft = spec.get("fitting_type", "bend")
+        if ft == "bend":
+            Di_str = spec.get("Di_str", "").strip()
+            if not Di_str:
+                raise ValueError(f"Fitting '{node.name()}': pipe ID is required.")
+            angle_str = spec.get("angle_str", "").strip()
+            if not angle_str:
+                raise ValueError(f"Fitting '{node.name()}': bend angle is required.")
+            bend_dias_str = spec.get("bend_dias_str", "").strip()
+            if not bend_dias_str:
+                raise ValueError(f"Fitting '{node.name()}': bend R/D ratio is required.")
+            Di_q = ureg.Quantity(float(Di_str), U.to_pint(spec.get("Di_unit", "inch")))
+            return Bend(
+                Di=Di_q,
+                ang_deg=float(angle_str),
+                bend_dias=float(bend_dias_str),
+                name=node.name(),
+            )
+        else:
+            Di_US_str = spec.get("Di_US_str", "").strip()
+            Di_DS_str = spec.get("Di_DS_str", "").strip()
+            if not Di_US_str or not Di_DS_str:
+                raise ValueError(
+                    f"Fitting '{node.name()}': upstream and downstream IDs are required."
+                )
+            Di_US_q = ureg.Quantity(float(Di_US_str), U.to_pint(spec.get("Di_US_unit", "inch")))
+            Di_DS_q = ureg.Quantity(float(Di_DS_str), U.to_pint(spec.get("Di_DS_unit", "inch")))
+            return Contraction_Expansion(
+                Di_US=Di_US_q,
+                Di_DS=Di_DS_q,
+                name=node.name(),
+            )
+
+    def _build_valve_component(self, node):
+        spec = self.node_specs[node.id]
+        vt   = spec.get("valve_type", "globe")
+
+        def _qty(str_key, unit_key):
+            s = spec.get(str_key, "").strip()
+            if not s:
+                raise ValueError(
+                    f"Valve '{node.name()}': {str_key[:-4]} is required."
+                )
+            return ureg.Quantity(float(s), U.to_pint(spec.get(unit_key, "inch")))
+
+        if vt == "butterfly":
+            D_q   = _qty("D_str", "D_unit")
+            style = int(spec.get("style_str", "0") or "0")
+            K     = fluids.fittings.K_butterfly_valve_Crane(
+                D=D_q.to("m").magnitude, style=style,
+            )
+            return Valve(Di=D_q, K=K, name=node.name())
+
+        D1_q      = _qty("D1_str", "D1_unit")
+        D2_q      = _qty("D2_str", "D2_unit")
+        D1_si     = D1_q.to("m").magnitude
+        D2_si     = D2_q.to("m").magnitude
+        angle     = float(spec.get("angle_str", "0").strip() or "0")
+
+        if vt == "globe":
+            K = fluids.fittings.K_globe_valve_Crane(D1=D1_si, D2=D2_si)
+        elif vt == "gate":
+            K = fluids.fittings.K_gate_valve_Crane(D1=D1_si, D2=D2_si, angle=angle)
+        elif vt == "plug":
+            style = int(spec.get("style_str", "0") or "0")
+            K = fluids.fittings.K_plug_valve_Crane(
+                D1=D1_si, D2=D2_si, angle=angle, style=style,
+            )
+        else:  # ball
+            K = fluids.fittings.K_ball_valve_Crane(D1=D1_si, D2=D2_si, angle=angle)
+
+        return Valve(Di=D2_q, K=K, name=node.name())
+
+    def _build_check_valve_component(self, node):
+        spec = self.node_specs[node.id]
+        cvt  = spec.get("cv_type", "swing")
+
+        def _qty(str_key, unit_key):
+            s = spec.get(str_key, "").strip()
+            if not s:
+                raise ValueError(
+                    f"Check valve '{node.name()}': {str_key[:-4]} is required."
+                )
+            return ureg.Quantity(float(s), U.to_pint(spec.get(unit_key, "inch")))
+
+        if cvt == "swing":
+            D_q    = _qty("D_str", "D_unit")
+            angled = spec.get("angled_str", "1") != "0"
+            K      = fluids.fittings.K_swing_check_valve_Crane(
+                D=D_q.to("m").magnitude, angled=angled,
+            )
+            return CheckValve(Di=D_q, K=K, name=node.name())
+
+        if cvt == "lift":
+            D1_q   = _qty("D1_str", "D1_unit")
+            D2_q   = _qty("D2_str", "D2_unit")
+            angled = spec.get("angled_str", "1") != "0"
+            K      = fluids.fittings.K_lift_check_valve_Crane(
+                D1=D1_q.to("m").magnitude,
+                D2=D2_q.to("m").magnitude,
+                angled=angled,
+            )
+            return CheckValve(Di=D2_q, K=K, name=node.name())
+
+        if cvt == "tilting_disk":
+            D_q   = _qty("D_str", "D_unit")
+            angle = float(spec.get("angle_str", "5").strip() or "5")
+            K     = fluids.fittings.K_tilting_disk_check_valve_Crane(
+                D=D_q.to("m").magnitude, angle=angle,
+            )
+            return CheckValve(Di=D_q, K=K, name=node.name())
+
+        if cvt == "angle_stop":
+            D1_q  = _qty("D1_str", "D1_unit")
+            D2_q  = _qty("D2_str", "D2_unit")
+            style = int(spec.get("style_str", "0") or "0")
+            K     = fluids.fittings.K_angle_stop_check_valve_Crane(
+                D1=D1_q.to("m").magnitude,
+                D2=D2_q.to("m").magnitude,
+                style=style,
+            )
+            return CheckValve(Di=D2_q, K=K, name=node.name())
+
+        # globe_stop
+        D1_q  = _qty("D1_str", "D1_unit")
+        D2_q  = _qty("D2_str", "D2_unit")
+        style = int(spec.get("style_str", "0") or "0")
+        K     = fluids.fittings.K_globe_stop_check_valve_Crane(
+            D1=D1_q.to("m").magnitude,
+            D2=D2_q.to("m").magnitude,
+            style=style,
+        )
+        return CheckValve(Di=D2_q, K=K, name=node.name())
 
     @staticmethod
     def _unique_edge_name(net, from_name, to_name):
@@ -941,7 +1790,7 @@ class NetworkScreen(QWidget):
                 P_Pa = P_dict.get(node.name())
                 self._set_widget(node, "P_result",
                                  self._format_pressure(P_Pa, P_unit))
-            elif t == "pipe":
+            elif t in ("pipe", "fitting", "valve", "check_valve"):
                 comp = self._pipe_components.get(node.id)
                 if comp is None:
                     self._set_widget(node, "dP_result", "")

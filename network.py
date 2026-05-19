@@ -86,7 +86,8 @@ _G = 9.8066   # m/s^2
 # Below this absolute flow rate (m^3/s), friction is linearized through zero
 # to avoid the friction_factor(Re=0) singularity and to keep the residual
 # function smooth for Newton's method.
-_Q_LIN_EPS = 1e-9
+_Q_LIN_EPS  = 1e-9
+_SEALING_K  = 1e9   # K-factor for a check valve in its sealed (reverse) state
 
 
 # ---------------------------------------------------------------------------
@@ -153,6 +154,9 @@ def _reversed_component(component):
         -- `.Di_US_si` and `.Di_DS_si` attributes => Contraction_Expansion-like.
            The two diameters are swapped, so a contraction becomes an
            expansion and vice versa.
+        -- `.check_valve` attribute is True => check valve.  A shallow copy
+           is returned with K replaced by _SEALING_K so reverse flow sees
+           an effectively infinite resistance.
         -- otherwise the component is taken to be symmetric (Bend, Valve)
            and returned unchanged.
 
@@ -171,6 +175,11 @@ def _reversed_component(component):
     if hasattr(component, "Di_US_si") and hasattr(component, "Di_DS_si"):
         rev = copy.copy(component)
         rev.Di_US_si, rev.Di_DS_si = component.Di_DS_si, component.Di_US_si
+        return rev
+
+    if getattr(component, "check_valve", False):
+        rev = copy.copy(component)
+        rev.K = _SEALING_K
         return rev
 
     return component   # symmetric -- Bend, Valve, anything else
@@ -206,7 +215,7 @@ def _component_signed_dP(component, fluid, Q_si, reversed_cache):
     aQ = abs(Q_si)
 
     if aQ <= _Q_LIN_EPS:
-        # Elevation contribution is symmetric; friction goes to zero.
+        # Elevation is direction-independent in the forward convention.
         if hasattr(component, "net_elevation_change_m"):
             elev_part = -fluid.density_si * _G * component.net_elevation_change_m
         else:
@@ -214,12 +223,29 @@ def _component_signed_dP(component, fluid, Q_si, reversed_cache):
         if aQ == 0.0:
             return elev_part
         Q_probe = _Q_LIN_EPS
-        c_dP_probe = component.dP(
-            fluid, flow_rate=ureg.Quantity(Q_probe, "m^3/s")
-        )
-        friction_probe = c_dP_probe - elev_part
-        friction_signed = friction_probe * (Q_si / Q_probe)
-        return friction_signed + elev_part
+        if Q_si > 0.0:
+            # Forward probe -- component evaluated directly.
+            c_dP_probe = component.dP(fluid, flow_rate=ureg.Quantity(Q_probe, "m^3/s"))
+            friction_probe = c_dP_probe - elev_part
+            return friction_probe * (aQ / Q_probe) + elev_part
+        else:
+            # Reverse probe -- use the reversed shadow so that asymmetric
+            # components (check valves) carry their reverse K even inside the
+            # linearization region.  This removes the derivative discontinuity
+            # at Q = -_Q_LIN_EPS that would otherwise confuse fsolve.
+            #
+            # For a reversed Line_Segment, net_elevation_change_m flips sign,
+            # so rev_elev_part = -elev_part.  Therefore:
+            #   friction_probe_rev = rev.dP(Q_probe) - rev_elev_part
+            #                      = rev.dP(Q_probe) + elev_part
+            key = id(component)
+            rev = reversed_cache.get(key)
+            if rev is None:
+                rev = _reversed_component(component)
+                reversed_cache[key] = rev
+            c_dP_probe = rev.dP(fluid, flow_rate=ureg.Quantity(Q_probe, "m^3/s"))
+            friction_probe = c_dP_probe + elev_part  # = rev.dP - rev_elev_part
+            return -friction_probe * (aQ / Q_probe) + elev_part
 
     if Q_si > 0.0:
         return component.dP(fluid, flow_rate=ureg.Quantity(aQ, "m^3/s"))

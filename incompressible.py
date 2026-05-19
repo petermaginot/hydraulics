@@ -60,6 +60,7 @@ from component_classes import (
     Base_Bend,
     Base_Contraction_Expansion,
     Base_Valve,
+    Base_CheckValve,
     _to_si,
     _resolve_id,
     _flow_props_from_id,
@@ -442,6 +443,46 @@ class Valve(Base_Valve):
         Q = _resolve_flow_rate(flow_rate, rho)
         v = Q / A
 
+        return -self.K * 0.5 * rho * v ** 2
+
+
+# ---------------------------------------------------------------------------
+# CheckValve -- incompressible child class
+# ---------------------------------------------------------------------------
+
+class CheckValve(Base_CheckValve):
+    """Check valve with incompressible pressure-drop calculation.
+
+    Forward flow uses the K-factor stored on the instance (computed from a
+    Crane check-valve correlation and passed at construction).  Reverse flow
+    is handled by network._reversed_component, which returns a shadow copy
+    with K = _SEALING_K (≈ 1e9), making the valve act as a near-perfect seal.
+
+    Constructor arguments are identical to Base_CheckValve:
+        Di : pint Quantity or float (m if float).  Pipe inner diameter.
+        K  : float.  Forward-flow K-factor (from a Crane correlation).
+    """
+
+    def dP(self, fluid, flow_rate):
+        """Forward pressure loss through the check valve [Pa].
+
+            dP = -K * (1/2) * rho * v^2
+
+        Only called for positive (forward) flow; the network solver invokes a
+        high-K shadow for reverse flow via network._reversed_component().
+
+        Args:
+            fluid     : Incompressible_Fluid instance.
+            flow_rate : pint Quantity -- volumetric or mass flow rate.
+
+        Returns:
+            float, pressure change [Pa].  Always <= 0 (loss).
+        """
+        rho = fluid.density_si
+        Di  = self.Di_si
+        A   = math.pi * Di ** 2 / 4.0
+        Q   = _resolve_flow_rate(flow_rate, rho)
+        v   = Q / A
         return -self.K * 0.5 * rho * v ** 2
 
 
