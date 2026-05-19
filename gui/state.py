@@ -13,8 +13,9 @@ from typing import Any, List, Optional
 @dataclass
 class AppState:
     # Set on the Start screen.  Determines which Line_Segment / Fluid classes
-    # the later screens instantiate.
-    flow_type: str = "incompressible"   # "incompressible" or "compressible"
+    # the later screens instantiate, or whether to route the user into the
+    # network-topology screen instead.
+    flow_type: str = "incompressible"   # "incompressible", "compressible", or "network"
 
     # Set on the Segment screen.  A fully-constructed Line_Segment of the
     # appropriate subclass (incompressible.Line_Segment or

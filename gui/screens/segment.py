@@ -44,11 +44,16 @@ def _load_segment_class(flow_type):
 
 
 def _qty(value_str, unit):
-    """Parse a text-field string into a pint Quantity, or None if blank."""
+    """Parse a text-field string into a pint Quantity, or None if blank.
+
+    Applies units.to_pint() so display labels like 'BBL/D' are
+    translated to the pint identifier ('oil_bbl/day') before pint sees
+    them.
+    """
     s = value_str.strip()
     if not s:
         return None
-    return ureg.Quantity(float(s), unit)
+    return ureg.Quantity(float(s), U.to_pint(unit))
 
 
 def _row(field_widget, unit_widget):

@@ -95,7 +95,7 @@ class FluidScreen(QWidget):
         self.i_api.combo.setVisible(False)
 
         self.i_visc    = _LabeledField("1.0",  U.VISCOSITY, "cP")
-        self.i_flow    = _LabeledField("1000", U.FLOW_RATE_INCOMPRESSIBLE, "oil_bbl/day")
+        self.i_flow    = _LabeledField("1000", U.FLOW_RATE_INCOMPRESSIBLE, "BBL/D")
 
         def _toggle():
             self.i_density.edit.setEnabled(self.rb_density.isChecked())

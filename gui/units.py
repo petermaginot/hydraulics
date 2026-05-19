@@ -1,13 +1,30 @@
 """Unit-dropdown choices used across the input screens.
 
-Each list is ordered with the most likely default first.  All strings are
-valid pint unit names (using the ureg from component_classes, which defines
-the custom standard-volume units scm/scf/mscf/mmscf and removes pint's
-default 'bbl').
+Each list is ordered with the most likely default first.  Strings are
+display labels -- mostly identical to pint's registered unit name, but a
+few (e.g. "BBL/D" instead of "oil_bbl/day") are renamed for readability.
+Use `to_pint(display)` to translate a display label back to the pint
+identifier before constructing a Quantity.
 
 For temperature, pint treats degC/degF as offset units; absolute-T conversion
 via ureg.Quantity(value, unit).to("K") works as expected.
 """
+
+# Display label -> pint unit identifier.  Only entries that differ go in
+# here; to_pint() falls back to identity for everything else.
+_DISPLAY_TO_PINT = {
+    "BBL/D": "oil_bbl/day",
+}
+
+
+def to_pint(unit):
+    """Translate a display label to its pint unit identifier.
+
+    Pass-through for any unit not in the rename table, so call sites can
+    use this unconditionally before handing the string to pint.
+    """
+    return _DISPLAY_TO_PINT.get(unit, unit)
+
 
 LENGTH      = ["m", "ft", "inch", "mm", "cm", "km", "mile"]
 DIAMETER    = ["inch", "mm", "m", "cm", "ft"]
@@ -23,7 +40,7 @@ TEMPERATURE = ["degF", "degC", "K", "degR"]
 # molar/standard-volume units for an incompressible liquid (the
 # incompressible solver would reject them).
 FLOW_RATE_INCOMPRESSIBLE = [
-    "m^3/s", "m^3/h", "gal/min", "oil_bbl/day", "ft^3/s",   # volumetric
+    "m^3/s", "m^3/h", "gal/min", "BBL/D", "ft^3/s",          # volumetric
     "kg/s", "kg/h", "lb/h",                                  # mass
 ]
 
