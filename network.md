@@ -44,7 +44,7 @@ A **`Node`** is a junction, inlet, or outlet. It carries an elevation and an opt
 - `Q_ext_spec_qty` — specified external supply, stored as a raw pint `Quantity` so unit conversion can be deferred until `solve()` time (when the fluid is available). Positive = flow into the node from outside; negative = withdrawal. Both solvers convert internally to mass flow [kg/s].
 - `T_spec_K` — specified temperature [K]. Ignored by `Network`; used by `Compressible_Network` (inlets typically have it, outlets typically don't).
 
-An **`Edge`** is a directed connection between two existing nodes, carrying a list of components evaluated in series in the `from_node -> to_node` direction. The list may be empty (a zero-pressure-drop connector that pins `P_from == P_to`) or contain one or more `Line_Segment` / `Bend` / `Valve` / `Contraction_Expansion` instances.
+An **`Edge`** is a directed connection between two existing nodes, carrying a list of components evaluated in series in the `from_node -> to_node` direction. The list may be empty (a zero-pressure-drop connector that pins `P_from == P_to`) or contain one or more `Line_Segment` / `Bend` / `Valve` / `CheckValve` / `Contraction_Expansion` instances. The same component set is available in both regimes — `compressible_flow.CheckValve` mirrors `incompressible.CheckValve` (inheriting the `check_valve = True` marker from `Base_CheckValve`), with a `dP_dT()` body identical to `Valve.dP_dT()`.
 
 Both networks are built imperatively:
 
@@ -85,16 +85,16 @@ Equations:
 - **Pipe equation** per edge: `P_from - P_to = -dP_inlet_to_outlet(mdot_e)`, where the per-edge dP is the signed sum across the edge's components walked in flow direction. The component `dP(fluid, flow_rate)` methods accept a mass-flow Quantity directly.
 - **Mass balance** at each non-P-spec node: sum of signed edge mdots + spec'd `Q_ext` (in kg/s) = 0. Interior junctions default to 0.
 
-The combined system is solved with `scipy.optimize.fsolve` (Powell hybrid) on the concatenated `(free P, edge mdot)` vector. The Jacobian is built by finite differences — adequate for networks up to a few dozen edges; a sparse analytic Jacobian would be needed for larger systems.
+The combined system is solved with `scipy.optimize.least_squares` (Trust Region Reflective, `x_scale='jac'`) on the concatenated `(free P, edge mdot)` vector. The Jacobian is built by finite differences — adequate for networks up to a few dozen edges; a sparse analytic Jacobian would be needed for larger systems. Earlier versions used `fsolve` (Powell hybrid), but it stalled on any topology mixing tiny check-valve dP with much larger pipe dP: the trust region collapsed and `fsolve` would return `ier=1` with the residual still in the kPa range. TRF handles that ill-conditioning gracefully.
 
 After convergence, the external flow at each P-spec node is recovered from its mass balance and reported alongside the spec'd / interior values.
 
 **Initial guesses:**
 - Free node pressures = mean of P-spec values.
-- Edge mdots = the largest spec'd `|Q_ext|` (in kg/s) by default, or 10 kg/s if no Q_ext is spec'd. This is intentionally **scale-matched** to the boundary flow: a too-small uniform guess produces a noisy finite-difference Jacobian (friction goes like mdot², so its derivative near zero is tiny), which can leave `fsolve` stuck.
+- Edge mdots = the largest spec'd `|Q_ext|` (in kg/s) by default, or 10 kg/s if no Q_ext is spec'd. This is intentionally **scale-matched** to the boundary flow: a too-small uniform guess produces a noisy finite-difference Jacobian (friction goes like mdot², so its derivative near zero is tiny), which can leave the trust region stuck.
 - Near `|mdot| / rho < 1e-9 m³/s` (effectively zero flow), friction is linearized through zero to avoid the `friction_factor(Re=0)` singularity and to keep the residual smooth.
 
-**Convergence** is declared if `fsolve` reports `ier == 1` **or** the residual L2 norm falls below `1e-4` (catches the case where `fsolve` reports `ier == 5` because it has hit floating-point noise — equation magnitudes here are pressures in Pa and mdots in kg/s, so 1e-4 covers both with margin).
+**Convergence** is declared when the residual L2 norm falls below `1e-4`, regardless of the solver's status code. Trusting the residual rather than the status code catches both false negatives (status reporting "no progress" when the residual has actually hit floating-point noise) and false positives (status reporting "step below xtol" when the trust region collapsed without driving the residual to zero — the failure mode that motivated switching off fsolve).
 
 At least one P-spec node is required to anchor pressures.
 
@@ -127,6 +127,8 @@ A subclass of `Network` that re-uses the `Node` / `Edge` data classes, the rever
 
 **Phase envelope.** Built once per `solve()` via `_build_phase_limits()` and forwarded to every `dP_dT()` call (rebuilding it is expensive for HEOS mixtures).
 
+**Per-component outlet readout.** After convergence, one additional walk is performed per edge using the converged solution to record the flow-direction outlet `(P_Pa, T_K)` of each component. The list is reindexed back to original `edge.components` order before being returned, so callers can map results to their own per-component objects without needing to know whether the converged flow ended up running forward or reverse on that edge. The data lands in `result["component_outlet_PT"]: dict[edge_name -> list of (P_Pa, T_K)]` and powers the per-block P / T annotations on the compressible GUI canvas (see [GUI.md](GUI.md)).
+
 **Per-edge initial guess.** `mdot_init_kgs` accepts either a scalar (broadcast to every edge) or a `dict {edge_name: kg/s}`. For networks with mixer/splitter junctions, a uniform scalar is mass-imbalanced at the junction and can trap the solver at the zero-flow minimum; pass a mass-balanced dict to seed properly.
 
 **Boundary-condition rule** (validated at solve time): every node with positive `Q_ext` (a supply into the network) must specify `T` so the inflow enthalpy can be evaluated.
@@ -147,11 +149,22 @@ The hard part of both solvers. When an edge's solved flow comes out negative, ea
 
 - a component with a `.profile` attribute (Line_Segment-like) gets a shallow copy with the profile list rebuilt: distances flipped (`new_dist = total_L - old_dist`), elevations / hydraulic diameters / flow areas reversed in order. All segment properties (`total_length_m`, `net_elevation_change_m`, `volume_m3`) follow automatically from the new profile.
 - a component with `.Di_US_si` and `.Di_DS_si` (Contraction_Expansion-like) gets the two diameters swapped — a contraction becomes an expansion.
+- a component with `check_valve = True` gets a shallow copy with `K = _SEALING_K` (≈ 1e9), so reverse flow sees near-infinite resistance. Works for both `incompressible.CheckValve` and `compressible_flow.CheckValve`, since both inherit the marker from `Base_CheckValve`; `Compressible_Network` re-uses `_reversed_component` directly and needs no separate handling.
 - everything else (Bend, Valve) is treated as symmetric and returned unchanged.
 
 The reversed copies are cached by `id()` of the original so they're built at most once per solve. The originals are never mutated.
 
 For the incompressible solver: the reversed shadow's `dP()` at `+|mdot|` gives the dP in flow direction directly; negating restores the forward inlet-to-outlet convention. For the compressible solver: walking the reversed shadow at `+|mdot|` from the new-flow-inlet's `(P, T)` produces the right outlet state directly.
+
+**Check valves are a special case.** The discrete K=K_fwd vs K=_SEALING_K substitution puts a nine-orders-of-magnitude step in the residual at Q=0 paired with a v² nonlinearity whose slope is zero there, and fsolve's Powell hybrid cannot navigate either feature when an edge needs to flip into its sealed state. Inside the incompressible residual function, `_check_valve_signed_dP()` therefore blends `K(Q)` smoothly via a tanh of width `_CHECKVALVE_Q_SCALE` and regularizes `|Q|` as `sqrt(Q² + Q_REG²)` with `_CHECKVALVE_Q_REG`, so the function is C¹ with a finite slope at Q=0. Saturation regions match the discrete model to a few percent. `Network.solve()` also retries with `mdot_init = 0` on every check-valve edge if the first attempt fails, since a positive initial guess plus the K_seal trust-region wall is what triggers the failure in the first place. The discrete `_reversed_component` substitution is still used by post-solve `ComponentResult` walks (where there is no Newton iteration to confuse).
+
+The compressible solver can't reuse the tanh-blend trick directly — its dP comes from a non-linear `compressible_K()` formula coupled to a CoolProp PT update, and K=_SEALING_K plugged into that formula produces a hugely negative `dP` that drives `P_out` and `T_out` to unphysical values (e.g. `P ≈ -5×10⁹ Pa`) which CoolProp can't update against. Three layered guards live in [compressible_flow.py](compressible_flow.py) and [compressible_network.py](compressible_network.py):
+
+- **`CheckValve.dP_dT()` sealed-state short-circuit.** When the K on a CV instance is ≥ `_SEALED_K_THRESHOLD` (1e6, well above any physical K-factor), `dP_dT()` skips the inertial formula entirely and updates the AbstractState to a clamped sealed-state outlet `(P_out, T_out) = (max(0.5·P_in, 1e5 Pa), T_in)` — a defensive measure so direct calls on a sealed shadow don't crash.
+- **`walk_edge()` sealed-edge short-circuit.** If any component on the walked path passes `_is_sealed_check_valve()`, the network solver clamps the AS to the same sealed-outlet state and returns **without walking downstream components**. This is what keeps a Line_Segment downstream of a sealed CV from being asked to integrate at 30 psi (or worse) while compressing tens of mmscf/day's worth of gas — `compressible_pipe_segment()` would otherwise exhaust its `_max_split_depth=8` recursive bisection budget on the resulting low-density / high-velocity state.
+- **Sealed-edge residual swap.** A sealed CV is a complementarity constraint (`mdot ≥ 0` AND `walked − P_outlet ≤ 0`, with at most one active), not an equality. The standard `walked_P_out − P_outlet_node` pipe-equation residual can be accidentally driven to zero by a backflow solution whenever the clamp value happens to match the natural outlet-node pressure — exactly what was happening on a sealed-CV edge with high downstream P. For edges where `walk_edge()` flags `sealed=True`, the solver therefore swaps the pipe equation for `mdot / mdot_ref`, which is zero iff `mdot = 0` (the only physical solution through a sealed CV). When the rest of the system genuinely cannot reach `mdot = 0` (over-determined boundary conditions), the residual norm stays non-zero and the solver reports "did not converge" — preferable to a silently-wrong backflow answer.
+
+For robustness against general numerical infeasibility during LM trial steps (e.g. a slice that can't be split to within `energy_tol`, a CoolProp PT update at a pathological state, etc.), `walk_edge()` also wraps the per-component loop in a `try/except (RuntimeError, ValueError)` that resets the AS to inlet conditions and returns a penalty walked-outlet of `_WALK_FAIL_P_PA = 1.0` Pa. The resulting `~ -1` pipe-equation residual reads as "step rejected" to the trust-region machinery, which shrinks its radius and tries elsewhere instead of aborting the whole solve.
 
 ---
 
@@ -185,7 +198,7 @@ result["converged"]                # bool
 
 For multi-component edges (e.g. `[bend, segment]`), `ComponentResult` walks the edge's components in flow order to find this component's endpoint pressures — so a `ComponentResult` on the bend reports the pressure at the bend inlet / outlet, not at the whole edge's inlet / outlet.
 
-`Compressible_Network.solve()` currently returns a plain dict with `P_Pa` / `T_K` / `mdot_kgs` / `Q_ext_mdot_kgs` / `converged` keys. Lifting the same `NetworkResult` / `EdgeResult` / `ComponentResult` accessors to also wrap compressible results (with an additional `T_K` / `pressure_and_temperature_profile()` surface) is on the open-work list.
+`Compressible_Network.solve()` currently returns a plain dict with `P_Pa` / `T_K` / `mdot_kgs` / `Q_ext_mdot_kgs` / `component_outlet_PT` / `converged` keys. The `component_outlet_PT` entry (added so the compressible GUI canvas can label per-block P / T without re-walking the chain itself — see the "Per-component outlet readout" subsection above) covers the most common per-component query. Lifting the full `NetworkResult` / `EdgeResult` / `ComponentResult` accessors to also wrap compressible results (with an additional `T_K` / `pressure_and_temperature_profile()` surface) is still on the open-work list.
 
 ---
 
@@ -257,17 +270,92 @@ The compressible analogues do not exist yet (the third item in open work).
 - **Asymmetric user-defined components.** Any component class not derived from `Base_Line_Segment` or `Base_Contraction_Expansion` is treated as symmetric under flow reversal by `_reversed_component()`. New asymmetric component types would need to be added to the duck-typing dispatch.
 - **Boundary-condition well-posedness.** Both solvers require at least one P-spec node; over-specified or under-specified systems (e.g., everywhere Q-spec, or pressures inconsistent with a steady state) will fail to converge or produce physically odd results (e.g., a "high-pressure outlet" effectively becoming an inlet — which is what the math says, but probably not what the user meant). For the compressible solver, any inlet with positive `Q_ext` must also specify `T`.
 - **Compressible solver sensitivity to initial guess on junction networks.** A uniform scalar `mdot_init_kgs` is mass-imbalanced at any junction with unequal in/out edge counts; the trust-region solver can stall at the trivial all-zero-flow minimum. Pass a per-edge `dict` for those cases.
+- **Compressible solver: over-determined sealed check-valve configurations.** When a CV's reverse-flow boundary conditions can't be satisfied at `mdot = 0` (e.g. a pressure imbalance that would drive backflow if the CV weren't blocking it), the sealed-edge residual swap drives `mdot → 0` correctly but leaves the system with a non-zero residual norm and a "did not converge" warning. The reported `mdot ≈ 0` solution is still physically correct; the warning just reflects that the over-determined pipe equation has no zero.
 
 ---
+
+## Persistence — `Network.save` / `Network.load`
+
+The headless solver supports JSON save/load so a built network can be
+round-tripped without rebuilding from code.  The file format
+(`*.hydnet.json`, current `SAVE_FORMAT_VERSION` = 1) lives in `network.py`;
+component-level (de)serialization lives in `component_classes.py` on each
+`Base_*` parent class.  Both regimes share the same format — only the
+component classes instantiated at load time differ.
+
+```python
+# Incompressible:
+net = Network()
+net.add_node("in",  P=ureg.Quantity(200, "psi"))
+net.add_node("out", Q_ext=ureg.Quantity(-1000, "oil_bbl/day"))
+net.add_edge("PIPE-1", "in", "out", [seg, bend, valve])
+net.save("scenario.hydnet.json")
+
+net2 = Network.load("scenario.hydnet.json")     # picks incompressible.* classes
+result = net2.solve(fluid)
+
+# Compressible (subclass selects compressible_flow.* component classes):
+gnet = Compressible_Network.load("scenario.hydnet.json")
+```
+
+Each `Network` subclass carries a `REGIME` class attribute (`"incompressible"`
+or `"compressible"`) that the file's `regime` field is matched against at
+load time — calling `Network.load()` on a compressible file (or vice
+versa) raises with a hint to use the matching class.  `from_dict()` accepts
+an explicit `component_classes={"line_segment": cls, ...}` override for
+callers who need to mix in custom subclasses.
+
+**Components.**  Each `Base_*` class has `to_dict()` / `from_dict()`:
+
+- `Base_Line_Segment`: stores `roughness_m`, `noncircular`, `k_wall`, and
+  **either** the full `profile` point list **or** a `csv_path` (and the
+  loader re-reads the CSV via `from_csv()` so edits to the CSV propagate
+  without re-saving the network).  CSV origin is tracked via a
+  `_csv_path` attribute set by `from_csv()`.
+- `Base_Bend`: `Di_m`, `ang_deg`, `bend_dias`, `name`.
+- `Base_Valve` / `Base_CheckValve`: `Di_m`, `K`, `name`.  The K-factor is
+  the resolved Crane value; the original valve "type" (globe/gate/...)
+  is not preserved at the Network level.
+- `Base_Contraction_Expansion`: `Di_US_m`, `Di_DS_m`, `name`.
+
+**Nodes.**  Per node the file records `name`, `elevation_m`, `P_Pa`,
+`Q_ext` (as `{"magnitude": float, "unit": str}` so the original pint
+unit survives), and — when compressible — `T_K`.
+
+**`gui_extras` block.**  A top-level `gui_extras` field is preserved
+verbatim through save/load.  The headless solver ignores it; the GUI
+uses it to round-trip canvas positions and the original-unit display
+strings (so a pipe entered as `"4.026 in"` doesn't come back as
+`"0.10226 m"` after a load).  Headless `Network.load()` produces a
+working network regardless of whether the field is present.
+
+## Result bundles
+
+`NetworkResult.save_bundle(dir_path)` (incompressible) and
+`save_compressible_result_bundle(dir_path, net, result, AS, isothermal=...)`
+(compressible, module-level since the compressible solver currently
+returns a flat dict) write a directory of files matching the
+GUI's "Save Results..." action:
+
+```
+<dir_path>/
+    summary.json              # converged flag, per-node P/T/Q_ext, per-edge mdot
+    <edge>__<pos>__<comp>.csv # one per Line_Segment-like component
+```
+
+Profile CSVs use whatever columns each component's profile generator
+returns — `distance_m, elevation_m, P_Pa, v_ms` for the incompressible
+side; `distance_m, P_Pa, T_K, v_ms` for compressible (re-walked via
+`Line_Segment.dP_dT` starting from the converged flow-direction inlet
+(P, T) of each component).
 
 ## Open work
 
 In rough priority order:
 
-1. **Lift the `NetworkResult` / `EdgeResult` / `ComponentResult` accessors to also wrap `Compressible_Network` results.** Adds `T_K` to the dict-style keys and `pressure_and_temperature_profile()` (or similar) to `ComponentResult` so the same query patterns work across both solvers.
+1. **Lift the `NetworkResult` / `EdgeResult` / `ComponentResult` accessors to also wrap `Compressible_Network` results.** Adds `T_K` to the dict-style keys and `pressure_and_temperature_profile()` (or similar) to `ComponentResult` so the same query patterns work across both solvers.  Also folds `save_compressible_result_bundle` into `NetworkResult.save_bundle`.
 2. **Three calculation-mode wrappers for the compressible solver.** Same shape as the incompressible ones, with `T` as an additional inlet spec.
 3. **Path-stitching for plotting.** Walk a chosen inlet → outlet route through the network, assemble a continuous `(distance, elevation, P, v[, T])` curve by concatenating consecutive `ComponentResult.pressure_profile()` outputs. Then a matplotlib helper to plot pressure-vs-distance.
-4. **CSV / JSON project I/O.** Save and load a network definition so users don't rebuild networks from code each time. Decide whether CSV-profiled Line_Segments are stored by path reference or embedded snapshot.
-5. **GUI.** A tree/list view of the network with add/remove/reorder for components, fluid-property editor, mode selector, results pane (per-component readout + path plot). Likely PySide6 if a topology canvas is wanted later, or Tkinter if the simplest path matters more.
-6. **Heterogeneous-composition compressible support.** Per-edge composition variables, composition-mixing equations at junctions, CoolProp updates with composition changes. Substantial work; only needed when the network actually has multiple gas sources.
-7. **Heat transfer.** Plumb `q_wall` through `Compressible_Network.solve()` so adiabatic isn't the only mode.
+4. **GUI.** A tree/list view of the network with add/remove/reorder for components, fluid-property editor, mode selector, results pane (per-component readout + path plot). Likely PySide6 if a topology canvas is wanted later, or Tkinter if the simplest path matters more.
+5. **Heterogeneous-composition compressible support.** Per-edge composition variables, composition-mixing equations at junctions, CoolProp updates with composition changes. Substantial work; only needed when the network actually has multiple gas sources.
+6. **Heat transfer.** Plumb `q_wall` through `Compressible_Network.solve()` so adiabatic isn't the only mode.

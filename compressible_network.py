@@ -46,6 +46,9 @@ Equations:
        h(P_n, T_n) at the node's mixed state.
 """
 
+import csv
+import json
+import os
 import warnings
 import numpy as np
 from scipy.optimize import root, least_squares
@@ -55,7 +58,18 @@ from network import (
     Node, Edge, Network,
     _reversed_component, _to_si_or_none, _to_pint_qty,
 )
-from compressible_flow import _build_phase_limits, _safe_update_PT
+from compressible_flow import (
+    _build_phase_limits, _safe_update_PT,
+    _is_sealed_check_valve, _sealed_outlet_PT,
+)
+
+
+# Penalty walked-outlet pressure returned by walk_edge when a component
+# dP_dT raises during an LM trial step.  Chosen well below any physical
+# node pressure so the pipe-equation residual is strongly negative (~ -1
+# after normalization by P_ref), signalling "infeasible trial" to the
+# trust-region solver without crashing the whole solve.
+_WALK_FAIL_P_PA = 1.0
 
 
 # ---------------------------------------------------------------------------
@@ -96,6 +110,39 @@ class Compressible_Network(Network):
     """Compressible-flow pipe-network solver.  See module docstring for
     formulation, boundary conventions, and assumptions.
     """
+
+    REGIME = "compressible"
+
+    @classmethod
+    def _default_component_classes(cls):
+        """Override Network._default_component_classes to plug in the
+        compressible_flow.* component subclasses on load."""
+        from compressible_flow import (
+            Line_Segment, Bend, Valve, CheckValve, Contraction_Expansion,
+        )
+        return {
+            "line_segment":          Line_Segment,
+            "bend":                  Bend,
+            "valve":                 Valve,
+            "check_valve":           CheckValve,
+            "contraction_expansion": Contraction_Expansion,
+        }
+
+    def _add_node_from_dict(self, node_payload):
+        """Replay one serialized compressible node: forwards T_K to
+        add_node() in addition to elevation / P / Q_ext."""
+        from component_classes import ureg as _ureg
+        kwargs = {"elevation": _ureg.Quantity(node_payload["elevation_m"], "m")}
+        if node_payload.get("P_Pa") is not None:
+            kwargs["P"] = _ureg.Quantity(node_payload["P_Pa"], "Pa")
+        if node_payload.get("T_K") is not None:
+            kwargs["T"] = _ureg.Quantity(node_payload["T_K"], "K")
+        Q_dict = node_payload.get("Q_ext")
+        if Q_dict is not None:
+            kwargs["Q_ext"] = _ureg.Quantity(
+                float(Q_dict["magnitude"]), Q_dict["unit"],
+            )
+        self.add_node(node_payload["name"], **kwargs)
 
     def add_node(self, name, *, elevation=0.0, P=None, T=None, Q_ext=None,
                  abstract_state=None):
@@ -142,7 +189,8 @@ class Compressible_Network(Network):
         self._node_order.append(name)
 
     def solve(self, abstract_state, *, P_init=None, T_init=None,
-              mdot_init_kgs=1.0, verbose=False, xtol=1e-8, maxfev=5000):
+              mdot_init_kgs=1.0, verbose=False, xtol=1e-8, maxfev=5000,
+              progress_callback=None):
         """Solve the compressible network.
 
         Args:
@@ -166,11 +214,22 @@ class Compressible_Network(Network):
             verbose        : bool.
             xtol           : float, LM tolerance on unknowns / residual.
             maxfev         : int, max function evaluations.
+            progress_callback : callable(nfev, residual_norm) or None.
+                             Called from inside the residual function after
+                             each evaluation.  Lets a GUI surface progress
+                             during a long solve.  Exceptions raised by the
+                             callback are swallowed so a buggy reporter
+                             can't abort the solve.
 
         Returns:
             dict with keys "P_Pa", "T_K", "mdot_kgs", "Q_ext_mdot_kgs",
-            and "converged".  The interpretation matches the incompressible
-            NetworkResult but with mass flow and temperature included.
+            "component_outlet_PT", and "converged".  The first four match
+            the incompressible NetworkResult conventions (with mass flow
+            and temperature added).  "component_outlet_PT" maps each
+            edge name to a list of (P_Pa, T_K) tuples giving the flow-
+            direction outlet conditions of each component, indexed by
+            the original edge.components order (regardless of whether
+            the converged flow ran forward or reverse on that edge).
         """
         node_names = list(self._node_order)
         n_nodes    = len(node_names)
@@ -288,10 +347,13 @@ class Compressible_Network(Network):
         def walk_edge(edge, mdot_e, P, T):
             """Walk the components on one edge in flow direction.
 
-            Returns (P_outlet, T_outlet, h_outlet) at the flow outlet.
-            Also returns the flow-inlet and flow-outlet node indices so
-            the caller can match the pressure residual against the right
-            node.
+            Returns (P_outlet, T_outlet, h_outlet, inlet_i, outlet_i,
+            sealed).  `sealed` is True iff the walked path contains a
+            sealing-K check-valve shadow (i.e. mdot_e < 0 through a CV);
+            the caller uses this to switch the pipe residual from the
+            standard walked - P_outlet form to a mdot penalty, since a
+            sealed CV's pipe equation is over-determined (no flow is
+            permitted regardless of the pressure mismatch across it).
             """
             if mdot_e >= 0.0:
                 inlet_i  = idx_of[edge.from_node]
@@ -312,20 +374,54 @@ class Compressible_Network(Network):
             T_in_e = T[inlet_i]
             abs_mdot = abs(mdot_e)
 
-            _safe_update_PT(abstract_state, P_in_e, T_in_e,
-                            T_cric, P_bar, T_c, P_c)
-            for c in comps:
-                c.dP_dT(
-                    abstract_state,
-                    ureg.Quantity(abs_mdot, "kg/s"),
-                    T_cricondentherm=T_cric, P_cricondenbar=P_bar,
-                    T_critical=T_c, P_critical=P_c,
-                )
+            # If any component in the walked path is a sealed check-valve
+            # shadow, short-circuit the whole edge to the clamped sealed-state
+            # outlet AND flag the edge as sealed so the residual function can
+            # swap to a mdot-penalty form.  Walking downstream components
+            # from the CV's clamped outlet drops them into a low-P /
+            # high-velocity regime where compressible_pipe_segment can fail
+            # to converge.
+            if any(_is_sealed_check_valve(c) for c in comps):
+                P_out, T_out = _sealed_outlet_PT(P_in_e, T_in_e)
+                _safe_update_PT(abstract_state, P_out, T_out,
+                                T_cric, P_bar, T_c, P_c)
+                return (abstract_state.p(),
+                        abstract_state.T(),
+                        abstract_state.hmass(),
+                        inlet_i, outlet_i, True)
+
+            # Wrap the walk in a try/except so that an LM trial step into a
+            # numerically infeasible region (e.g. compressible_pipe_segment
+            # failing to converge its slice within the configured energy/dPdL
+            # tolerances, or a CoolProp PT update failing at an extreme state)
+            # does not abort the whole solve.  On failure, reset AS to inlet
+            # conditions and return a penalty walked outlet at _WALK_FAIL_P_PA
+            # (~ 1 Pa).  The pipe-equation residual then becomes ~ -1 after
+            # normalization by P_ref, which the trust-region LM solver
+            # interprets as "step rejected", shrinks its trust radius, and
+            # retries from a safer point.
+            try:
+                _safe_update_PT(abstract_state, P_in_e, T_in_e,
+                                T_cric, P_bar, T_c, P_c)
+                for c in comps:
+                    c.dP_dT(
+                        abstract_state,
+                        ureg.Quantity(abs_mdot, "kg/s"),
+                        T_cricondentherm=T_cric, P_cricondenbar=P_bar,
+                        T_critical=T_c, P_critical=P_c,
+                    )
+            except (RuntimeError, ValueError):
+                _safe_update_PT(abstract_state, P_in_e, T_in_e,
+                                T_cric, P_bar, T_c, P_c)
+                return (_WALK_FAIL_P_PA,
+                        T_in_e,
+                        abstract_state.hmass(),
+                        inlet_i, outlet_i, False)
 
             return (abstract_state.p(),
                     abstract_state.T(),
                     abstract_state.hmass(),
-                    inlet_i, outlet_i)
+                    inlet_i, outlet_i, False)
 
         # Reference scales used to non-dimensionalize each residual class.
         # All three are then O(1) at the initial guess and any further
@@ -335,6 +431,8 @@ class Compressible_Network(Network):
         mdot_ref   = mdot_ref_scalar
         energy_ref = mdot_ref * 1.0e6   # J/s, rough enthalpy scale
 
+        nfev_counter = [0]
+
         def residuals(x):
             P, T, mdot = unpack(x)
             res = np.empty(n_p_free + n_t_free + n_edges)
@@ -342,12 +440,16 @@ class Compressible_Network(Network):
             walked_h_out = np.empty(n_edges)
             walked_P_out = np.empty(n_edges)
             outlet_i_of  = [None] * n_edges
+            sealed_of    = [False] * n_edges
 
             for e_idx, edge in enumerate(self._edges):
-                wP, wT, wh, _, outlet_i = walk_edge(edge, mdot[e_idx], P, T)
+                wP, wT, wh, _, outlet_i, sealed = walk_edge(
+                    edge, mdot[e_idx], P, T
+                )
                 walked_P_out[e_idx] = wP
                 walked_h_out[e_idx] = wh
                 outlet_i_of[e_idx]  = outlet_i
+                sealed_of[e_idx]    = sealed
 
             # Mass balance at each non-P-spec node (normalized by mdot_ref).
             for j, i in enumerate(p_free_idx):
@@ -418,12 +520,32 @@ class Compressible_Network(Network):
 
                 res[n_p_free + j] = (sum_in - sum_out) / energy_ref
 
-            # Pipe equation per edge: walked outlet P == node P at the
-            # flow-outlet end (normalized by P_ref).
+            # Pipe equation per edge: normally walked outlet P == node P at
+            # the flow-outlet end (normalized by P_ref).  When the walk
+            # crossed a sealed check valve, the standard form is
+            # over-determined (the CV blocks flow regardless of the
+            # pressure mismatch across it), and a clamp-based walked_P_out
+            # can collide with the natural P_outlet value, leaving zero
+            # residual and inviting the solver to accept a spurious
+            # backflow solution.  For sealed edges we therefore swap to a
+            # direct mdot penalty: residual = mdot / mdot_ref, which is
+            # zero iff mdot = 0 (the only physical solution through a
+            # sealed CV).
             for e_idx in range(n_edges):
-                res[n_p_free + n_t_free + e_idx] = (
-                    walked_P_out[e_idx] - P[outlet_i_of[e_idx]]
-                ) / P_ref
+                if sealed_of[e_idx]:
+                    res[n_p_free + n_t_free + e_idx] = mdot[e_idx] / mdot_ref
+                else:
+                    res[n_p_free + n_t_free + e_idx] = (
+                        walked_P_out[e_idx] - P[outlet_i_of[e_idx]]
+                    ) / P_ref
+
+            nfev_counter[0] += 1
+            if progress_callback is not None:
+                try:
+                    progress_callback(nfev_counter[0],
+                                      float(np.linalg.norm(res)))
+                except Exception:
+                    pass
 
             return res
 
@@ -484,14 +606,195 @@ class Compressible_Network(Network):
             else:
                 Q_ext_out[name] = float(mdot_ext_spec[name] or 0.0)
 
+        # Final per-component walk using the converged solution.  Records
+        # the flow-direction outlet (P, T) of each component, indexed by
+        # ORIGINAL edge.components order so callers can map results back to
+        # their own per-component objects (e.g. GUI inline nodes) without
+        # caring whether the converged flow ran forward or reverse.
+        component_outlet_PT = {}
+        for e_idx, edge in enumerate(self._edges):
+            mdot_e = float(mdot_arr[e_idx])
+            if mdot_e >= 0.0:
+                inlet_i  = idx_of[edge.from_node]
+                walk_comps = edge.components
+                walk_in_orig_order = True
+            else:
+                inlet_i  = idx_of[edge.to_node]
+                rev_list = []
+                for c in edge.components:
+                    key = id(c)
+                    if key not in reversed_cache:
+                        reversed_cache[key] = _reversed_component(c)
+                    rev_list.append(reversed_cache[key])
+                walk_comps = list(reversed(rev_list))
+                walk_in_orig_order = False
+
+            # Sealed-edge short-circuit (mirrors walk_edge above): if any
+            # component on the walked path is a sealing-K check-valve shadow,
+            # report the clamped sealed-state outlet for every component
+            # rather than attempting the downstream walk, which would put
+            # subsequent components into a near-vacuum state and fail.
+            if any(_is_sealed_check_valve(c) for c in walk_comps):
+                P_clamp, T_clamp = _sealed_outlet_PT(
+                    float(P_arr[inlet_i]), float(T_arr[inlet_i])
+                )
+                _safe_update_PT(abstract_state, P_clamp, T_clamp,
+                                T_cric, P_bar, T_c, P_c)
+                walked_PT = [(P_clamp, T_clamp) for _ in walk_comps]
+                if not walk_in_orig_order:
+                    walked_PT = list(reversed(walked_PT))
+                component_outlet_PT[edge.name] = walked_PT
+                continue
+
+            _safe_update_PT(abstract_state, P_arr[inlet_i], T_arr[inlet_i],
+                            T_cric, P_bar, T_c, P_c)
+            walked_PT = []
+            for c in walk_comps:
+                c.dP_dT(
+                    abstract_state,
+                    ureg.Quantity(abs(mdot_e), "kg/s"),
+                    T_cricondentherm=T_cric, P_cricondenbar=P_bar,
+                    T_critical=T_c, P_critical=P_c,
+                )
+                walked_PT.append((float(abstract_state.p()),
+                                  float(abstract_state.T())))
+            # For reverse flow, walked_PT[k] is the flow-direction outlet of
+            # original edge.components[N-1-k]; reverse it so the list is
+            # indexed by original component position.
+            if not walk_in_orig_order:
+                walked_PT = list(reversed(walked_PT))
+            component_outlet_PT[edge.name] = walked_PT
+
         return {
-            "P_Pa":           {n: float(P_arr[i]) for i, n in enumerate(node_names)},
-            "T_K":            {n: float(T_arr[i]) for i, n in enumerate(node_names)},
-            "mdot_kgs":       {self._edges[e].name: float(mdot_arr[e])
-                               for e in range(n_edges)},
-            "Q_ext_mdot_kgs": Q_ext_out,
-            "converged":      bool(converged),
+            "P_Pa":               {n: float(P_arr[i]) for i, n in enumerate(node_names)},
+            "T_K":                {n: float(T_arr[i]) for i, n in enumerate(node_names)},
+            "mdot_kgs":           {self._edges[e].name: float(mdot_arr[e])
+                                   for e in range(n_edges)},
+            "Q_ext_mdot_kgs":     Q_ext_out,
+            "component_outlet_PT": component_outlet_PT,
+            "converged":          bool(converged),
         }
+
+
+# ---------------------------------------------------------------------------
+# Results bundle for the compressible solver.
+#
+# Compressible_Network.solve() currently returns a flat dict rather than a
+# NetworkResult (see network.md open work), so the analogue of
+# NetworkResult.save_bundle lives here as a module-level function rather
+# than as a method.  Per-pipe profiles are generated by re-running
+# Line_Segment.dP_dT on the converged inlet (P, T) -- the same path the
+# GUI's per-block inspector uses for "Plot profile..." plots.
+# ---------------------------------------------------------------------------
+
+def save_compressible_result_bundle(dir_path, net, result, abstract_state,
+                                    *, isothermal=False):
+    """Write summary.json + per-pipe profile CSVs into `dir_path`.
+
+    Args:
+        dir_path        : str.  Directory to write into; created if absent.
+        net             : Compressible_Network instance the result came from.
+        result          : flat dict returned by net.solve().
+        abstract_state  : the same AbstractState passed to net.solve() (the
+                          AS is mutated and restored around each profile
+                          walk so the caller sees no net change).
+        isothermal      : bool.  Mirror of the flag passed to solve(); used
+                          to re-walk per-pipe profiles consistently.
+
+    Mutates `abstract_state` transiently but restores its (P, T) on exit.
+    """
+    import CoolProp.CoolProp as CP
+    from network import _safe_csv_name
+
+    os.makedirs(dir_path, exist_ok=True)
+
+    summary = {
+        "regime":    "compressible",
+        "converged": bool(result["converged"]),
+        "nodes": {
+            name: {
+                "P_Pa":      float(result["P_Pa"][name]),
+                "T_K":       float(result["T_K"][name]),
+                "Q_ext_kgs": float(result["Q_ext_mdot_kgs"].get(name, 0.0)),
+            }
+            for name in result["P_Pa"]
+        },
+        "edges": {
+            edge_name: {"mdot_kgs": float(mdot)}
+            for edge_name, mdot in result["mdot_kgs"].items()
+        },
+    }
+
+    profile_errors = {}
+    used = set()
+
+    P_save = abstract_state.p()
+    T_save = abstract_state.T()
+    try:
+        for edge in net._edges:
+            mdot = result["mdot_kgs"][edge.name]
+            pt_list = result.get("component_outlet_PT", {}).get(edge.name, [])
+            # Components are indexed in the edge's nominal order; the
+            # flow-direction inlet of position 0 is from_node (if forward)
+            # or to_node (if reverse).  Subsequent inlets are the previous
+            # position's outlet.  In reverse flow the components are
+            # walked in reverse position order.
+            from_P = result["P_Pa"][edge.from_node]
+            from_T = result["T_K"][edge.from_node]
+            to_P   = result["P_Pa"][edge.to_node]
+            to_T   = result["T_K"][edge.to_node]
+
+            for pos, comp in enumerate(edge.components):
+                if not hasattr(comp, "dP_dT") or not hasattr(comp, "profile"):
+                    continue
+                # Flow-direction inlet (P, T) for this position.
+                if mdot >= 0.0:
+                    if pos == 0:
+                        P_in, T_in = from_P, from_T
+                    else:
+                        P_in, T_in = pt_list[pos - 1]
+                else:
+                    if pos == len(pt_list) - 1:
+                        P_in, T_in = to_P, to_T
+                    else:
+                        P_in, T_in = pt_list[pos + 1]
+                try:
+                    abstract_state.update(CP.PT_INPUTS, P_in, T_in)
+                    raw = comp.dP_dT(
+                        abstract_state=abstract_state,
+                        flow_rate=ureg.Quantity(abs(mdot), "kg/s"),
+                        isothermal=isothermal,
+                    )
+                except Exception as exc:
+                    profile_errors[f"{edge.name}#{pos}"] = (
+                        f"{type(exc).__name__}: {exc}"
+                    )
+                    continue
+                if not raw:
+                    continue
+                comp_name = getattr(comp, "name", None) or f"comp{pos}"
+                fname = _safe_csv_name(
+                    f"{edge.name}__{pos}__{comp_name}", used,
+                ) + ".csv"
+                used.add(fname.lower())
+                with open(os.path.join(dir_path, fname), "w",
+                          newline="", encoding="utf-8") as fh:
+                    w = csv.writer(fh)
+                    w.writerow(["distance_m", "P_Pa", "T_K", "v_ms"])
+                    for d, P, T, v in raw:
+                        w.writerow([d, P, T, v])
+    finally:
+        import CoolProp.CoolProp as _CP
+        try:
+            abstract_state.update(_CP.PT_INPUTS, P_save, T_save)
+        except Exception:
+            pass
+
+    if profile_errors:
+        summary["profile_errors"] = profile_errors
+    with open(os.path.join(dir_path, "summary.json"), "w",
+              encoding="utf-8") as f:
+        json.dump(summary, f, indent=2)
 
 
 # ---------------------------------------------------------------------------

@@ -1,12 +1,11 @@
 # GUI — status
 
-A PySide6 desktop application wrapping the hydraulics back end. Launch with `python run_gui.py` from the repo root. Three workflows live behind a single Start screen:
+A PySide6 desktop application wrapping the hydraulics back end. Launch with `python run_gui.py` from the repo root. Four workflows live behind a single Start screen:
 
 1. **Point-to-point incompressible** — one pipe segment, one liquid, one calculation.
 2. **Point-to-point compressible** — one pipe segment, one gas mixture, one calculation.
-3. **Pipe network (incompressible)** — a P&ID-style canvas with multiple sources/sinks, junctions, and pipe segments, calling `Network.solve()` from [network.py](network.py).
-
-Compressible *network* mode is the obvious next step; it isn't in the Start screen yet.
+3. **Pipe network (incompressible)** — a P&ID-style canvas with multiple sources/sinks, junctions, pipes, fittings, valves, and check valves, calling `Network.solve()` from [network.py](network.py).
+4. **Pipe network (compressible)** — same canvas, with a composition / EOS panel and per-Source/Sink temperature spec, calling `Compressible_Network.solve()` from [compressible_network.py](compressible_network.py).
 
 Dependencies (install with pip): `pyside6`, `pyqtgraph`, `nodegraphqt`, plus the existing physics deps (`pint`, `fluids`, `coolprop`).
 
@@ -22,12 +21,15 @@ gui/
     main.py              — MainWindow + QStackedWidget routing between screens
     state.py             — AppState dataclass shared between screens
     units.py             — per-category unit-dropdown lists; "BBL/D" -> "oil_bbl/day" rewrite
+    persistence.py       — canvas Save / Load wrapper around network.py's Network.save / load
     screens/
-        start.py         — radio-button selector + Next
-        segment.py       — point-to-point pipe-segment builder (Manual / CSV tabs)
-        fluid.py         — point-to-point fluid + inlet conditions (incompressible & compressible)
-        results.py       — pressure-profile plot for the point-to-point flow
-        network.py       — node-graph canvas + incompressible network solver
+        start.py                  — radio-button selector + Next
+        segment.py                — point-to-point pipe-segment builder (Manual / CSV tabs)
+        fluid.py                  — point-to-point fluid + inlet conditions (incompressible & compressible)
+        composition.py            — compressible-network composition / EOS / mode builder
+        results.py                — pressure-profile plot for the point-to-point flow
+        network.py                — node-graph canvas + incompressible network solver
+        compressible_network.py   — subclass of network.py wired to Compressible_Network
 ```
 
 ---
@@ -55,7 +57,7 @@ The **network screen does not use `AppState`** beyond reading `flow_type` — it
 
 ## Start screen — [`start.py`](gui/screens/start.py)
 
-Three radio choices ("Point-to-point: Incompressible (liquid)" / "Point-to-point: Compressible (gas)" / "Pipe network (incompressible)") plus a Next button. The point-to-point options route to the Segment screen → Fluid → Results pipeline; the network option jumps straight to the Network screen. Switching regime clears stale state via `AppState.reset_for_flow_type_change()`.
+Four radio choices ("Point-to-point: Incompressible (liquid)" / "Point-to-point: Compressible (gas)" / "Pipe network (incompressible)" / "Pipe network (compressible)") plus a Next button. The point-to-point options route to the Segment screen → Fluid → Results pipeline; the incompressible network option jumps straight to the Network screen; the compressible network option routes through the Composition screen first (to build the AbstractState) and then to the CompressibleNetworkScreen. Switching regime clears stale state via `AppState.reset_for_flow_type_change()`.
 
 ---
 
@@ -97,18 +99,23 @@ A monospace summary block above the plot reports length, inlet/outlet P, total d
 
 ## Network screen — [`network.py`](gui/screens/network.py) (incompressible only)
 
-A P&ID-style canvas driven by `NodeGraphQt`. Three node families plus connecting edges:
+A P&ID-style canvas driven by `NodeGraphQt`. Six node families plus connecting edges:
 
-- **`SourceSinkNode`** — boundary node carrying a `P` or `Q_ext` spec (mutually exclusive). Multi-in and multi-out ports so one node can serve as the inlet/outlet for several chains (manifold).
-- **`JunctionNode`** — interior splitter/merger with no boundary condition; multi-in and multi-out ports.
+- **`SourceSinkNode`** — boundary node carrying a `P` or `Q_ext` spec (mutually exclusive). Multi-in and multi-out ports so one node can serve as the inlet/outlet for several chains (manifold). Result widgets: solved `P`, `T` (compressible only — left blank otherwise), and external `Q`.
+- **`JunctionNode`** — interior splitter/merger with no boundary condition; multi-in and multi-out ports. Result widgets: solved `P` and (compressible only) `T`.
 - **`PipeSegmentNode`** — inline pipe segment with geometry. Strict single-input + single-output ports (no branching) — branching happens at junction nodes.
+- **`FittingNode`** — inline bend or sudden contraction/expansion.
+- **`ValveNode`** — inline valve (globe / gate / plug / ball / butterfly), K-factor computed from Crane correlations at solve time.
+- **`CheckValveNode`** — inline check valve (swing / lift / tilting-disk / angle-stop / globe-stop), again K from Crane. Reverse flow is handled by `_reversed_component` in [network.py](network.py), which substitutes `K = _SEALING_K ≈ 1e9` so the valve seals.
 
-A "pipe" in the underlying `Network` solver is **not** one canvas node — it's the chain of `PipeSegmentNode`s found by walking from a boundary node's output through pipe nodes until another boundary node is reached. The chain's `Line_Segment` instances become the `components=[...]` list on a single solver `Edge`. This means a long manifold-to-manifold run with multiple discrete pipe sections appears on the canvas as several visible blocks but resolves to one solver edge, and the per-block dP / Q are recovered via `result.component(seg)` after the solve.
+The four inline node types each carry the same set of result widgets, stacked top-to-bottom: a primary readout (`dP` for incompressible, outlet `P` for compressible — the field is reused rather than renamed to keep serialized graphs portable), `T` (compressible only), and signed flow.
+
+A "pipe" in the underlying `Network` solver is **not** one canvas node — it's the chain of inline nodes (pipe / fitting / valve / check-valve) found by walking from a boundary node's output through inline nodes until another boundary node is reached. The chain's component instances become the `components=[...]` list on a single solver `Edge`. This means a long manifold-to-manifold run with multiple discrete blocks appears on the canvas as several visible nodes but resolves to one solver edge. Per-block results are recovered via `result.component(seg)` for the incompressible solver, or — for the compressible solver — by indexing `result["component_outlet_PT"][edge_name][pos]`, where `pos` is the inline node's 0-based position within its edge's chain (tracked by the screen in `self._inline_chain_pos`).
 
 ### Layout
 
 ```
-[+ Source/Sink] [+ Junction] [+ Pipe] [- Delete selected]              [Solve]
+[+ Source/Sink] [+ Junction] [+ Pipe] [- Delete selected]    [Save...] [Load...] [Save Results...] [Solve]
 +----------------------------------------------+--------------------------+
 |                                              | Fluid (incompressible)   |
 |                                              |   density / viscosity    |
@@ -126,30 +133,58 @@ A "pipe" in the underlying `Network` solver is **not** one canvas node — it's 
 
 ### Selected-node editor
 
-A `QStackedWidget` with four pages keyed on node type, automatically swapped via `node_selected`. Each page shows a Name field, the appropriate spec fields (with unit dropdowns), and an Apply button that writes back to a `node_specs[node_id]` dict.
+A `QStackedWidget` with one page per node family, automatically swapped via `node_selected`. Each page shows a Name field, the appropriate spec fields (with unit dropdowns), and an Apply button that writes back to a `node_specs[node_id]` dict.
 
-- **Source/Sink editor** — `P`, `Q_ext`, and elevation. The P / Q_ext fields are mutually exclusive: typing in one disables the other (`_update_PQ_exclusivity`), matching the solver's `P xor Q_ext` rule per node.
+- **Source/Sink editor** — `P`, `Q_ext`, and elevation. The P / Q_ext fields are mutually exclusive: typing in one disables the other (`_update_PQ_exclusivity`), matching the solver's `P xor Q_ext` rule per node. The compressible subclass adds a `T` row (required on every Source/Sink even when it's currently a withdrawal — a future solve could reverse the flow and need an inflow T).
 - **Junction editor** — just elevation (decorative).
 - **Pipe Segment editor** — same shape as the point-to-point Segment screen's Manual tab (ID/OD/WT/length/dz/roughness) plus a **Load CSV...** button that switches the pipe into CSV mode. In CSV mode the manual geometry fields go read-only and display CSV-derived summaries (first/last ID, total length, net dz); a **Switch to manual** button reverts.
+- **Fitting / Valve / Check Valve editors** — type-specific geometry (ID, angle, R/D, D1/D2, etc.) feeding the corresponding `fluids.fittings.K_*_Crane` correlation at solve time.
 
 ### Solving
 
 The Solve button:
 
 1. Flushes any pending in-editor changes into `node_specs` (so the user doesn't have to press Apply first).
-2. Builds an `Incompressible_Fluid` from the side panel.
-3. Translates the canvas into a `Network`: each boundary node becomes a `net.add_node(...)`; each chain of pipe-segment nodes between two boundary nodes becomes one `net.add_edge(name, from, to, [Line_Segment, ...])`. `_walk_chain` does the chain detection and raises if a pipe chain doesn't terminate at a boundary node or if a pipe is shared between chains.
-4. Runs `net.solve(fluid)`.
+2. Builds an `Incompressible_Fluid` from the side panel (or, for the compressible subclass, pulls the AbstractState that the Composition screen stashed on `AppState.fluid`).
+3. Translates the canvas into a `Network`: each boundary node becomes a `net.add_node(...)`; each chain of inline nodes between two boundary nodes becomes one `net.add_edge(name, from, to, [component, ...])`. `_walk_chain` does the chain detection (raising if a chain doesn't terminate at a boundary node or if a node is shared between chains) and additionally records each inline node's 0-based position in its edge into `self._inline_chain_pos` so the compressible renderer can look up per-block results.
+4. Runs `net.solve(...)` on whichever solver is wired in via `self.NETWORK_CLS`.
 5. Renders the result.
+
+Component classes are also class-attribute overrides (`LINE_SEGMENT_CLS`, `BEND_CLS`, `VALVE_CLS`, `CHECKVALVE_CLS`, `CONTRACTION_EXP_CLS`, `NETWORK_CLS`), so the compressible subclass swaps in `compressible_flow.*` and `Compressible_Network` without touching the editor stack, chain walker, or canvas plumbing.
 
 ### Rendering results
 
 After a successful solve, results land in two places:
 
-- **On the canvas** — each `SourceSinkNode` gets `P=… psi` and `Q=… BBL/D` (flow into / out of the network). Each `JunctionNode` gets `P=… psi`. Each `PipeSegmentNode` gets `dP=… psi` and `Q=… BBL/D` (signed, per the edge's nominal direction). The latter comes from `result.component(seg)` — `ComponentResult` walks the edge in flow direction internally so each block reports its own dP, not the whole chain's.
-- **In the side text panel** — a tab-aligned summary: convergence flag, every node's P, every edge's signed flow, every boundary node's external Q. Currently flow magnitudes near zero are suppressed in the external-flow listing.
+- **On the canvas** — each `SourceSinkNode` gets `P=… psi`, `T=…` (compressible only), and `Q=…` (flow into / out of the network). Each `JunctionNode` gets `P=…` and (compressible only) `T=…`. Each inline node gets a primary readout (`dP=…` for incompressible, outlet `P=…` for compressible — same widget field reused), `T=…` (compressible only), and signed `Q=…`. The incompressible per-block dP comes from `result.component(seg)`; the compressible per-block (P, T) comes from `result["component_outlet_PT"][edge_name][pos]` (see [network.md](network.md) for the solver side).
+- **In the side text panel** — a tab-aligned summary: convergence flag, every node's P (and T for compressible), every edge's signed flow, every boundary node's external Q. Currently flow magnitudes near zero are suppressed in the external-flow listing.
 
-The **Result display units** combos (pressure, flow) re-render both the canvas annotations and the text panel without re-running the solver. The flow combo lists both volumetric and mass units; `_convert_flow` picks the right source (`mdot_kgs` or `Q_m3s`) by checking the unit's pint dimensionality against cached mass-flow and volumetric-flow signatures.
+The **Result display units** combos re-render both the canvas annotations and the text panel without re-running the solver. The default panel has Pressure and Flow; the compressible subclass appends a Temperature row via the `_add_extra_display_unit_rows(form)` hook. The flow combo lists both volumetric and mass units; `_convert_flow` picks the right source (`mdot_kgs` or `Q_m3s`) by checking the unit's pint dimensionality against cached mass-flow and volumetric-flow signatures.
+
+### Per-block inspector
+
+Each inline editor page (Pipe / Fitting / Valve / Check Valve) carries a **"Show solved details…"** button that becomes visible only when (a) a solve has completed and (b) that node was assigned a component during chain-walk. Clicking it opens a modal `NodeResultsDialog` ([gui/dialogs.py](gui/dialogs.py)) with formatted label/value rows:
+
+- **Pipe** — mass flow, inlet/outlet P, dP, inlet/outlet velocity (plus inlet/outlet T for compressible). A **"Plot profile…"** button on the dialog opens a non-modal `PipeProfileWindow` showing P vs distance; for compressible a secondary right-hand axis carries the T trace, with its own unit selector — same layout as the point-to-point Results screen.
+- **Valve / Check Valve** — K-factor, mass flow, dP, and velocity through the **smallest** characteristic diameter (seat bore `D1` for reducer types, single pipe `D` for butterfly / swing / tilting-disk). Compressible adds inlet/outlet P + T rows.
+- **Fitting** — mass flow, dP, velocity. Bend reports velocity at the pipe ID; sudden contraction/expansion reports velocity at `min(Di_US, Di_DS)` (the point of maximum velocity).
+
+For the incompressible case all rows come from `result.component(comp)` — `pressure_profile()` already supplies per-point `v_ms` so the profile window consumes it directly. For the compressible case, inlet/outlet (P, T) come from `_inline_inlet_outlet_PT()`, which reads `result["component_outlet_PT"]` and walks one step back in flow direction (handling reverse flow); inlet density for velocity comes from a save / restore around `AS.update(PT_INPUTS, P, T)`. The compressible pipe profile is generated lazily on **Plot profile…** click by re-running `compressible_flow.Line_Segment.dP_dT` against an AS reseeded to the inlet (P, T) — the returned `(distance, P, T, v)` tuples feed `PipeProfileWindow` directly.
+
+---
+
+## Compressible Network screen — [`compressible_network.py`](gui/screens/compressible_network.py)
+
+`CompressibleNetworkScreen` subclasses `NetworkScreen` and overrides the regime-specific knobs:
+
+- **Component classes** — `LINE_SEGMENT_CLS`, `BEND_CLS`, `VALVE_CLS`, `CHECKVALVE_CLS`, `CONTRACTION_EXP_CLS` all swap to their `compressible_flow.*` equivalents; `NETWORK_CLS` swaps to `Compressible_Network`. Because the base class's `_build_*_component` helpers reach for these via `self`, the editor stack, chain walker, and canvas rendering are entirely inherited.
+- **Fluid panel** — replaced with a read-only label summarising the composition / EOS / mode that `CompressibleCompositionScreen` stashed on `AppState.fluid`. The Composition screen runs first in the start-screen routing for this regime.
+- **Source/Sink editor** — adds a `T` row (the required-on-every-Source/Sink rule lives in `_extra_kwargs_for_boundary`).
+- **Display units** — adds a Temperature combo (`degF` default) via the `_add_extra_display_unit_rows` hook.
+- **Result rendering** — the compressible solver returns a flat dict; `_annotate_results_on_canvas` fills `P` + `T` + external `Q` on Source/Sink, `P` + `T` on Junction, and outlet `P` + `T` + edge `mdot` on inline blocks. The per-block (P, T) come from `result["component_outlet_PT"]`, indexed by each inline node's `self._inline_chain_pos`. Per-component `dP` is not separately surfaced (the user can read consecutive P values off the canvas instead).
+- **Solver progress** — `Compressible_Network.solve()` accepts a `progress_callback(nfev, residual_norm)` that fires from inside its `residuals()` after each evaluation. `CompressibleNetworkScreen._solve_network` overrides the base no-op to seed `results_text` with "Solving..." and pass `_on_solve_progress` into the solver. The callback throttles to ~150 ms, rewrites the panel with `nfev` / residual norm / elapsed seconds, and calls `QApplication.processEvents()` so the UI repaints mid-solve. The base `NetworkScreen._solve` wraps the solve in a `try/finally` that disables `self._solve_btn` for the duration — necessary because `processEvents()` would otherwise let a second click re-enter `_solve`. The final `_render_results_text` overwrites the progress line with the normal result table.
+
+The flow-rate dropdown is mass / molar / standard-volume only — actual-volumetric units are omitted because density varies along the network and there's no single conversion.
 
 ---
 
@@ -169,12 +204,59 @@ Centralizes the dropdown choices and the one rename pint can't handle out of the
 
 ---
 
+## Save / Load / Save Results — [`gui/persistence.py`](gui/persistence.py)
+
+Three toolbar buttons (**Save...**, **Load...**, **Save Results...**) sit
+between the node-add buttons and **Solve** on both the incompressible and
+compressible network screens.  The file format itself lives in
+[network.py](network.py) (`Network.save` / `Network.load` /
+`NetworkResult.save_bundle`) so headless code can produce and consume the
+same files — see [network.md](network.md).  `gui/persistence.py` is the
+thin canvas-side wrapper.
+
+**Save** flushes any pending in-editor edits, then calls
+`_build_network()` so a malformed canvas raises before anything hits
+disk.  It then calls `Network.save(path, gui_extras=...)`.  The
+`gui_extras` block carries the canvas-only state the headless format
+does not represent: per-canvas-node position, the canvas id (used only to
+wire connections within the file), the raw `node_specs` dict (which
+preserves the user's input units and the OD/WT-vs-ID and valve-type
+intent that gets flattened on the network side), and the canvas
+connections by port name.  CSV-backed pipes have their `csv_path`
+rewritten relative to the save file in `gui_extras` so the bundle is
+portable as long as the CSVs move with it.
+
+**Load** reads the JSON, validates same-regime files by calling
+`screen.NETWORK_CLS.from_dict(payload)` (catches malformed components,
+unknown kinds, etc.), then rebuilds the canvas from `gui_extras`.
+Cross-regime loads are supported: loading an incompressible save into the
+compressible canvas merges in the compressible Source/Sink defaults (so
+`T_str` / `T_unit` exist with blank values) and surfaces a warning
+listing every Source/Sink that needs `T` filled in before the next
+solve.  Files written without a `gui_extras` block (headless-only saves)
+currently warn and leave the canvas empty — full canvas reconstruction
+from the headless representation alone is on the open-work list.
+
+**Save Results** is disabled until a successful solve, then opens a
+directory picker and dispatches to `NetworkResult.save_bundle()` for the
+incompressible side or to
+`compressible_network.save_compressible_result_bundle()` for the
+compressible side.  See [network.md](network.md) for the bundle layout
+(`summary.json` plus one per-pipe profile CSV per Line_Segment-like
+component on each edge).
+
+The fluid / composition panel state is **not** included in save files by
+design — the user re-enters density/viscosity or rebuilds the
+AbstractState each session.  Loading a saved network does not touch the
+side-panel fluid box.
+
+---
+
 ## Things missing / next steps
 
 In rough priority order:
+1. **Three calculation-mode wrappers in the UI.** `Network.solve_for_outlet_pressure` / `_inlet_pressure` / `_flow_rate` aren't exposed as explicit modes; the user emulates them by choosing P-spec vs Q_ext-spec on individual boundary nodes. A mode selector with named labels would be more discoverable. Compressible analogues don't exist on the back end yet (see [network.md](network.md) open work).
+2. **Multi-block path plot.** The per-block inspector plots a single pipe's profile; it doesn't yet stitch a continuous P-vs-distance (or P + T-vs-distance for compressible) curve across multiple inline blocks along a chosen inlet→outlet path through the graph.
+3. **Fluid/composition autosave alongside the network.** Save/Load is topology-only by design; an opt-in "save fluid panel too" toggle would let users round-trip a full runnable scene without re-entering density/viscosity or rebuilding the AbstractState.
+4. **Canvas reconstruction from headless saves.** A file produced by `Network.save()` headless (no `gui_extras`) currently loads to an empty canvas with a warning.  Auto-layout + sensible default unit choices would let the GUI open files written by code.
 
-1. **Compressible network on the canvas.** A `Compressible_Network` variant of the network screen would need a composition / EOS panel (same shape as the point-to-point fluid screen's compressible side), per-node `T` spec on the Source/Sink editor, and a mass-flow-aware display. The back end already exists in [compressible_network.py](compressible_network.py).
-2. **Three calculation-mode wrappers in the UI.** `Network.solve_for_outlet_pressure` / `_inlet_pressure` / `_flow_rate` aren't exposed as explicit modes; the user emulates them by choosing P-spec vs Q_ext-spec on individual boundary nodes. A mode selector with named labels would be more discoverable.
-4. **Path plot.** The Network screen reports per-pipe dP numerically; it doesn't yet plot a continuous P-vs-distance curve for a chosen inlet→outlet path through the graph (the natural compressible-network analogue would be P+T-vs-distance).
-5. **Project save/load.** The canvas state isn't persisted; closing the app drops every node and connection. `NodeGraphQt` ships a session-save mechanism that can be paired with a JSON of the `node_specs` dicts.
-6. **Validation tab / per-pipe inspector.** The canvas annotations are concise; a more detailed inspector showing the full pressure profile of a selected pipe (matching the point-to-point Results screen) would be useful for diagnostics.

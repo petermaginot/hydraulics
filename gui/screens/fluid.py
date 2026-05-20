@@ -11,6 +11,7 @@ P/T (compressible only) before emitting next_clicked.
 import traceback
 
 import CoolProp.CoolProp as CP
+import gui.dialogs as dialogs
 from PySide6.QtCore import Qt, Signal
 from PySide6.QtWidgets import (
     QButtonGroup,
@@ -270,7 +271,7 @@ class FluidScreen(QWidget):
         try:
             fractions = composition.parse_composition_csv(path)
         except Exception as e:
-            QMessageBox.critical(
+            dialogs.critical(
                 self, "Could not load composition",
                 f"{type(e).__name__}: {e}",
             )
@@ -292,7 +293,7 @@ class FluidScreen(QWidget):
             else:
                 self._finalize_compressible()
         except Exception as e:
-            QMessageBox.critical(
+            dialogs.critical(
                 self, "Invalid fluid input",
                 f"{type(e).__name__}: {e}\n\n{traceback.format_exc()}",
             )

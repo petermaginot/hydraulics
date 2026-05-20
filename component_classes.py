@@ -550,11 +550,69 @@ class Base_Line_Segment:
             f"net elevation change = {net_elev_m:.4f} m  [mode={mode}]"
         )
 
-        return cls(
+        seg = cls(
             roughness=roughness,
             profile=rows,
             noncircular=noncircular,
             id_tolerance=id_tolerance,
+            k_wall=k_wall,
+            name=name,
+        )
+        # Tag the segment with its CSV origin so to_dict() can save the path
+        # instead of the full profile (per the network-save spec: CSV-backed
+        # segments re-load from the CSV at load time, so edits to the CSV
+        # propagate without needing to re-save the network file).
+        seg._csv_path = csv_path
+        return seg
+
+    # ------------------------------------------------------------------
+    # JSON (de)serialization for Network.save / Network.load.
+    #
+    # CSV-backed segments are stored as {"csv_path": ...} and reloaded via
+    # from_csv() so a user can tweak the CSV between runs without re-saving
+    # the network.  Manually-constructed segments are stored as a full
+    # profile list (SI floats only).
+    # ------------------------------------------------------------------
+
+    def to_dict(self):
+        d = {
+            "kind":        "line_segment",
+            "name":        self.name,
+            "roughness_m": float(self.roughness_si),
+            "noncircular": bool(self.noncircular),
+            "k_wall":      None if self.k_wall_si is None else float(self.k_wall_si),
+        }
+        csv_path = getattr(self, "_csv_path", None)
+        if csv_path:
+            d["csv_path"] = csv_path
+        else:
+            d["profile"] = [list(map(float, row)) for row in self.profile]
+        return d
+
+    @classmethod
+    def from_dict(cls, payload):
+        if payload.get("kind") != "line_segment":
+            raise ValueError(
+                f"{cls.__name__}.from_dict: expected kind='line_segment', "
+                f"got {payload.get('kind')!r}."
+            )
+        roughness = payload["roughness_m"]
+        noncircular = bool(payload.get("noncircular", False))
+        k_wall = payload.get("k_wall")
+        name = payload.get("name")
+        if "csv_path" in payload:
+            return cls.from_csv(
+                payload["csv_path"],
+                roughness=roughness,
+                noncircular=noncircular,
+                k_wall=k_wall,
+                name=name,
+            )
+        profile = [tuple(row) for row in payload["profile"]]
+        return cls(
+            roughness=roughness,
+            profile=profile,
+            noncircular=noncircular,
             k_wall=k_wall,
             name=name,
         )
@@ -651,6 +709,29 @@ class Base_Bend:
             f"bend_diameters={self.bend_dias:.2f})"
         )
 
+    def to_dict(self):
+        return {
+            "kind":      "bend",
+            "name":      self.name,
+            "Di_m":      float(self.Di_si),
+            "ang_deg":   float(self.ang_deg),
+            "bend_dias": float(self.bend_dias),
+        }
+
+    @classmethod
+    def from_dict(cls, payload):
+        if payload.get("kind") != "bend":
+            raise ValueError(
+                f"{cls.__name__}.from_dict: expected kind='bend', "
+                f"got {payload.get('kind')!r}."
+            )
+        return cls(
+            Di=payload["Di_m"],
+            ang_deg=payload["ang_deg"],
+            bend_dias=payload["bend_dias"],
+            name=payload.get("name"),
+        )
+
 
 # ---------------------------------------------------------------------------
 # Base_Valve
@@ -691,6 +772,23 @@ class Base_Valve:
             f"Di={Di_q.to('inch'):.4f~P}, "
             f"K={self.K:.4f})"
         )
+
+    def to_dict(self):
+        return {
+            "kind": "valve",
+            "name": self.name,
+            "Di_m": float(self.Di_si),
+            "K":    float(self.K),
+        }
+
+    @classmethod
+    def from_dict(cls, payload):
+        if payload.get("kind") != "valve":
+            raise ValueError(
+                f"{cls.__name__}.from_dict: expected kind='valve', "
+                f"got {payload.get('kind')!r}."
+            )
+        return cls(Di=payload["Di_m"], K=payload["K"], name=payload.get("name"))
 
 
 # ---------------------------------------------------------------------------
@@ -735,6 +833,23 @@ class Base_CheckValve:
             f"K_fwd={self.K:.4f})"
         )
 
+    def to_dict(self):
+        return {
+            "kind": "check_valve",
+            "name": self.name,
+            "Di_m": float(self.Di_si),
+            "K":    float(self.K),
+        }
+
+    @classmethod
+    def from_dict(cls, payload):
+        if payload.get("kind") != "check_valve":
+            raise ValueError(
+                f"{cls.__name__}.from_dict: expected kind='check_valve', "
+                f"got {payload.get('kind')!r}."
+            )
+        return cls(Di=payload["Di_m"], K=payload["K"], name=payload.get("name"))
+
 
 # ---------------------------------------------------------------------------
 # Base_Contraction_Expansion
@@ -775,4 +890,25 @@ class Base_Contraction_Expansion:
             f"{self.__class__.__name__}("
             f"Di_US={US_q.to('inch'):.4f~P}, "
             f"Di_DS={DS_q.to('inch'):.4f~P})"
+        )
+
+    def to_dict(self):
+        return {
+            "kind":    "contraction_expansion",
+            "name":    self.name,
+            "Di_US_m": float(self.Di_US_si),
+            "Di_DS_m": float(self.Di_DS_si),
+        }
+
+    @classmethod
+    def from_dict(cls, payload):
+        if payload.get("kind") != "contraction_expansion":
+            raise ValueError(
+                f"{cls.__name__}.from_dict: expected kind='contraction_expansion', "
+                f"got {payload.get('kind')!r}."
+            )
+        return cls(
+            Di_US=payload["Di_US_m"],
+            Di_DS=payload["Di_DS_m"],
+            name=payload.get("name"),
         )

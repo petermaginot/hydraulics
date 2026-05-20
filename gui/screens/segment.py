@@ -13,6 +13,7 @@ chart is drawn.
 import os
 import traceback
 
+import gui.dialogs as dialogs
 import pyqtgraph as pg
 from PySide6.QtCore import Qt, Signal
 from PySide6.QtWidgets import (
@@ -315,7 +316,7 @@ class SegmentScreen(QWidget):
         self._sync_elev_vb_geom()
 
     def _error(self, title, exc):
-        QMessageBox.critical(
+        dialogs.critical(
             self, title,
             f"{type(exc).__name__}: {exc}\n\n{traceback.format_exc()}",
         )

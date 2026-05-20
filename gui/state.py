@@ -15,7 +15,9 @@ class AppState:
     # Set on the Start screen.  Determines which Line_Segment / Fluid classes
     # the later screens instantiate, or whether to route the user into the
     # network-topology screen instead.
-    flow_type: str = "incompressible"   # "incompressible", "compressible", or "network"
+    # "incompressible" / "compressible" -> point-to-point pipeline.
+    # "network" / "compressible_network" -> P&ID-style canvas.
+    flow_type: str = "incompressible"
 
     # Set on the Segment screen.  A fully-constructed Line_Segment of the
     # appropriate subclass (incompressible.Line_Segment or

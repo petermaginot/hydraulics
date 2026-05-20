@@ -1,0 +1,480 @@
+{
+  "format_version": 1,
+  "regime": "compressible",
+  "nodes": [
+    {
+      "name": "Source/Sink",
+      "elevation_m": 0.0,
+      "P_Pa": null,
+      "Q_ext": {
+        "magnitude": 10.0,
+        "unit": "mmscf / day"
+      },
+      "T_K": 310.9277777777778
+    },
+    {
+      "name": "Source/Sink 1",
+      "elevation_m": 0.0,
+      "P_Pa": 6894757.293168363,
+      "Q_ext": null,
+      "T_K": 283.15000000000003
+    },
+    {
+      "name": "Junction",
+      "elevation_m": 0.0,
+      "P_Pa": null,
+      "Q_ext": null
+    },
+    {
+      "name": "Junction 1",
+      "elevation_m": 0.0,
+      "P_Pa": null,
+      "Q_ext": null
+    },
+    {
+      "name": "Source/Sink 2",
+      "elevation_m": 0.0,
+      "P_Pa": null,
+      "Q_ext": {
+        "magnitude": 20.0,
+        "unit": "mmscf / day"
+      },
+      "T_K": 324.81666666666666
+    },
+    {
+      "name": "Junction 2",
+      "elevation_m": 0.0,
+      "P_Pa": null,
+      "Q_ext": null
+    }
+  ],
+  "edges": [
+    {
+      "name": "Source/Sink->Junction",
+      "from_node": "Source/Sink",
+      "to_node": "Junction",
+      "components": []
+    },
+    {
+      "name": "Junction->Junction 1",
+      "from_node": "Junction",
+      "to_node": "Junction 1",
+      "components": [
+        {
+          "kind": "line_segment",
+          "name": "Pipe Segment",
+          "roughness_m": 4.571999999999999e-05,
+          "noncircular": false,
+          "k_wall": null,
+          "profile": [
+            [
+              0.0,
+              0.0,
+              0.10226039999999999,
+              0.00821305735546811
+            ],
+            [
+              304.79999999999995,
+              15.239999999999998,
+              0.10226039999999999,
+              0.00821305735546811
+            ]
+          ]
+        }
+      ]
+    },
+    {
+      "name": "Junction->Junction 1#2",
+      "from_node": "Junction",
+      "to_node": "Junction 1",
+      "components": [
+        {
+          "kind": "line_segment",
+          "name": "Pipe Segment 1",
+          "roughness_m": 4.571999999999999e-05,
+          "noncircular": false,
+          "k_wall": null,
+          "profile": [
+            [
+              0.0,
+              0.0,
+              0.0779272,
+              0.0047694469787326055
+            ],
+            [
+              365.75999999999993,
+              15.239999999999998,
+              0.0779272,
+              0.0047694469787326055
+            ]
+          ]
+        }
+      ]
+    },
+    {
+      "name": "Junction->Junction 2",
+      "from_node": "Junction",
+      "to_node": "Junction 2",
+      "components": [
+        {
+          "kind": "line_segment",
+          "name": "Pipe Segment 2",
+          "roughness_m": 4.571999999999999e-05,
+          "noncircular": false,
+          "k_wall": null,
+          "profile": [
+            [
+              0.0,
+              0.0,
+              0.10226039999999999,
+              0.00821305735546811
+            ],
+            [
+              304.79999999999995,
+              0.0,
+              0.10226039999999999,
+              0.00821305735546811
+            ]
+          ]
+        },
+        {
+          "kind": "check_valve",
+          "name": "Check Valve",
+          "Di_m": 0.10226039999999999,
+          "K": 1.6209233081014838
+        }
+      ]
+    },
+    {
+      "name": "Junction 1->Source/Sink 1",
+      "from_node": "Junction 1",
+      "to_node": "Source/Sink 1",
+      "components": []
+    },
+    {
+      "name": "Source/Sink 2->Junction 2",
+      "from_node": "Source/Sink 2",
+      "to_node": "Junction 2",
+      "components": []
+    },
+    {
+      "name": "Junction 2->Junction 1",
+      "from_node": "Junction 2",
+      "to_node": "Junction 1",
+      "components": [
+        {
+          "kind": "line_segment",
+          "name": "Pipe Segment 3",
+          "roughness_m": 4.571999999999999e-05,
+          "noncircular": false,
+          "k_wall": null,
+          "profile": [
+            [
+              0.0,
+              0.0,
+              0.10226039999999999,
+              0.00821305735546811
+            ],
+            [
+              304.79999999999995,
+              15.239999999999998,
+              0.10226039999999999,
+              0.00821305735546811
+            ]
+          ]
+        }
+      ]
+    }
+  ],
+  "gui_extras": {
+    "canvas_nodes": [
+      {
+        "id": "0x16c6cb4c830",
+        "name": "Source/Sink",
+        "pos": [
+          -626.201875964334,
+          405.0489718388629
+        ],
+        "spec": {
+          "type": "source_sink",
+          "P_str": "",
+          "P_unit": "psi",
+          "Q_str": "10",
+          "Q_unit": "mmscf/day",
+          "elev_str": "0",
+          "elev_unit": "ft",
+          "T_str": "100",
+          "T_unit": "degF"
+        }
+      },
+      {
+        "id": "0x16c6a42ec10",
+        "name": "Source/Sink 1",
+        "pos": [
+          1307.6164553962637,
+          388.05578634578984
+        ],
+        "spec": {
+          "type": "source_sink",
+          "P_str": "1000",
+          "P_unit": "psi",
+          "Q_str": "",
+          "Q_unit": "mmscf/day",
+          "elev_str": "0",
+          "elev_unit": "ft",
+          "T_str": "50",
+          "T_unit": "degF"
+        }
+      },
+      {
+        "id": "0x16c6a42efd0",
+        "name": "Junction",
+        "pos": [
+          -314.4726407206741,
+          385.2884484112992
+        ],
+        "spec": {
+          "type": "junction",
+          "elev_str": "0",
+          "elev_unit": "ft"
+        }
+      },
+      {
+        "id": "0x16c6a598d60",
+        "name": "Pipe Segment",
+        "pos": [
+          503.7174330853601,
+          207.0119718728283
+        ],
+        "spec": {
+          "type": "pipe",
+          "mode": "manual",
+          "ID_str": "4.026",
+          "ID_unit": "inch",
+          "OD_str": "",
+          "OD_unit": "inch",
+          "WT_str": "",
+          "WT_unit": "inch",
+          "L_str": "1000",
+          "L_unit": "ft",
+          "dz_str": "50",
+          "dz_unit": "ft",
+          "rough_str": "0.00015",
+          "rough_unit": "ft"
+        }
+      },
+      {
+        "id": "0x16c6a598e90",
+        "name": "Pipe Segment 1",
+        "pos": [
+          498.5004908291845,
+          471.10121225746184
+        ],
+        "spec": {
+          "type": "pipe",
+          "mode": "manual",
+          "ID_str": "3.068",
+          "ID_unit": "inch",
+          "OD_str": "",
+          "OD_unit": "inch",
+          "WT_str": "",
+          "WT_unit": "inch",
+          "L_str": "1200",
+          "L_unit": "ft",
+          "dz_str": "50",
+          "dz_unit": "ft",
+          "rough_str": "0.00015",
+          "rough_unit": "ft"
+        }
+      },
+      {
+        "id": "0x16c6a598fc0",
+        "name": "Junction 1",
+        "pos": [
+          995.4560392773361,
+          394.9289706325099
+        ],
+        "spec": {
+          "type": "junction",
+          "elev_str": "0",
+          "elev_unit": "ft"
+        }
+      },
+      {
+        "id": "0x16c6a599480",
+        "name": "Source/Sink 2",
+        "pos": [
+          134.36358948475473,
+          -187.7517925620716
+        ],
+        "spec": {
+          "type": "source_sink",
+          "P_str": "",
+          "P_unit": "psi",
+          "Q_str": "20",
+          "Q_unit": "mmscf/day",
+          "elev_str": "0",
+          "elev_unit": "ft",
+          "T_str": "125",
+          "T_unit": "degF"
+        }
+      },
+      {
+        "id": "0x16c6a599350",
+        "name": "Junction 2",
+        "pos": [
+          523.1926203476255,
+          -80.15756236134118
+        ],
+        "spec": {
+          "type": "junction",
+          "elev_str": "0",
+          "elev_unit": "ft"
+        }
+      },
+      {
+        "id": "0x16c6a5995b0",
+        "name": "Pipe Segment 2",
+        "pos": [
+          -46.95039788387771,
+          178.10597287479482
+        ],
+        "spec": {
+          "type": "pipe",
+          "mode": "manual",
+          "ID_str": "4.026",
+          "ID_unit": "inch",
+          "OD_str": "",
+          "OD_unit": "inch",
+          "WT_str": "",
+          "WT_unit": "inch",
+          "L_str": "1000",
+          "L_unit": "ft",
+          "dz_str": "0",
+          "dz_unit": "ft",
+          "rough_str": "0.00015",
+          "rough_unit": "ft"
+        }
+      },
+      {
+        "id": "0x16c6a599810",
+        "name": "Pipe Segment 3",
+        "pos": [
+          789.0542488726688,
+          51.764197177816925
+        ],
+        "spec": {
+          "type": "pipe",
+          "mode": "manual",
+          "ID_str": "4.026",
+          "ID_unit": "inch",
+          "OD_str": "",
+          "OD_unit": "inch",
+          "WT_str": "",
+          "WT_unit": "inch",
+          "L_str": "1000",
+          "L_unit": "ft",
+          "dz_str": "50",
+          "dz_unit": "ft",
+          "rough_str": "0.00015",
+          "rough_unit": "ft"
+        }
+      },
+      {
+        "id": "0x16c6a599220",
+        "name": "Check Valve",
+        "pos": [
+          239.49462461711332,
+          17.372667070671433
+        ],
+        "spec": {
+          "type": "check_valve",
+          "cv_type": "swing",
+          "D_str": "4.026",
+          "D_unit": "inch",
+          "angled_str": "1",
+          "angle_str": "",
+          "style_str": "",
+          "D1_str": "",
+          "D1_unit": "inch",
+          "D2_str": "",
+          "D2_unit": "inch"
+        }
+      }
+    ],
+    "canvas_connections": [
+      {
+        "from_id": "0x16c6cb4c830",
+        "from_port": "out",
+        "to_id": "0x16c6a42efd0",
+        "to_port": "in"
+      },
+      {
+        "from_id": "0x16c6a42efd0",
+        "from_port": "out",
+        "to_id": "0x16c6a598d60",
+        "to_port": "in"
+      },
+      {
+        "from_id": "0x16c6a42efd0",
+        "from_port": "out",
+        "to_id": "0x16c6a598e90",
+        "to_port": "in"
+      },
+      {
+        "from_id": "0x16c6a42efd0",
+        "from_port": "out",
+        "to_id": "0x16c6a5995b0",
+        "to_port": "in"
+      },
+      {
+        "from_id": "0x16c6a598d60",
+        "from_port": "out",
+        "to_id": "0x16c6a598fc0",
+        "to_port": "in"
+      },
+      {
+        "from_id": "0x16c6a598e90",
+        "from_port": "out",
+        "to_id": "0x16c6a598fc0",
+        "to_port": "in"
+      },
+      {
+        "from_id": "0x16c6a598fc0",
+        "from_port": "out",
+        "to_id": "0x16c6a42ec10",
+        "to_port": "in"
+      },
+      {
+        "from_id": "0x16c6a599480",
+        "from_port": "out",
+        "to_id": "0x16c6a599350",
+        "to_port": "in"
+      },
+      {
+        "from_id": "0x16c6a599350",
+        "from_port": "out",
+        "to_id": "0x16c6a599810",
+        "to_port": "in"
+      },
+      {
+        "from_id": "0x16c6a5995b0",
+        "from_port": "out",
+        "to_id": "0x16c6a599220",
+        "to_port": "in"
+      },
+      {
+        "from_id": "0x16c6a599810",
+        "from_port": "out",
+        "to_id": "0x16c6a598fc0",
+        "to_port": "in"
+      },
+      {
+        "from_id": "0x16c6a599220",
+        "from_port": "out",
+        "to_id": "0x16c6a599350",
+        "to_port": "in"
+      }
+    ]
+  }
+}

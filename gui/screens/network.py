@@ -28,6 +28,7 @@ Layout:
 
 import gui._compat   # noqa: F401  -- must import before NodeGraphQt
 
+import math
 import os
 import traceback
 
@@ -49,6 +50,9 @@ from PySide6.QtWidgets import (
     QVBoxLayout,
     QWidget,
 )
+
+import gui.dialogs as dialogs
+from gui.dialogs import NodeResultsDialog, PipeProfileWindow
 
 from NodeGraphQt import BaseNode, NodeGraph
 
@@ -86,7 +90,8 @@ class SourceSinkNode(BaseNode):
 
     Multi-connection in and out ports so a single Source/Sink can serve
     as the start/end of multiple chains (e.g. a manifold).  Result widgets
-    show the solved pressure and the (specified or derived) external flow.
+    show the solved pressure, the solved temperature (compressible only;
+    left blank otherwise), and the (specified or derived) external flow.
     """
     __identifier__ = "pipe"
     NODE_NAME = "Source/Sink"
@@ -99,6 +104,7 @@ class SourceSinkNode(BaseNode):
             "P_result", label="", text="",
             placeholder_text="(solve to see)",
         )
+        self.add_text_input("T_result", label="", text="")
         self.add_text_input("Q_result", label="", text="")
 
 
@@ -106,7 +112,8 @@ class JunctionNode(BaseNode):
     """Interior splitter / merger.
 
     No boundary condition; the only spec the user can set is the
-    (decorative) elevation.  Result widget shows the solved pressure.
+    (decorative) elevation.  Result widgets show the solved pressure
+    and (compressible only) the solved temperature.
     """
     __identifier__ = "pipe"
     NODE_NAME = "Junction"
@@ -119,6 +126,7 @@ class JunctionNode(BaseNode):
             "P_result", label="", text="",
             placeholder_text="(solve to see)",
         )
+        self.add_text_input("T_result", label="", text="")
 
 
 class PipeSegmentNode(BaseNode):
@@ -126,7 +134,9 @@ class PipeSegmentNode(BaseNode):
 
     Single in + single out (no branching).  Stored geometry feeds a
     Line_Segment built at solve time and dropped into the solver Edge's
-    component list.  Result widgets show the segment's dP and signed flow.
+    component list.  Result widgets show the segment's dP (incompressible)
+    or outlet P (compressible), outlet T (compressible only), and signed
+    flow.  Widgets the active regime doesn't populate are left blank.
     """
     __identifier__ = "pipe"
     NODE_NAME = "Pipe Segment"
@@ -139,6 +149,7 @@ class PipeSegmentNode(BaseNode):
             "dP_result", label="", text="",
             placeholder_text="(solve to see)",
         )
+        self.add_text_input("T_result", label="", text="")
         self.add_text_input("Q_result", label="", text="")
 
 
@@ -146,7 +157,8 @@ class FittingNode(BaseNode):
     """Inline fitting (bend or sudden contraction/expansion).
 
     Single in + single out.  Stored parameters feed a Bend or
-    Contraction_Expansion built at solve time.
+    Contraction_Expansion built at solve time.  Result widget set matches
+    PipeSegmentNode.
     """
     __identifier__ = "pipe"
     NODE_NAME = "Fitting"
@@ -159,6 +171,7 @@ class FittingNode(BaseNode):
             "dP_result", label="", text="",
             placeholder_text="(solve to see)",
         )
+        self.add_text_input("T_result", label="", text="")
         self.add_text_input("Q_result", label="", text="")
 
 
@@ -166,7 +179,8 @@ class ValveNode(BaseNode):
     """Inline valve fitting (globe or gate).
 
     Single in + single out.  Stored parameters feed a Valve built at
-    solve time via the Crane K-factor correlations.
+    solve time via the Crane K-factor correlations.  Result widget set
+    matches PipeSegmentNode.
     """
     __identifier__ = "pipe"
     NODE_NAME = "Valve"
@@ -179,6 +193,7 @@ class ValveNode(BaseNode):
             "dP_result", label="", text="",
             placeholder_text="(solve to see)",
         )
+        self.add_text_input("T_result", label="", text="")
         self.add_text_input("Q_result", label="", text="")
 
 
@@ -187,6 +202,7 @@ class CheckValveNode(BaseNode):
 
     Single in + single out.  Forward K from Crane correlations;
     reverse K = _SEALING_K (handled by _reversed_component in network.py).
+    Result widget set matches PipeSegmentNode.
     """
     __identifier__ = "pipe"
     NODE_NAME = "Check Valve"
@@ -199,6 +215,7 @@ class CheckValveNode(BaseNode):
             "dP_result", label="", text="",
             placeholder_text="(solve to see)",
         )
+        self.add_text_input("T_result", label="", text="")
         self.add_text_input("Q_result", label="", text="")
 
 
@@ -208,6 +225,20 @@ class CheckValveNode(BaseNode):
 
 class NetworkScreen(QWidget):
     back_clicked = Signal()
+
+    # Class-level config knobs.  CompressibleNetworkScreen overrides these
+    # to swap in the compressible Line_Segment, the Compressible_Network
+    # solver, and the compressible flow-rate unit list.  Everything else
+    # (canvas, node editors, chain walking, CSV loading) is shared.
+    LINE_SEGMENT_CLS     = Line_Segment
+    BEND_CLS             = Bend
+    VALVE_CLS            = Valve
+    CHECKVALVE_CLS       = CheckValve
+    CONTRACTION_EXP_CLS  = Contraction_Expansion
+    NETWORK_CLS          = Network
+    DISPLAY_FLOW_UNITS   = U.FLOW_RATE_INCOMPRESSIBLE
+    DISPLAY_FLOW_DEFAULT = "BBL/D"
+    FLUID_BOX_TITLE      = "Fluid (incompressible)"
 
     def __init__(self, state, parent=None):
         super().__init__(parent)
@@ -222,6 +253,18 @@ class NetworkScreen(QWidget):
         # last solve, so result.component(seg) can be looked up to render
         # per-pipe dP and flow on the canvas.
         self._pipe_components = {}
+        # Maps an inline-node id (pipe/fitting/valve/check_valve) to the
+        # name of the solver Edge its chain was assembled into.  Used by
+        # the compressible subclass to render per-block flow when the
+        # solver result is a flat dict (no NetworkResult.component()).
+        self._pipe_edge_names = {}
+        # Maps an inline-node id to its 0-based position within its edge's
+        # ORIGINAL components list (i.e. the from_node -> to_node order
+        # the chain was walked in at network-build time).  The compressible
+        # screen indexes solver result["component_outlet_PT"][edge_name]
+        # with this to recover the flow-direction outlet (P, T) of each
+        # inline block.
+        self._inline_chain_pos = {}
         # Last successful solve, retained so the display-unit selectors can
         # re-render the canvas + text panel without re-solving.
         self._last_net    = None
@@ -256,8 +299,18 @@ class NetworkScreen(QWidget):
         add_cv_btn.clicked.connect(self._add_check_valve)
         del_btn       = QPushButton("- Delete selected")
         del_btn.clicked.connect(self._delete_selected)
-        solve_btn     = QPushButton("Solve")
-        solve_btn.clicked.connect(self._solve)
+        save_btn      = QPushButton("Save...")
+        save_btn.clicked.connect(self._on_save_network)
+        load_btn      = QPushButton("Load...")
+        load_btn.clicked.connect(self._on_load_network)
+        # Save Results is enabled only after a successful solve; the
+        # _last_result is None check inside the handler guards it but we
+        # also disable the button visually until then.
+        self._save_results_btn = QPushButton("Save Results...")
+        self._save_results_btn.clicked.connect(self._on_save_results)
+        self._save_results_btn.setEnabled(False)
+        self._solve_btn = QPushButton("Solve")
+        self._solve_btn.clicked.connect(self._solve)
 
         toolbar = QHBoxLayout()
         toolbar.addWidget(add_src_btn)
@@ -268,7 +321,10 @@ class NetworkScreen(QWidget):
         toolbar.addWidget(add_cv_btn)
         toolbar.addWidget(del_btn)
         toolbar.addStretch()
-        toolbar.addWidget(solve_btn)
+        toolbar.addWidget(save_btn)
+        toolbar.addWidget(load_btn)
+        toolbar.addWidget(self._save_results_btn)
+        toolbar.addWidget(self._solve_btn)
 
         # ---- Side panel ----
         self._build_fluid_box()
@@ -308,14 +364,15 @@ class NetworkScreen(QWidget):
     # Default spec dicts
     # ------------------------------------------------------------------
 
-    @staticmethod
-    def _default_source_sink_fields():
-        return {
+    def _default_source_sink_fields(self):
+        spec = {
             "type":      "source_sink",
             "P_str":     "",   "P_unit":    "psi",
-            "Q_str":     "",   "Q_unit":    "BBL/D",
+            "Q_str":     "",   "Q_unit":    self.DISPLAY_FLOW_DEFAULT,
             "elev_str":  "0",  "elev_unit": "ft",
         }
+        spec.update(self._default_source_sink_extra())
+        return spec
 
     @staticmethod
     def _default_junction_fields():
@@ -383,12 +440,18 @@ class NetworkScreen(QWidget):
     # ------------------------------------------------------------------
 
     def _build_fluid_box(self):
+        """Build the side-panel fluid box.
+
+        Default (incompressible) layout has density / viscosity fields.
+        CompressibleNetworkScreen overrides this to show a composition
+        summary read from AppState instead.
+        """
         self.f_density   = _LabeledField("62.4", U.DENSITY,   "lb/ft^3")
         self.f_viscosity = _LabeledField("1.0",  U.VISCOSITY, "cP")
         form = QFormLayout()
         form.addRow("Density:",   self.f_density.widget())
         form.addRow("Viscosity:", self.f_viscosity.widget())
-        self.fluid_box = QGroupBox("Fluid (incompressible)")
+        self.fluid_box = QGroupBox(self.FLUID_BOX_TITLE)
         self.fluid_box.setLayout(form)
 
     def _build_editor_stack(self):
@@ -420,9 +483,11 @@ class NetworkScreen(QWidget):
 
     def _build_source_sink_editor(self):
         self.ss_name = QLineEdit()
-        self.ss_P    = _LabeledField("",  U.PRESSURE,                "psi")
-        self.ss_Q    = _LabeledField("",  U.FLOW_RATE_INCOMPRESSIBLE, "BBL/D")
-        self.ss_elev = _LabeledField("0", U.LENGTH,                  "ft")
+        self.ss_P    = _LabeledField("",  U.PRESSURE,           "psi")
+        self.ss_Q    = _LabeledField(
+            "",  self.DISPLAY_FLOW_UNITS, self.DISPLAY_FLOW_DEFAULT,
+        )
+        self.ss_elev = _LabeledField("0", U.LENGTH,             "ft")
         self.ss_apply = QPushButton("Apply")
         self.ss_apply.clicked.connect(self._apply_source_sink_edits)
 
@@ -439,8 +504,10 @@ class NetworkScreen(QWidget):
 
         form = QFormLayout()
         form.addRow("Name:",       self.ss_name)
-        form.addRow("P:",          self.ss_P.widget())
-        form.addRow("Q_ext:",      self.ss_Q.widget())
+        form.addRow("Pressure:",          self.ss_P.widget())
+        form.addRow("Flow Rate:",      self.ss_Q.widget())
+        # Subclass hook: lets CompressibleNetworkScreen add a T row here.
+        self._add_extra_source_sink_rows(form)
         form.addRow("Elevation:",  self.ss_elev.widget())
 
         hint = QLabel(
@@ -504,6 +571,9 @@ class NetworkScreen(QWidget):
         self.p_rough  = _LabeledField("0.00015", U.ROUGHNESS, "ft")
         self.p_apply  = QPushButton("Apply")
         self.p_apply.clicked.connect(self._apply_pipe_edits)
+        self.p_details_btn = QPushButton("Show solved details...")
+        self.p_details_btn.clicked.connect(self._show_current_node_details)
+        self.p_details_btn.setVisible(False)
 
         csv_row = QHBoxLayout()
         csv_row.addWidget(self.p_csv_btn)
@@ -525,6 +595,7 @@ class NetworkScreen(QWidget):
         v.addLayout(form)
         v.addLayout(csv_row)
         v.addWidget(self.p_apply)
+        v.addWidget(self.p_details_btn)
         v.addStretch()
         self.editor_stack.addWidget(page)
 
@@ -580,6 +651,9 @@ class NetworkScreen(QWidget):
 
         self.fit_apply = QPushButton("Apply")
         self.fit_apply.clicked.connect(self._apply_fitting_edits)
+        self.fit_details_btn = QPushButton("Show solved details...")
+        self.fit_details_btn.clicked.connect(self._show_current_node_details)
+        self.fit_details_btn.setVisible(False)
 
         top_form = QFormLayout()
         top_form.addRow("Name:", self.fit_name)
@@ -590,6 +664,7 @@ class NetworkScreen(QWidget):
         v.addLayout(top_form)
         v.addWidget(self.fit_input_stack)
         v.addWidget(self.fit_apply)
+        v.addWidget(self.fit_details_btn)
         v.addStretch()
         self.editor_stack.addWidget(page)
 
@@ -716,6 +791,9 @@ class NetworkScreen(QWidget):
 
         self.valve_apply = QPushButton("Apply")
         self.valve_apply.clicked.connect(self._apply_valve_edits)
+        self.valve_details_btn = QPushButton("Show solved details...")
+        self.valve_details_btn.clicked.connect(self._show_current_node_details)
+        self.valve_details_btn.setVisible(False)
 
         top_form = QFormLayout()
         top_form.addRow("Name:", self.valve_name)
@@ -726,6 +804,7 @@ class NetworkScreen(QWidget):
         v.addLayout(top_form)
         v.addWidget(self.valve_input_stack)
         v.addWidget(self.valve_apply)
+        v.addWidget(self.valve_details_btn)
         v.addStretch()
         self.editor_stack.addWidget(page)
 
@@ -847,6 +926,9 @@ class NetworkScreen(QWidget):
 
         self.cv_apply = QPushButton("Apply")
         self.cv_apply.clicked.connect(self._apply_check_valve_edits)
+        self.cv_details_btn = QPushButton("Show solved details...")
+        self.cv_details_btn.clicked.connect(self._show_current_node_details)
+        self.cv_details_btn.setVisible(False)
 
         top_form = QFormLayout()
         top_form.addRow("Name:", self.cv_name)
@@ -857,6 +939,7 @@ class NetworkScreen(QWidget):
         v.addLayout(top_form)
         v.addWidget(self.cv_input_stack)
         v.addWidget(self.cv_apply)
+        v.addWidget(self.cv_details_btn)
         v.addStretch()
         self.editor_stack.addWidget(page)
 
@@ -871,8 +954,8 @@ class NetworkScreen(QWidget):
             self._rerender_with_current_units
         )
         self.d_flow = QComboBox()
-        self.d_flow.addItems(U.FLOW_RATE_INCOMPRESSIBLE)
-        self.d_flow.setCurrentText("BBL/D")
+        self.d_flow.addItems(self.DISPLAY_FLOW_UNITS)
+        self.d_flow.setCurrentText(self.DISPLAY_FLOW_DEFAULT)
         self.d_flow.currentTextChanged.connect(
             self._rerender_with_current_units
         )
@@ -880,8 +963,19 @@ class NetworkScreen(QWidget):
         form = QFormLayout()
         form.addRow("Pressure:", self.d_pressure)
         form.addRow("Flow:",     self.d_flow)
+        # Subclass hook: compressible adds a Temperature row here.
+        self._add_extra_display_unit_rows(form)
         self.display_box = QGroupBox("Result display units")
         self.display_box.setLayout(form)
+
+    def _add_extra_display_unit_rows(self, form):
+        """Hook for subclasses to append rows to the display-units form.
+
+        The default no-op keeps the incompressible screen at just
+        Pressure + Flow.  CompressibleNetworkScreen overrides to add
+        a Temperature combo.
+        """
+        return
 
     def _build_results_box(self):
         self.results_text = QPlainTextEdit()
@@ -930,6 +1024,7 @@ class NetworkScreen(QWidget):
         for nid in node_ids:
             self.node_specs.pop(nid, None)
             self._pipe_components.pop(nid, None)
+            self._pipe_edge_names.pop(nid, None)
         if self._cur_node is not None and self._cur_node.id in node_ids:
             self._cur_node = None
         self._sync_editor_to_selection()
@@ -950,6 +1045,7 @@ class NetworkScreen(QWidget):
         if n is None or n.id not in self.node_specs:
             self.editor_stack.setCurrentIndex(0)
             self.editor_box.setTitle("Selected node: (none)")
+            self._refresh_details_button_visibility()
             return
         spec = self.node_specs[n.id]
         t = spec.get("type")
@@ -960,9 +1056,13 @@ class NetworkScreen(QWidget):
             self.ss_P.edit.setText(spec.get("P_str", ""))
             self.ss_P.combo.setCurrentText(spec.get("P_unit", "psi"))
             self.ss_Q.edit.setText(spec.get("Q_str", ""))
-            self.ss_Q.combo.setCurrentText(spec.get("Q_unit", "BBL/D"))
+            self.ss_Q.combo.setCurrentText(
+                spec.get("Q_unit", self.DISPLAY_FLOW_DEFAULT)
+            )
             self.ss_elev.edit.setText(spec.get("elev_str", "0"))
             self.ss_elev.combo.setCurrentText(spec.get("elev_unit", "ft"))
+            # Subclass hook: populate any extra widgets (e.g. T for compressible).
+            self._sync_source_sink_extra(spec)
             self._update_PQ_exclusivity()
         elif t == "junction":
             self.editor_stack.setCurrentIndex(2)
@@ -1053,6 +1153,7 @@ class NetworkScreen(QWidget):
             self.cv_globestop_style.setCurrentIndex(style_idx)
         else:
             self.editor_stack.setCurrentIndex(0)
+        self._refresh_details_button_visibility()
 
     def _sync_pipe_editor_to_spec(self, spec):
         # Roughness is always user-editable, regardless of mode.
@@ -1124,7 +1225,7 @@ class NetworkScreen(QWidget):
         new_name = self.ss_name.text().strip()
         if new_name and new_name != n.name():
             n.set_name(new_name)
-        self.node_specs[n.id] = {
+        spec = {
             "type":      "source_sink",
             "P_str":     self.ss_P.edit.text().strip(),
             "P_unit":    self.ss_P.combo.currentText(),
@@ -1133,6 +1234,9 @@ class NetworkScreen(QWidget):
             "elev_str":  self.ss_elev.edit.text().strip() or "0",
             "elev_unit": self.ss_elev.combo.currentText(),
         }
+        # Subclass hook: mutate spec to include extra fields (e.g. T).
+        self._apply_source_sink_extra(spec)
+        self.node_specs[n.id] = spec
         self.editor_box.setTitle(f"Selected node: {n.name()}  [Source/Sink]")
 
     def _apply_junction_edits(self):
@@ -1375,16 +1479,16 @@ class NetworkScreen(QWidget):
             # roughness value is discarded -- only the parsed profile
             # matters.  The real roughness is read from the editor at
             # solve time.
-            tmp_seg = Line_Segment.from_csv(path, roughness=1e-6)
+            tmp_seg = self.LINE_SEGMENT_CLS.from_csv(path, roughness=1e-6)
         except Exception as e:
-            QMessageBox.critical(
+            dialogs.critical(
                 self, "Could not load CSV", f"{type(e).__name__}: {e}",
             )
             return
         profile = list(tmp_seg.profile)
         if not profile:
-            QMessageBox.critical(self, "Could not load CSV",
-                                 "CSV produced an empty profile.")
+            dialogs.critical(self, "Could not load CSV",
+                             "CSV produced an empty profile.")
             return
         spec = self.node_specs[n.id]
         spec["mode"]        = "csv"
@@ -1407,24 +1511,178 @@ class NetworkScreen(QWidget):
     # ------------------------------------------------------------------
 
     def _solve(self):
+        # Disable Solve while the solver is running.  The compressible
+        # subclass pumps QApplication.processEvents() from its progress
+        # callback so the UI can repaint mid-solve; without this guard a
+        # second click would re-enter _solve.
+        self._solve_btn.setEnabled(False)
         try:
-            fluid  = self._build_fluid()
-            net    = self._build_network()
-            result = net.solve(fluid)
+            try:
+                fluid  = self._build_fluid()
+                net    = self._build_network()
+                result = self._solve_network(net, fluid)
+            except Exception as e:
+                dialogs.critical(
+                    self, "Solve failed",
+                    f"{type(e).__name__}: {e}\n\n{traceback.format_exc()}",
+                )
+                return
+            self._render_results(net, result)
+        finally:
+            self._solve_btn.setEnabled(True)
+
+    # ------------------------------------------------------------------
+    # Save / Load network + Save Results.
+    #
+    # The file format lives in network.py (Network.to_dict / from_dict
+    # and NetworkResult.save_bundle); this layer just wraps those calls
+    # with a file picker, gui_extras capture, and a warning dialog for
+    # cross-regime loads.  See gui/persistence.py for the actual work.
+    # ------------------------------------------------------------------
+
+    def _on_save_network(self):
+        import gui.persistence as persistence
+        # Flush any pending in-editor edits the same way Solve does so a
+        # Save without a prior Apply still captures what the user sees.
+        self._flush_pending_editor_edits()
+        path, _ = QFileDialog.getSaveFileName(
+            self, "Save network", "",
+            "Hydraulics network (*.hydnet.json);;JSON (*.json);;All files (*)",
+        )
+        if not path:
+            return
+        if not path.lower().endswith(".json"):
+            path += ".hydnet.json"
+        try:
+            persistence.save_canvas(path, self)
         except Exception as e:
-            QMessageBox.critical(
-                self, "Solve failed",
+            dialogs.critical(
+                self, "Save failed",
                 f"{type(e).__name__}: {e}\n\n{traceback.format_exc()}",
             )
             return
-        self._render_results(net, result)
+        QMessageBox.information(self, "Saved", f"Network saved to:\n{path}")
+
+    def _on_load_network(self):
+        import gui.persistence as persistence
+        path, _ = QFileDialog.getOpenFileName(
+            self, "Load network", "",
+            "Hydraulics network (*.hydnet.json *.json);;All files (*)",
+        )
+        if not path:
+            return
+        try:
+            warnings = persistence.load_canvas(path, self)
+        except Exception as e:
+            dialogs.critical(
+                self, "Load failed",
+                f"{type(e).__name__}: {e}\n\n{traceback.format_exc()}",
+            )
+            return
+        # Solve-related state was cleared by load_canvas; disable the
+        # Save Results button until the next successful solve.
+        self._save_results_btn.setEnabled(False)
+        if warnings:
+            QMessageBox.warning(
+                self, "Network loaded with warnings",
+                "\n\n".join(warnings),
+            )
+
+    def _on_save_results(self):
+        import gui.persistence as persistence
+        if self._last_net is None or self._last_result is None:
+            return
+        path = QFileDialog.getExistingDirectory(
+            self, "Choose directory for results bundle",
+        )
+        if not path:
+            return
+        try:
+            persistence.save_canvas_results(
+                path, self, self._last_net, self._last_result,
+            )
+        except Exception as e:
+            dialogs.critical(
+                self, "Save results failed",
+                f"{type(e).__name__}: {e}\n\n{traceback.format_exc()}",
+            )
+            return
+        QMessageBox.information(
+            self, "Saved", f"Results written to:\n{path}",
+        )
+
+    def _flush_pending_editor_edits(self):
+        """Mirror of the Apply-flush at the top of _build_network: push
+        whatever's in the active editor page back into node_specs so a
+        Save (or anything else that reads node_specs) sees fresh state."""
+        if self._cur_node is None:
+            return
+        t = self.node_specs.get(self._cur_node.id, {}).get("type")
+        if t == "source_sink":
+            self._apply_source_sink_edits()
+        elif t == "junction":
+            self._apply_junction_edits()
+        elif t == "pipe":
+            self._apply_pipe_edits()
+        elif t == "fitting":
+            self._apply_fitting_edits()
+        elif t == "valve":
+            self._apply_valve_edits()
+        elif t == "check_valve":
+            self._apply_check_valve_edits()
 
     def _build_fluid(self):
+        """Return the fluid object passed to the solver.
+
+        Default = Incompressible_Fluid built from the side-panel
+        density/viscosity inputs.  CompressibleNetworkScreen overrides
+        this to return the pre-built AbstractState from AppState.
+        """
         rho = self.f_density.quantity()
         mu  = self.f_viscosity.quantity()
         if rho is None or mu is None:
             raise ValueError("Density and viscosity are required.")
         return Incompressible_Fluid(density=rho, viscosity=mu)
+
+    def _solve_network(self, net, fluid):
+        """Call the underlying solver.  The default works for the
+        incompressible Network; the compressible subclass overrides to
+        pass extra kwargs (P_init, T_init, mdot_init_kgs) supported by
+        Compressible_Network.solve().
+        """
+        return net.solve(fluid)
+
+    # ------------------------------------------------------------------
+    # Subclass hooks (default no-ops, overridden by CompressibleNetworkScreen)
+    # ------------------------------------------------------------------
+
+    def _add_extra_source_sink_rows(self, form):
+        """Optional extra QFormLayout rows on the Source/Sink editor.
+
+        Called between the Q_ext row and the Elevation row.  Used by
+        the compressible subclass to add a T row.
+        """
+
+    def _default_source_sink_extra(self):
+        """Extra default-spec keys for new Source/Sink nodes.
+
+        Returned dict is merged into the standard source/sink defaults.
+        """
+        return {}
+
+    def _sync_source_sink_extra(self, spec):
+        """Push extra fields (e.g. T) from the spec dict into editor widgets."""
+
+    def _apply_source_sink_extra(self, spec):
+        """Mutate the in-progress source/sink spec dict to capture extra
+        editor fields (e.g. T) before it replaces node_specs[...]."""
+
+    def _extra_kwargs_for_boundary(self, spec, node_name):
+        """Optional extra kwargs to pass into net.add_node() for this node.
+
+        Used by the compressible subclass to forward T as a pint Quantity.
+        """
+        return {}
 
     def _build_network(self):
         # Push any pending in-editor changes into the spec dicts so a
@@ -1469,8 +1727,10 @@ class NetworkScreen(QWidget):
                 )
             seen_names.add(name)
 
-        net = Network()
+        net = self.NETWORK_CLS()
         self._pipe_components = {}
+        self._pipe_edge_names = {}
+        self._inline_chain_pos = {}
 
         # Add boundary nodes to the solver.
         for node in boundary_nodes:
@@ -1483,7 +1743,7 @@ class NetworkScreen(QWidget):
         for start_node in boundary_nodes:
             for out_port, targets in start_node.connected_output_nodes().items():
                 for target in targets:
-                    components, end_node = self._walk_chain(
+                    components, chain_node_ids, end_node = self._walk_chain(
                         target, visited_pipes, start_node.name(),
                     )
                     if end_node is None:
@@ -1500,6 +1760,9 @@ class NetworkScreen(QWidget):
                         edge_name, start_node.name(), end_node.name(),
                         components,
                     )
+                    for pos, nid in enumerate(chain_node_ids):
+                        self._pipe_edge_names[nid] = edge_name
+                        self._inline_chain_pos[nid] = pos
         return net
 
     def _kwargs_for_boundary(self, spec, node_name):
@@ -1524,21 +1787,26 @@ class NetworkScreen(QWidget):
         kwargs["elevation"] = ureg.Quantity(
             float(elev_str), U.to_pint(spec.get("elev_unit", "ft")),
         )
+        # Subclass hook: e.g. compressible adds T to source/sink boundaries.
+        kwargs.update(self._extra_kwargs_for_boundary(spec, node_name))
         return kwargs
 
     def _walk_chain(self, target_node, visited_pipes, source_name):
         """Walk forward through inline nodes (pipe/fitting/valve) starting at
         target_node, collecting components, until hitting a boundary node.
-        Returns (component_list, end_boundary_node) or (component_list, None).
+        Returns (component_list, chain_node_ids, end_boundary_node);
+        end_boundary_node is None if the chain dead-ended at an unknown
+        node type.
         """
-        components = []
+        components     = []
+        chain_node_ids = []
         cur = target_node
         while True:
             t = self.node_specs.get(cur.id, {}).get("type")
             if t in ("source_sink", "junction"):
-                return components, cur
+                return components, chain_node_ids, cur
             if t not in ("pipe", "fitting", "valve", "check_valve"):
-                return components, None
+                return components, chain_node_ids, None
             if cur.id in visited_pipes:
                 raise ValueError(
                     f"Node '{cur.name()}' is part of more than one chain "
@@ -1554,6 +1822,7 @@ class NetworkScreen(QWidget):
             else:
                 comp = self._build_check_valve_component(cur)
             self._pipe_components[cur.id] = comp
+            chain_node_ids.append(cur.id)
             components.append(comp)
             outs = []
             for port, targets in cur.connected_output_nodes().items():
@@ -1581,7 +1850,14 @@ class NetworkScreen(QWidget):
                     f"Pipe '{pipe_node.name()}': CSV mode but no profile "
                     f"loaded."
                 )
-            return Line_Segment(roughness=rough_q, profile=profile)
+            seg = self.LINE_SEGMENT_CLS(
+                roughness=rough_q, profile=profile, name=pipe_node.name(),
+            )
+            # Tag with csv source so net.save() can serialize it as a
+            # csv_path reference rather than the full profile (matches
+            # Line_Segment.from_csv() behavior).
+            seg._csv_path = spec.get("csv_path")
+            return seg
 
         def _opt(name):
             s = spec.get(f"{name}_str", "").strip()
@@ -1591,13 +1867,14 @@ class NetworkScreen(QWidget):
                 float(s), U.to_pint(spec.get(f"{name}_unit", "")),
             )
 
-        return Line_Segment(
+        return self.LINE_SEGMENT_CLS(
             roughness        = rough_q,
             id_val           = _opt("ID"),
             od_val           = _opt("OD"),
             wt_val           = _opt("WT"),
             length           = _opt("L"),
             elevation_change = _opt("dz"),
+            name             = pipe_node.name(),
         )
 
     def _build_fitting_component(self, node):
@@ -1614,7 +1891,7 @@ class NetworkScreen(QWidget):
             if not bend_dias_str:
                 raise ValueError(f"Fitting '{node.name()}': bend R/D ratio is required.")
             Di_q = ureg.Quantity(float(Di_str), U.to_pint(spec.get("Di_unit", "inch")))
-            return Bend(
+            return self.BEND_CLS(
                 Di=Di_q,
                 ang_deg=float(angle_str),
                 bend_dias=float(bend_dias_str),
@@ -1629,7 +1906,7 @@ class NetworkScreen(QWidget):
                 )
             Di_US_q = ureg.Quantity(float(Di_US_str), U.to_pint(spec.get("Di_US_unit", "inch")))
             Di_DS_q = ureg.Quantity(float(Di_DS_str), U.to_pint(spec.get("Di_DS_unit", "inch")))
-            return Contraction_Expansion(
+            return self.CONTRACTION_EXP_CLS(
                 Di_US=Di_US_q,
                 Di_DS=Di_DS_q,
                 name=node.name(),
@@ -1653,7 +1930,7 @@ class NetworkScreen(QWidget):
             K     = fluids.fittings.K_butterfly_valve_Crane(
                 D=D_q.to("m").magnitude, style=style,
             )
-            return Valve(Di=D_q, K=K, name=node.name())
+            return self.VALVE_CLS(Di=D_q, K=K, name=node.name())
 
         D1_q      = _qty("D1_str", "D1_unit")
         D2_q      = _qty("D2_str", "D2_unit")
@@ -1673,7 +1950,7 @@ class NetworkScreen(QWidget):
         else:  # ball
             K = fluids.fittings.K_ball_valve_Crane(D1=D1_si, D2=D2_si, angle=angle)
 
-        return Valve(Di=D2_q, K=K, name=node.name())
+        return self.VALVE_CLS(Di=D2_q, K=K, name=node.name())
 
     def _build_check_valve_component(self, node):
         spec = self.node_specs[node.id]
@@ -1693,7 +1970,7 @@ class NetworkScreen(QWidget):
             K      = fluids.fittings.K_swing_check_valve_Crane(
                 D=D_q.to("m").magnitude, angled=angled,
             )
-            return CheckValve(Di=D_q, K=K, name=node.name())
+            return self.CHECKVALVE_CLS(Di=D_q, K=K, name=node.name())
 
         if cvt == "lift":
             D1_q   = _qty("D1_str", "D1_unit")
@@ -1704,7 +1981,7 @@ class NetworkScreen(QWidget):
                 D2=D2_q.to("m").magnitude,
                 angled=angled,
             )
-            return CheckValve(Di=D2_q, K=K, name=node.name())
+            return self.CHECKVALVE_CLS(Di=D2_q, K=K, name=node.name())
 
         if cvt == "tilting_disk":
             D_q   = _qty("D_str", "D_unit")
@@ -1712,7 +1989,7 @@ class NetworkScreen(QWidget):
             K     = fluids.fittings.K_tilting_disk_check_valve_Crane(
                 D=D_q.to("m").magnitude, angle=angle,
             )
-            return CheckValve(Di=D_q, K=K, name=node.name())
+            return self.CHECKVALVE_CLS(Di=D_q, K=K, name=node.name())
 
         if cvt == "angle_stop":
             D1_q  = _qty("D1_str", "D1_unit")
@@ -1723,7 +2000,7 @@ class NetworkScreen(QWidget):
                 D2=D2_q.to("m").magnitude,
                 style=style,
             )
-            return CheckValve(Di=D2_q, K=K, name=node.name())
+            return self.CHECKVALVE_CLS(Di=D2_q, K=K, name=node.name())
 
         # globe_stop
         D1_q  = _qty("D1_str", "D1_unit")
@@ -1734,7 +2011,7 @@ class NetworkScreen(QWidget):
             D2=D2_q.to("m").magnitude,
             style=style,
         )
-        return CheckValve(Di=D2_q, K=K, name=node.name())
+        return self.CHECKVALVE_CLS(Di=D2_q, K=K, name=node.name())
 
     @staticmethod
     def _unique_edge_name(net, from_name, to_name):
@@ -1755,6 +2032,8 @@ class NetworkScreen(QWidget):
         self._last_net    = net
         self._last_result = result
         self._render_canvas_and_panel(net, result)
+        self._refresh_details_button_visibility()
+        self._save_results_btn.setEnabled(True)
 
     def _rerender_with_current_units(self):
         if self._last_result is None:
@@ -1883,3 +2162,240 @@ class NetworkScreen(QWidget):
             lines.append(f"  {name:<16} {val:>+14.4f}")
 
         self.results_text.setPlainText("\n".join(lines))
+
+    # ------------------------------------------------------------------
+    # Per-node solved-details inspector (button on inline editor pages)
+    # ------------------------------------------------------------------
+
+    _DETAILS_BTNS_BY_TYPE = {
+        "pipe":        "p_details_btn",
+        "fitting":     "fit_details_btn",
+        "valve":       "valve_details_btn",
+        "check_valve": "cv_details_btn",
+    }
+
+    def _refresh_details_button_visibility(self):
+        """Show the "Show solved details..." button on the active editor
+        page only when (a) the current node is an inline node and (b) we
+        have a usable solver result for it.  Called from selection-sync
+        and from _render_results.
+        """
+        # Always hide everything first; the active page will be re-shown
+        # below if eligible.
+        for attr in self._DETAILS_BTNS_BY_TYPE.values():
+            btn = getattr(self, attr, None)
+            if btn is not None:
+                btn.setVisible(False)
+        n = self._cur_node
+        if n is None or self._last_result is None:
+            return
+        spec = self.node_specs.get(n.id, {})
+        t = spec.get("type")
+        attr = self._DETAILS_BTNS_BY_TYPE.get(t)
+        if attr is None:
+            return
+        if not self._have_result_for_inline(n):
+            return
+        btn = getattr(self, attr, None)
+        if btn is not None:
+            btn.setVisible(True)
+
+    def _have_result_for_inline(self, node):
+        """Default predicate: an inline node has a result if it was bound
+        to a component during the last build_network.  Subclasses can
+        override if they need stricter checks."""
+        return node.id in self._pipe_components
+
+    def _show_current_node_details(self):
+        n = self._cur_node
+        if n is None or self._last_result is None:
+            return
+        t = self.node_specs.get(n.id, {}).get("type")
+        if t == "pipe":
+            rows, profile = self._pipe_details(n)
+            cb = (lambda points=profile, name=n.name():
+                  self._open_pipe_profile_window(name, points)) if profile else None
+            NodeResultsDialog(self, f"Pipe details: {n.name()}", rows, cb).exec()
+        elif t == "fitting":
+            rows = self._fitting_details(n)
+            NodeResultsDialog(self, f"Fitting details: {n.name()}", rows).exec()
+        elif t == "valve":
+            rows = self._valve_details(n)
+            NodeResultsDialog(self, f"Valve details: {n.name()}", rows).exec()
+        elif t == "check_valve":
+            rows = self._check_valve_details(n)
+            NodeResultsDialog(self, f"Check valve details: {n.name()}", rows).exec()
+
+    def _open_pipe_profile_window(self, node_name, profile_points):
+        # Keep a reference on self so the non-modal window isn't garbage-
+        # collected the moment _show_current_node_details returns.
+        win = PipeProfileWindow(
+            title=f"Profile: {node_name}",
+            profile_points=profile_points,
+            x_default="ft",
+            p_default=self.d_pressure.currentText(),
+            t_default=self._current_temp_unit_or_default(),
+            parent=self,
+        )
+        self._profile_windows = getattr(self, "_profile_windows", [])
+        self._profile_windows.append(win)
+        win.show()
+
+    def _current_temp_unit_or_default(self):
+        """Compressible subclass exposes d_temperature; the base doesn't."""
+        combo = getattr(self, "d_temperature", None)
+        return combo.currentText() if combo is not None else "degF"
+
+    # ------------------------------------------------------------------
+    # Per-type incompressible detail builders.  The compressible subclass
+    # overrides these because it sources data from the flat solver-result
+    # dict + the AbstractState rather than NetworkResult.component().
+    # ------------------------------------------------------------------
+
+    def _pipe_details(self, node):
+        """Return (rows, profile_points) for an incompressible pipe.
+
+        profile_points is the per-point list returned by
+        ComponentResult.pressure_profile() (already has distance_m, P_Pa,
+        v_ms keys) -- PipeProfileWindow consumes it directly.
+        """
+        comp = self._pipe_components[node.id]
+        cr   = self._last_result.component(comp)
+        profile = cr.pressure_profile()
+
+        P_unit = self.d_pressure.currentText()
+        v_unit = "ft/s"
+
+        v_in_str  = _fmt_velocity(profile[0]["v_ms"],  v_unit)
+        v_out_str = _fmt_velocity(profile[-1]["v_ms"], v_unit)
+        P_in_str  = _fmt_pressure(cr.P_in_Pa,  P_unit)
+        P_out_str = _fmt_pressure(cr.P_out_Pa, P_unit)
+        dP_str    = _fmt_pressure_signed(cr.dP_Pa, P_unit)
+        Q_str     = self._fmt_flow_for_details(cr.mdot_kgs, cr.Q_m3s)
+
+        rows = [
+            ("Mass flow:",    Q_str),
+            ("Inlet P:",      P_in_str),
+            ("Outlet P:",     P_out_str),
+            ("dP:",           dP_str),
+            ("Inlet vel.:",   v_in_str),
+            ("Outlet vel.:",  v_out_str),
+        ]
+        return rows, profile
+
+    def _fitting_details(self, node):
+        comp = self._pipe_components[node.id]
+        cr   = self._last_result.component(comp)
+        rho  = float(self._last_result.fluid.density_si)
+        D    = _fitting_velocity_diameter(comp)
+        v    = abs(cr.mdot_kgs) / (rho * math.pi * D * D / 4.0)
+
+        P_unit = self.d_pressure.currentText()
+        rows = [
+            ("Mass flow:", self._fmt_flow_for_details(cr.mdot_kgs, cr.Q_m3s)),
+            ("dP:",        _fmt_pressure_signed(cr.dP_Pa, P_unit)),
+            ("Velocity:",  _fmt_velocity_at_D(v, D)),
+        ]
+        return rows
+
+    def _valve_details(self, node):
+        comp = self._pipe_components[node.id]
+        cr   = self._last_result.component(comp)
+        rho  = float(self._last_result.fluid.density_si)
+        D    = self._valve_smallest_D_si(node)
+        v    = abs(cr.mdot_kgs) / (rho * math.pi * D * D / 4.0)
+
+        P_unit = self.d_pressure.currentText()
+        rows = [
+            ("K-factor:",   f"{comp.K:.3f}"),
+            ("Mass flow:",  self._fmt_flow_for_details(cr.mdot_kgs, cr.Q_m3s)),
+            ("dP:",         _fmt_pressure_signed(cr.dP_Pa, P_unit)),
+            ("Velocity:",   _fmt_velocity_at_D(v, D)),
+        ]
+        return rows
+
+    def _check_valve_details(self, node):
+        # Same shape as a regular valve; reuse so subclasses only override once.
+        return self._valve_details(node)
+
+    def _fmt_flow_for_details(self, mdot_kgs, Q_m3s):
+        """Format the edge mass flow using the screen's current flow-unit
+        selection, picking mass / volumetric source by dimensionality."""
+        unit = self.d_flow.currentText()
+        val  = self._convert_flow(mdot_kgs, Q_m3s, unit)
+        return f"{val:+.4g} {unit}"
+
+    def _valve_smallest_D_si(self, node):
+        """Smallest diameter in the flow path through this valve [m].
+
+        Reads the spec rather than the built Valve, because for reducer
+        types (globe/gate/plug/ball/lift/angle_stop/globe_stop) only D2
+        is preserved on the Valve instance and D1 (the seat bore, often
+        the smallest) lives only in the spec dict.
+        """
+        spec = self.node_specs[node.id]
+        t    = spec.get("type")
+        if t == "valve":
+            vt = spec.get("valve_type", "globe")
+            if vt == "butterfly":
+                return _qty_to_m(spec.get("D_str"), spec.get("D_unit", "inch"))
+            D1 = _qty_to_m(spec.get("D1_str"), spec.get("D1_unit", "inch"))
+            D2 = _qty_to_m(spec.get("D2_str"), spec.get("D2_unit", "inch"))
+            return min(D1, D2)
+        if t == "check_valve":
+            cvt = spec.get("cv_type", "swing")
+            if cvt in ("swing", "tilting_disk"):
+                return _qty_to_m(spec.get("D_str"), spec.get("D_unit", "inch"))
+            D1 = _qty_to_m(spec.get("D1_str"), spec.get("D1_unit", "inch"))
+            D2 = _qty_to_m(spec.get("D2_str"), spec.get("D2_unit", "inch"))
+            return min(D1, D2)
+        raise ValueError(f"_valve_smallest_D_si called on non-valve type {t!r}")
+
+
+# ---------------------------------------------------------------------------
+# Module-level formatters used by the details inspector (also reused by
+# CompressibleNetworkScreen so they live here, not on the class).
+# ---------------------------------------------------------------------------
+
+def _fmt_pressure(P_Pa, unit):
+    val = ureg.Quantity(P_Pa, "Pa").to(U.to_pint(unit)).magnitude
+    return f"{val:.3f} {unit}"
+
+
+def _fmt_pressure_signed(dP_Pa, unit):
+    val = ureg.Quantity(dP_Pa, "Pa").to(U.to_pint(unit)).magnitude
+    return f"{val:+.3f} {unit}"
+
+
+def _fmt_velocity(v_ms, unit):
+    val = ureg.Quantity(v_ms, "m/s").to(unit).magnitude
+    return f"{val:.3f} {unit}"
+
+
+def _fmt_velocity_at_D(v_ms, D_si):
+    """Velocity line tagged with the reference diameter in inches."""
+    D_in = ureg.Quantity(D_si, "m").to("inch").magnitude
+    return f"{_fmt_velocity(v_ms, 'ft/s')}  (at D = {D_in:.3f} in)"
+
+
+def _fmt_temperature(T_K, unit):
+    val = ureg.Quantity(T_K, "K").to(U.to_pint(unit)).magnitude
+    return f"{val:.3f} {unit}"
+
+
+def _qty_to_m(value_str, unit):
+    if value_str is None or value_str == "":
+        raise ValueError("missing diameter spec for velocity calculation")
+    return ureg.Quantity(float(value_str), U.to_pint(unit)).to("m").magnitude
+
+
+def _fitting_velocity_diameter(comp):
+    """Velocity-reference diameter for a fitting component [m].
+
+    Bend: the single pipe ID.
+    Contraction/Expansion: the smaller of upstream/downstream ID
+    (= max velocity point through the abrupt area change).
+    """
+    if hasattr(comp, "Di_US_si") and hasattr(comp, "Di_DS_si"):
+        return min(comp.Di_US_si, comp.Di_DS_si)
+    return comp.Di_si

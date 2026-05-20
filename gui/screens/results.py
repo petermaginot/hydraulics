@@ -3,6 +3,7 @@
 import traceback
 
 import CoolProp.CoolProp as CP
+import gui.dialogs as dialogs
 import pyqtgraph as pg
 from PySide6.QtCore import Qt, Signal
 from PySide6.QtWidgets import (
@@ -140,7 +141,7 @@ class ResultsScreen(QWidget):
                     for (d, P, T, v) in raw
                 ]
         except Exception as e:
-            QMessageBox.critical(
+            dialogs.critical(
                 self, "Calculation failed",
                 f"{type(e).__name__}: {e}\n\n{traceback.format_exc()}",
             )

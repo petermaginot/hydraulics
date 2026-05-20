@@ -29,6 +29,12 @@ Valve  (inherits Base_Valve)
     Adds dP_dT() using the pre-computed K-factor stored on the instance,
     delegating to compressible_K().
 
+CheckValve  (inherits Base_CheckValve)
+    Adds dP_dT() identical to Valve's, using the forward-flow K-factor
+    stored on the instance.  Carries check_valve=True from the base class,
+    so network._reversed_component substitutes K=1e9 under reverse flow
+    and the valve presents near-infinite resistance.
+
 Contraction_Expansion  (inherits Base_Contraction_Expansion)
     Adds dP_dT() using fluids.fittings.contraction_sharp() or
     diffuser_sharp() to obtain K, then delegates to
@@ -78,6 +84,11 @@ compressible_pipe_segment(abstract_state, mdot, dL, dz, D_h, roughness,
     Solves coupled dP/dL and dT/dL ODEs (or the isothermal dP/dL equation)
     using a forward-Euler step with a one-iteration energy-balance
     correction.  Updates the AbstractState in-place to outlet conditions.
+
+downsample_profile(profile, max_step_m=1000.0, ...)
+    Reduce a dense pipe profile to the points that actually matter for
+    compressible flow: diameter changes, polyline slope breaks, and a
+    spacing cap.  Returns a new profile list in the same 4-tuple format.
 """
 
 import csv
@@ -95,6 +106,7 @@ from component_classes import (
     Base_Bend,
     Base_Contraction_Expansion,
     Base_Valve,
+    Base_CheckValve,
     ureg,
 )
 
@@ -420,6 +432,114 @@ class Valve(Base_Valve):
         )
 
 
+# When network._reversed_component substitutes K = _SEALING_K (~ 1e9) on a
+# check-valve copy for a reverse-flow walk, the inertial compressible_K()
+# formula drives P_out and T_out to nonsense values (~ -5e9 Pa) that
+# CoolProp can't update against.  CheckValve.dP_dT short-circuits to a
+# clamped sealed-state outlet whenever K >= _SEALED_K_THRESHOLD: P_out is
+# pulled to _SEALED_P_OUT_FRACTION * P_in (floored at _SEALED_P_FLOOR_PA so
+# downstream components on the same edge don't see a sub-triple-point
+# state), T_out is left at T_in.  The big walked_outlet_P - P_node residual
+# still drives the network solver back toward mdot >= 0.
+_SEALED_K_THRESHOLD     = 1.0e6   # K above this is taken to be the sealing shadow
+_SEALED_P_OUT_FRACTION  = 0.5     # outlet P as fraction of inlet P
+_SEALED_P_FLOOR_PA      = 1.0e5   # absolute floor on outlet P [Pa]
+
+
+def _is_sealed_check_valve(component):
+    """True if `component` is a check-valve shadow carrying the sealing K
+    (substituted by network._reversed_component for reverse flow).  Used by
+    the compressible network walk to short-circuit any edge whose path
+    contains a sealed CV: walking downstream components at the clamped
+    sealed-state outlet (P pulled to a fraction of inlet P) puts them into
+    a low-density / high-velocity regime where compressible_pipe_segment
+    can fail to converge.
+    """
+    return (
+        getattr(component, "check_valve", False)
+        and getattr(component, "K", 0.0) >= _SEALED_K_THRESHOLD
+    )
+
+
+def _sealed_outlet_PT(P_in, T_in):
+    """Return (P_out, T_out) for a sealed-edge clamped outlet state.
+
+    Used by both CheckValve.dP_dT and the compressible network walk so the
+    clamp formula lives in exactly one place.
+    """
+    return (max(_SEALED_P_OUT_FRACTION * P_in, _SEALED_P_FLOOR_PA), T_in)
+
+
+class CheckValve(Base_CheckValve):
+    """Check valve with compressible pressure/temperature calculation.
+
+    Forward flow uses the K-factor stored on the instance and delegates to
+    compressible_K().  Reverse flow is handled upstream by
+    network._reversed_component, which returns a shallow copy with K replaced
+    by _SEALING_K (~ 1e9); dP_dT() detects that case (K >= _SEALED_K_THRESHOLD)
+    and short-circuits to a clamped sealed-state outlet instead of running
+    the inertial formula, which would otherwise produce an unphysical
+    negative P_out that crashes CoolProp.
+
+    Constructor arguments are identical to Base_CheckValve:
+        Di : pint Quantity or float (m if float).  Pipe inner diameter.
+        K  : float.  Forward-flow K-factor.
+    """
+
+    def dP_dT(
+        self,
+        abstract_state,
+        flow_rate,
+        T_cricondentherm=None,
+        P_cricondenbar=None,
+        T_critical=None,
+        P_critical=None,
+    ):
+        """Outlet conditions for a compressible fluid passing through the
+        check valve.
+
+        The caller must update abstract_state to the inlet (P, T) conditions
+        before calling.  Forward flow (physical K) delegates to
+        compressible_K().  Reverse flow (sealing K substituted by
+        _reversed_component) is short-circuited to a clamped sealed-state
+        outlet, see module-level _SEALED_* constants.
+
+        Args:
+            abstract_state : CoolProp AbstractState, pre-updated to inlet (P, T)
+                             by the caller.  Updated in-place on return.
+            flow_rate      : pint Quantity -- mass, molar, or volumetric flow.
+            T_cricondentherm,
+            P_cricondenbar,
+            T_critical,
+            P_critical     : optional precomputed phase-envelope limits,
+                             forwarded to compressible_K() / _safe_update_PT().
+
+        Returns:
+            None.  abstract_state is updated in place to outlet conditions.
+        """
+        AS   = abstract_state
+        mdot = _resolve_mdot(flow_rate, AS)
+
+        if self.K >= _SEALED_K_THRESHOLD:
+            P_out, T_out = _sealed_outlet_PT(AS.p(), AS.T())
+            _safe_update_PT(
+                AS, P_out, T_out,
+                T_cricondentherm, P_cricondenbar, T_critical, P_critical,
+            )
+            return
+
+        Di = self.Di_si
+        A  = math.pi * Di ** 2 / 4.0
+
+        compressible_K(
+            AS, mdot, A, self.K,
+            T_cricondentherm=T_cricondentherm,
+            P_cricondenbar=P_cricondenbar,
+            T_critical=T_critical,
+            P_critical=P_critical,
+        )
+
+
 class Contraction_Expansion(Base_Contraction_Expansion):
     """Abrupt contraction or expansion with compressible pressure/temperature
     calculation.
@@ -493,6 +613,112 @@ class Contraction_Expansion(Base_Contraction_Expansion):
             T_critical=T_critical,
             P_critical=P_critical,
         )
+
+
+# ---------------------------------------------------------------------------
+# Profile downsampling
+# ---------------------------------------------------------------------------
+
+def downsample_profile(profile, max_step_m=1000.0,
+                       slope_tol=1e-6, diameter_tol=1e-9):
+    """Downsample a pipe-segment profile, keeping only geometrically
+    meaningful points and enforcing a maximum spacing between them.
+
+    Profile is the list-of-tuples format used by Base_Line_Segment: each
+    row is (distance_m, elevation_m, D_h_m, flow_area_m2).  The same
+    format is returned, sorted by distance and starting at the first
+    row of the input.
+
+    Closely-spaced profile points dramatically slow compressible-flow
+    integrations because compressible_pipe_segment() is called once per
+    consecutive point pair.  This helper produces a coarser profile
+    that retains the features that actually affect the result:
+
+      * The first and last point are always kept.
+      * Both points bounding any diameter change are kept, so the
+        area-change correction sees the correct A_in/A_out.
+      * Any interior point whose left-slope (to its previous neighbor)
+        differs from its right-slope (to its next neighbor) by more
+        than slope_tol is kept -- i.e. grade breaks and other polyline
+        vertices.
+      * Between any two kept points whose spacing exceeds max_step_m,
+        evenly-spaced intermediate points are inserted from the
+        original profile to cap the spacing.
+
+    Args:
+        profile      : list of (dist_m, elev_m, D_h_m, A_m2) tuples,
+                       sorted by ascending distance.
+        max_step_m   : float, maximum allowed spacing [m] between
+                       retained points.  Default 1000.0.
+        slope_tol    : float, slope-difference threshold for declaring
+                       a polyline vertex (dimensionless m/m).
+                       Default 1e-6.
+        diameter_tol : float, |dD_h| threshold for declaring a
+                       diameter change [m].  Default 1e-9.
+
+    Returns:
+        New list of profile rows.  Always at least min(2, len(profile))
+        points.
+    """
+    n = len(profile)
+    if n <= 2:
+        return list(profile)
+
+    keep = [False] * n
+    keep[0]  = True
+    keep[-1] = True
+
+    # Diameter changes -- keep both sides of the step so an area-change
+    # correction can be applied across the discontinuity.
+    for i in range(1, n):
+        if abs(profile[i][2] - profile[i - 1][2]) > diameter_tol:
+            keep[i - 1] = True
+            keep[i]     = True
+
+    # Polyline slope breaks.
+    for i in range(1, n - 1):
+        d0, e0 = profile[i - 1][0], profile[i - 1][1]
+        d1, e1 = profile[i    ][0], profile[i    ][1]
+        d2, e2 = profile[i + 1][0], profile[i + 1][1]
+        # Guard against duplicate-distance rows: if either neighbor sits
+        # at the same station, the slope is undefined -- keep the point
+        # rather than silently dropping a possible vertex.
+        if d1 <= d0 or d2 <= d1:
+            keep[i] = True
+            continue
+        slope_left  = (e1 - e0) / (d1 - d0)
+        slope_right = (e2 - e1) / (d2 - d1)
+        if abs(slope_right - slope_left) > slope_tol:
+            keep[i] = True
+
+    # Enforce max_step by inserting points from the original profile
+    # wherever the spacing between consecutive kept points is too large.
+    kept_idx = [i for i, k in enumerate(keep) if k]
+    final_idx = [kept_idx[0]]
+    for k in range(1, len(kept_idx)):
+        i0 = final_idx[-1]
+        i1 = kept_idx[k]
+        gap = profile[i1][0] - profile[i0][0]
+        if gap > max_step_m:
+            n_sub = int(math.ceil(gap / max_step_m))
+            for j in range(1, n_sub):
+                target = profile[i0][0] + j * gap / n_sub
+                lo = final_idx[-1] + 1
+                hi = i1 - 1
+                if lo > hi:
+                    break
+                best = lo
+                best_diff = abs(profile[best][0] - target)
+                for m in range(lo + 1, hi + 1):
+                    diff = abs(profile[m][0] - target)
+                    if diff < best_diff:
+                        best = m
+                        best_diff = diff
+                if best > final_idx[-1]:
+                    final_idx.append(best)
+        final_idx.append(i1)
+
+    return [profile[i] for i in final_idx]
 
 
 # ---------------------------------------------------------------------------

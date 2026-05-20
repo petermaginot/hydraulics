@@ -37,9 +37,12 @@ Equations:
            sum of (signed) edge flows entering the node + Q_ext_spec = 0.
        Q_ext_spec defaults to 0 for interior junctions.
 
-The system is solved with scipy.optimize.fsolve (Powell hybrid).  After
-convergence, the external flow at each P-spec node is recovered from its
-mass balance.
+The system is solved with scipy.optimize.least_squares using the Trust
+Region Reflective method, with x_scale='jac' for automatic unknown-scale
+normalization.  TRF handles the ill-conditioning that comes from mixing
+tiny check-valve dP terms with much larger pipe dP terms on the same
+edge set -- something fsolve's Powell hybrid does not.  After convergence,
+the external flow at each P-spec node is recovered from its mass balance.
 
 Reverse-flow handling
 ---------------------
@@ -54,6 +57,13 @@ convention.  Reversing means:
        volume_m3) follow automatically from the new profile.
     -- Contraction_Expansion: Di_US and Di_DS are swapped, turning a
        contraction into an expansion and vice versa.
+    -- CheckValve: K is replaced with _SEALING_K, so a reversed valve
+       presents near-infinite resistance.  Inside the residual function
+       the K-factor is actually blended smoothly across Q=0 via tanh
+       (see _check_valve_signed_dP) so that fsolve can step across the
+       open<->sealed transition.  The discrete K_seal substitution is
+       still used by the post-solve ComponentResult walk, where there is
+       no Newton iteration to confuse.
     -- Bend and Valve: symmetric, returned unchanged.
 This reverses the actual geometry rather than applying a sign(Q) flip on
 the friction term, so K-factor asymmetries (sharp contraction vs sharp
@@ -62,22 +72,46 @@ expansion) and along-pipe profile asymmetries are captured correctly.
 Limitations
 -----------
 -- Incompressible flow only.  Constant density is assumed network-wide.
--- The Jacobian is computed by finite differences inside fsolve.  This is
-   fine for networks up to a few dozen edges; larger networks would
-   benefit from a sparse analytic Jacobian.
+-- The Jacobian is computed by finite differences inside least_squares.
+   This is fine for networks up to a few dozen edges; larger networks
+   would benefit from a sparse analytic Jacobian.
 -- User-defined component types not derived from Base_Line_Segment or
    Base_Contraction_Expansion are assumed symmetric under flow reversal.
 """
 
 import copy
+import csv
+import json
+import os
 import warnings
 from dataclasses import dataclass
 from typing import Any, Optional
 
 import numpy as np
-from scipy.optimize import fsolve
+from scipy.optimize import least_squares
 
 from component_classes import ureg
+
+
+# ---------------------------------------------------------------------------
+# Save-file format constant.  Bump if a breaking change is made.
+# ---------------------------------------------------------------------------
+SAVE_FORMAT_VERSION = 1
+
+
+def _safe_csv_name(name, used_lower):
+    """Sanitize `name` into a filesystem-safe filename stem and dedupe
+    against an already-used set (lowercase) for case-insensitive
+    filesystems."""
+    safe = "".join(
+        c if (c.isalnum() or c in "-_") else "_" for c in name
+    ).strip("_") or "result"
+    base = safe
+    i = 2
+    while safe.lower() in used_lower:
+        safe = f"{base}_{i}"
+        i += 1
+    return safe
 
 
 # Standard gravity, used for hydrostatic elevation contributions.
@@ -88,6 +122,21 @@ _G = 9.8066   # m/s^2
 # function smooth for Newton's method.
 _Q_LIN_EPS  = 1e-9
 _SEALING_K  = 1e9   # K-factor for a check valve in its sealed (reverse) state
+
+# Two scales for the check-valve regularization (m^3/s):
+#   Q_SCALE -- width of the tanh blend that swings K(Q) between K_fwd and
+#              _SEALING_K.  Without it the K-factor steps by ~9 orders of
+#              magnitude at Q=0.
+#   Q_REG   -- regularization scale that turns |Q| into sqrt(Q^2 + Q_REG^2)
+#              in the velocity-head term.  Without it d(signed_dP)/dQ is
+#              zero at Q=0 (the Q*|Q| factor has zero slope there) and
+#              fsolve sees no gradient telling it which way to step across
+#              the open<->sealed transition.
+# Both are picked well below the converged sealed-flow magnitude for typical
+# pipe sizes / back-pressures, so the saturated regions match the discrete
+# reversed-shadow physics to within a few percent.
+_CHECKVALVE_Q_SCALE = 1e-7
+_CHECKVALVE_Q_REG   = 1e-7
 
 
 # ---------------------------------------------------------------------------
@@ -185,6 +234,38 @@ def _reversed_component(component):
     return component   # symmetric -- Bend, Valve, anything else
 
 
+def _check_valve_signed_dP(cv, fluid, Q_si):
+    """Signed inlet-to-outlet dP for a check valve, regularized through Q=0.
+
+    Conceptually the check valve has two K-factors -- K_fwd in forward flow
+    and _SEALING_K in reverse -- realized in the rest of the code by the
+    reversed-geometry pattern that swaps in a high-K shadow under reverse
+    flow.  Used directly, that step at Q=0 spans nine orders of magnitude
+    and is paired with a v^2 velocity-head term whose slope is zero at v=0,
+    so fsolve's Newton iteration sees no gradient telling it how to step
+    across the open<->sealed transition.  Two regularizations fix this:
+
+        K(Q)   = K_fwd + (K_seal - K_fwd) * (1 - tanh(Q / Q_scale)) / 2
+        signed_dP(Q) = -K(Q) * 0.5 * rho * Q * sqrt(Q^2 + Q_reg^2) / A^2
+
+    For |Q| >> max(Q_scale, Q_reg) this saturates to the discrete model
+    (K_fwd*0.5*rho*v^2 forward, K_seal*0.5*rho*v^2 reverse), so converged
+    flows in the open or sealed regimes match it to a few percent.  At
+    Q=0 the slope is -K(0)*0.5*rho*Q_reg/A^2, finite and negative -- fsolve
+    can step into the reverse regime when the back-pressure demands it.
+
+    Returns the signed inlet-to-outlet dP in the same convention as
+    _component_signed_dP: negative for a forward friction loss, positive
+    when the valve is sealed against a reverse-flow pressure differential.
+    """
+    rho = fluid.density_si
+    A   = np.pi * cv.Di_si ** 2 / 4.0
+    K_fwd  = cv.K
+    K_seal = _SEALING_K
+    K = K_fwd + (K_seal - K_fwd) * 0.5 * (1.0 - np.tanh(Q_si / _CHECKVALVE_Q_SCALE))
+    return -K * 0.5 * rho * Q_si * np.sqrt(Q_si * Q_si + _CHECKVALVE_Q_REG ** 2) / (A * A)
+
+
 def _component_signed_dP(component, fluid, Q_si, reversed_cache):
     """Signed inlet-to-outlet pressure change of a single component [Pa].
 
@@ -194,6 +275,11 @@ def _component_signed_dP(component, fluid, Q_si, reversed_cache):
     negative of the original component's inlet-to-outlet change at the same
     physical state.  Negating restores the answer to the forward
     inlet-to-outlet convention.
+
+    Check valves take a separate path (`_check_valve_signed_dP`) that
+    blends K_fwd and _SEALING_K smoothly across Q=0, because the discrete
+    step would otherwise put a 9-order-of-magnitude slope discontinuity in
+    front of fsolve.
 
     For |Q| <= _Q_LIN_EPS, friction is linearized through zero to avoid the
     friction_factor(Re=0) singularity and to keep the residual smooth.  The
@@ -212,6 +298,9 @@ def _component_signed_dP(component, fluid, Q_si, reversed_cache):
     Returns:
         float, signed inlet-to-outlet dP [Pa].
     """
+    if getattr(component, "check_valve", False):
+        return _check_valve_signed_dP(component, fluid, Q_si)
+
     aQ = abs(Q_si)
 
     if aQ <= _Q_LIN_EPS:
@@ -588,24 +677,28 @@ class Network:
             mdot_init_kgs = max(spec_magnitudes) if spec_magnitudes else 10.0
         return P_init, mdot_init_kgs
 
-    def _report_convergence(self, info, ier, msg, verbose):
-        """Decide whether fsolve actually converged and emit any warnings.
+    def _report_convergence(self, result_obj, verbose):
+        """Decide whether the trust-region solver converged.
 
-        fsolve sometimes reports ier=5 ("not making good progress") when the
-        residual has already hit floating-point noise.  Cross-check the norm
-        so a tiny residual still counts as success.
+        Trust the residual norm, not least_squares' status code: a status
+        of 2 ("ftol below threshold") or 3 ("xtol below threshold") can
+        fire when the trust region collapsed without driving the residual
+        toward zero (typically a check-valve edge stuck on the wrong side
+        of its sealed transition).  Conversely, status -1 / 0 with a tiny
+        residual still counts as success.
         """
-        residual_norm = float(np.linalg.norm(info["fvec"]))
-        converged = (ier == 1) or (residual_norm < 1e-4)
+        residual_norm = float(np.linalg.norm(result_obj.fun))
+        converged = residual_norm < 1e-4
         if not converged:
             warnings.warn(
-                f"Network.solve: fsolve did not converge (ier={ier}, "
-                f"residual norm = {residual_norm:.3e}): {msg}",
+                f"Network.solve: did not converge (status={result_obj.status}, "
+                f"residual norm = {residual_norm:.3e}): {result_obj.message}",
                 stacklevel=2,
             )
         if verbose:
             print(
-                f"Network.solve: ier={ier}, nfev={info['nfev']}, "
+                f"Network.solve: status={result_obj.status}, "
+                f"nfev={result_obj.nfev}, "
                 f"residual norm = {residual_norm:.3e}"
             )
         return converged
@@ -650,7 +743,11 @@ class Network:
                              or 10 kg/s if no Q_ext is spec'd.  Nonzero to
                              avoid the sign(mdot) kink at zero.
             verbose        : bool, print solver progress.
-            xtol           : float, fsolve absolute tolerance on unknowns.
+            xtol           : float, tolerance on unknowns/residual/gradient
+                             passed to least_squares (scaled by 1e-4 for
+                             ftol/gtol/xtol so the solver iterates until
+                             the actual residual is small, not just until
+                             trust-region steps stop moving).
             maxfev         : int, max function evaluations.
 
         Returns:
@@ -676,10 +773,6 @@ class Network:
         )
 
         n_free = len(free_indices)
-        x0 = np.concatenate([
-            np.full(n_free, float(P_init)),
-            np.full(n_edges, float(mdot_init_kgs)),
-        ])
 
         # P-spec values are loop-invariant; bake them into a template that
         # unpack() copies once per Newton step and then overwrites at the
@@ -720,10 +813,52 @@ class Network:
 
             return res
 
-        sol, info, ier, msg = fsolve(
-            residuals, x0, full_output=True, xtol=xtol, maxfev=maxfev,
-        )
-        converged = self._report_convergence(info, ier, msg, verbose)
+        def _attempt(mdot_init_arr):
+            x0 = np.concatenate([
+                np.full(n_free, float(P_init)),
+                mdot_init_arr,
+            ])
+            # least_squares(method='trf') auto-scales unknowns via x_scale='jac'
+            # and handles the ill-conditioning that comes from mixing tiny
+            # check-valve dP with much larger pipe dP on the same edge set.
+            # fsolve's Powell hybrid handled the existing tests fine but
+            # stalled on any topology where the trust region needed to push a
+            # check valve from forward into its sealed-reverse regime.
+            return least_squares(
+                residuals, x0, method="trf", x_scale="jac",
+                xtol=xtol * 1e-4, ftol=xtol * 1e-4, gtol=xtol * 1e-4,
+                max_nfev=maxfev,
+            )
+
+        # First attempt: scale-matched initial flow on every edge.
+        mdot_init_default = np.full(n_edges, float(mdot_init_kgs))
+        result_obj = _attempt(mdot_init_default)
+        sol = result_obj.x
+        fvec = result_obj.fun
+        residual_norm_first = float(np.linalg.norm(fvec))
+
+        # Fallback for check-valve networks: if the first attempt left a
+        # large residual (typical when the initial guess put a CV on the
+        # wrong side of its sealed transition), retry with mdot_init=0 on
+        # every CV-containing edge.  Inside the regularized
+        # _check_valve_signed_dP the Jacobian at mdot=0 sees a finite slope
+        # into the sealed regime, so the first TRF step picks the right
+        # sign of flow.  Other edges keep the scale-matched guess.
+        cv_edge_indices = [
+            i for i, e in enumerate(self._edges)
+            if any(getattr(c, "check_valve", False) for c in e.components)
+        ]
+        if cv_edge_indices and residual_norm_first > 1e-4:
+            mdot_init_cv = mdot_init_default.copy()
+            for i in cv_edge_indices:
+                mdot_init_cv[i] = 0.0
+            result_b = _attempt(mdot_init_cv)
+            if float(np.linalg.norm(result_b.fun)) < residual_norm_first:
+                result_obj = result_b
+                sol = result_obj.x
+                fvec = result_obj.fun
+
+        converged = self._report_convergence(result_obj, verbose)
 
         P_arr, mdot_arr = unpack(sol)
         mdot_ext_out = self._recover_pspec_mdot_ext(
@@ -738,6 +873,188 @@ class Network:
             mdot_ext_kgs=mdot_ext_out,
             converged=bool(converged),
         )
+
+    # ------------------------------------------------------------------
+    # JSON (de)serialization.
+    #
+    # File format (.hydnet.json), version SAVE_FORMAT_VERSION:
+    #   {
+    #     "format_version": 1,
+    #     "regime": "incompressible" | "compressible",
+    #     "nodes": [
+    #       {"name", "elevation_m", "P_Pa"|null, "Q_ext"|null, "T_K"|null}
+    #     ],
+    #     "edges": [
+    #       {"name", "from_node", "to_node",
+    #        "components": [<component.to_dict()>, ...]}
+    #     ],
+    #     "gui_extras": {...}    # opaque to this layer; preserved verbatim
+    #   }
+    #
+    # Q_ext is stored as {"magnitude": float, "unit": str} (or null) so the
+    # original pint unit survives a round trip -- conversion to kg/s still
+    # happens at solve() time when the fluid is known.
+    #
+    # Component dispatch on load uses cls._default_component_classes(),
+    # which subclasses override (Compressible_Network plugs in the
+    # compressible_flow.* equivalents).
+    # ------------------------------------------------------------------
+
+    REGIME = "incompressible"
+
+    @classmethod
+    def _default_component_classes(cls):
+        """Return {"line_segment": cls, "bend": cls, ...} for from_dict.
+
+        Lazy import to avoid a circular: incompressible.py imports
+        network.py, so we can't pull the concrete subclasses in at
+        module-top time.  Subclasses (Compressible_Network) override.
+        """
+        from incompressible import (
+            Line_Segment, Bend, Valve, CheckValve, Contraction_Expansion,
+        )
+        return {
+            "line_segment":          Line_Segment,
+            "bend":                  Bend,
+            "valve":                 Valve,
+            "check_valve":           CheckValve,
+            "contraction_expansion": Contraction_Expansion,
+        }
+
+    def _node_to_dict(self, node):
+        """Serialize one Node to a JSON-safe dict.  Subclasses can override
+        to add regime-specific fields; the compressible subclass overrides
+        to include T_K explicitly."""
+        Q_qty = node.Q_ext_spec_qty
+        if Q_qty is None:
+            Q_dict = None
+        else:
+            Q_dict = {"magnitude": float(Q_qty.magnitude), "unit": str(Q_qty.units)}
+        d = {
+            "name":        node.name,
+            "elevation_m": float(node.elevation_m),
+            "P_Pa":        None if node.P_spec_Pa is None else float(node.P_spec_Pa),
+            "Q_ext":       Q_dict,
+        }
+        if node.T_spec_K is not None:
+            d["T_K"] = float(node.T_spec_K)
+        return d
+
+    def to_dict(self, *, gui_extras=None):
+        """Serialize the network to a JSON-safe dict.
+
+        gui_extras: optional opaque payload (e.g. the GUI's canvas
+        positions and original-unit display preferences) preserved
+        verbatim under the "gui_extras" key.
+        """
+        nodes_out = [
+            self._node_to_dict(self._nodes[name])
+            for name in self._node_order
+        ]
+        edges_out = []
+        for edge in self._edges:
+            edges_out.append({
+                "name":       edge.name,
+                "from_node":  edge.from_node,
+                "to_node":    edge.to_node,
+                "components": [c.to_dict() for c in edge.components],
+            })
+        payload = {
+            "format_version": SAVE_FORMAT_VERSION,
+            "regime":         self.REGIME,
+            "nodes":          nodes_out,
+            "edges":          edges_out,
+        }
+        if gui_extras is not None:
+            payload["gui_extras"] = gui_extras
+        return payload
+
+    def _add_node_from_dict(self, node_payload):
+        """Replay one serialized node into this network.
+
+        Default implementation handles elevation / P / Q_ext.  The
+        compressible subclass overrides to also forward T.
+        """
+        kwargs = {"elevation": ureg.Quantity(node_payload["elevation_m"], "m")}
+        if node_payload.get("P_Pa") is not None:
+            kwargs["P"] = ureg.Quantity(node_payload["P_Pa"], "Pa")
+        Q_dict = node_payload.get("Q_ext")
+        if Q_dict is not None:
+            kwargs["Q_ext"] = ureg.Quantity(
+                float(Q_dict["magnitude"]), Q_dict["unit"],
+            )
+        self.add_node(node_payload["name"], **kwargs)
+
+    @classmethod
+    def from_dict(cls, payload, *, component_classes=None):
+        """Reconstruct a Network from a payload produced by to_dict().
+
+        component_classes: optional {"line_segment": cls, ...} override.
+        Defaults to cls._default_component_classes() (incompressible for
+        the base class, compressible_flow.* for Compressible_Network).
+
+        Raises ValueError if the payload's regime tag does not match
+        cls.REGIME -- this catches "Network.load on a compressible file"
+        with a clear error rather than letting a wrong-class load proceed.
+        """
+        fv = payload.get("format_version")
+        if fv != SAVE_FORMAT_VERSION:
+            raise ValueError(
+                f"{cls.__name__}.from_dict: unsupported format_version {fv!r}; "
+                f"this build writes {SAVE_FORMAT_VERSION}."
+            )
+        file_regime = payload.get("regime")
+        if file_regime != cls.REGIME:
+            raise ValueError(
+                f"{cls.__name__}.from_dict: file regime is {file_regime!r} "
+                f"but this class expects {cls.REGIME!r}.  Use the matching "
+                f"Network class to load this file."
+            )
+        if component_classes is None:
+            component_classes = cls._default_component_classes()
+
+        net = cls()
+        for node_payload in payload.get("nodes", []):
+            net._add_node_from_dict(node_payload)
+        for edge_payload in payload.get("edges", []):
+            comps = []
+            for cp in edge_payload.get("components", []):
+                kind = cp.get("kind")
+                component_cls = component_classes.get(kind)
+                if component_cls is None:
+                    raise ValueError(
+                        f"{cls.__name__}.from_dict: edge "
+                        f"{edge_payload.get('name')!r} has component of "
+                        f"unknown kind {kind!r}."
+                    )
+                comps.append(component_cls.from_dict(cp))
+            net.add_edge(
+                edge_payload["name"],
+                edge_payload["from_node"],
+                edge_payload["to_node"],
+                comps,
+            )
+        return net
+
+    def save(self, path, *, gui_extras=None):
+        """Write the network to `path` as JSON.  Pass through gui_extras."""
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(self.to_dict(gui_extras=gui_extras), f, indent=2)
+
+    @classmethod
+    def load(cls, path, *, component_classes=None):
+        """Read a saved network from `path`.
+
+        For headless callers; the GUI uses a thin wrapper around this that
+        also restores canvas positions from the "gui_extras" payload.
+
+        Pipe segments saved with a `csv_path` are re-read from the CSV
+        (per the network-save spec), so edits to the CSV propagate
+        without re-saving the network.
+        """
+        with open(path, "r", encoding="utf-8") as f:
+            payload = json.load(f)
+        return cls.from_dict(payload, component_classes=component_classes)
 
 
 # ---------------------------------------------------------------------------
@@ -818,6 +1135,82 @@ class NetworkResult:
                     return EdgeResult(self, e)
             raise KeyError(f"NetworkResult.edge: no edge named {name_or_edge!r}")
         return EdgeResult(self, name_or_edge)
+
+    def to_summary_dict(self):
+        """Compact JSON-serializable summary of the converged state.
+
+        Used by save_bundle(); separated so callers can grab the summary
+        directly (e.g. to merge with an own results report).
+        """
+        return {
+            "regime":    self._network.REGIME,
+            "converged": bool(self["converged"]),
+            "nodes": {
+                name: {
+                    "P_Pa":      float(self["P_Pa"][name]),
+                    "Q_ext_kgs": float(self["mdot_ext_kgs"].get(name, 0.0)),
+                    "Q_ext_m3s": float(self["Q_ext_m3s"].get(name, 0.0)),
+                }
+                for name in self["P_Pa"]
+            },
+            "edges": {
+                edge_name: {
+                    "mdot_kgs": float(mdot),
+                    "Q_m3s":    float(self["Q_m3s"].get(edge_name, 0.0)),
+                }
+                for edge_name, mdot in self["mdot_kgs"].items()
+            },
+        }
+
+    def save_bundle(self, dir_path):
+        """Write a directory bundle of solved results.
+
+        Layout:
+            <dir_path>/
+                summary.json                  # to_summary_dict()
+                <edge>_<idx>_<comp_name>.csv  # per-Line_Segment profile
+
+        One profile CSV per Line_Segment-like component on every edge,
+        named "<edge_name>__<position>__<component_name_or_unnamed>.csv".
+        Columns are the keys of pressure_profile() returned dicts:
+        distance_m, elevation_m, P_Pa, v_ms.
+        """
+        os.makedirs(dir_path, exist_ok=True)
+        summary = self.to_summary_dict()
+        profile_errors = {}
+        used = set()
+
+        for edge in self._network._edges:
+            for pos, comp in enumerate(edge.components):
+                if not hasattr(comp, "pressure_profile"):
+                    continue
+                try:
+                    profile = self.component(comp).pressure_profile()
+                except Exception as exc:
+                    profile_errors[f"{edge.name}#{pos}"] = (
+                        f"{type(exc).__name__}: {exc}"
+                    )
+                    continue
+                if not profile:
+                    continue
+                comp_name = getattr(comp, "name", None) or f"comp{pos}"
+                fname = _safe_csv_name(
+                    f"{edge.name}__{pos}__{comp_name}", used,
+                ) + ".csv"
+                used.add(fname.lower())
+                cols = list(profile[0].keys())
+                with open(os.path.join(dir_path, fname), "w",
+                          newline="", encoding="utf-8") as fh:
+                    w = csv.writer(fh)
+                    w.writerow(cols)
+                    for row in profile:
+                        w.writerow([row.get(c, "") for c in cols])
+
+        if profile_errors:
+            summary["profile_errors"] = profile_errors
+        with open(os.path.join(dir_path, "summary.json"), "w",
+                  encoding="utf-8") as f:
+            json.dump(summary, f, indent=2)
 
     def component(self, comp):
         """Return a ComponentResult for the given component object.
@@ -1054,6 +1447,40 @@ class ComponentResult:
 # Self-tests
 # ---------------------------------------------------------------------------
 
+def _test_numerous_viscosities():
+    from incompressible import Line_Segment, Incompressible_Fluid
+    for i in range(1, 2):
+        fluid = Incompressible_Fluid.from_api_gravity(
+            api_gravity=10.0,
+            viscosity=ureg.Quantity(30.0, "cP"),
+        )
+        seg = Line_Segment(
+            roughness=ureg.Quantity(0.00015, "ft"),
+            id_val=ureg.Quantity(3.068, "inch"),
+            length=ureg.Quantity(10000.0, "ft"),
+            elevation_change=ureg.Quantity(0.0, "ft"),
+            name="single",
+        )
+
+        P_in_spec = ureg.Quantity(100.0, "psi").to("Pa").magnitude
+        P_out_spec = ureg.Quantity(40.0, "psi").to("Pa").magnitude
+
+        net = Network()
+        net.add_node("in",  P=P_in_spec)
+        net.add_node("out", P=P_out_spec)
+        net.add_edge("seg", "in", "out", seg)
+
+        result = net.solve(fluid, verbose=True)
+
+        print( result["mdot_kgs"])
+        # mdot_in = result["mdot_kgs"]
+        # Q_in = ureg.Quantity((mdot_in/fluid.density_si), "m^3/s").to("oil_bbl/day")
+        # print(
+        #     f"{Q_in}"
+        # )
+
+
+
 def _test_single_segment():
     """One inlet, one outlet, one Line_Segment in between.
 
@@ -1064,18 +1491,18 @@ def _test_single_segment():
     from incompressible import Line_Segment, Incompressible_Fluid
 
     fluid = Incompressible_Fluid.from_api_gravity(
-        api_gravity=50.0,
-        viscosity=ureg.Quantity(1.0, "cP"),
+        api_gravity=10.0,
+        viscosity=ureg.Quantity(30.0, "cP"),
     )
     seg = Line_Segment(
         roughness=ureg.Quantity(0.00015, "ft"),
         id_val=ureg.Quantity(3.068, "inch"),
-        length=ureg.Quantity(2000.0, "ft"),
+        length=ureg.Quantity(1000.0, "ft"),
         elevation_change=ureg.Quantity(25.0, "ft"),
         name="single",
     )
 
-    Q = ureg.Quantity(10000.0, "oil_bbl/day")
+    Q = ureg.Quantity(2000.0, "oil_bbl/day")
     P_out_spec = ureg.Quantity(50.0, "psi").to("Pa").magnitude
 
     direct_dP = seg.dP(fluid, Q)                          # negative for loss
@@ -1400,6 +1827,100 @@ def _test_query_api():
         print(f"   pressure_profile() raises AttributeError as expected: {e}")
 
 
+def _test_check_valve_forward_and_sealed():
+    """Check valve: forward flow uses K_fwd; back-pressure produces a sealed solve.
+
+    The sealed case is the scenario from the GUI screenshot -- both ends are
+    P-spec'd with P_to > P_from on the check-valve edge, so the natural
+    pressure drive is reverse, but the valve must block.  Without the
+    K-factor regularization + two-shot init fallback added for the check
+    valve, the TRF solver cannot cross from a positive initial guess into
+    the sealed-reverse regime (the K=1e9 wall produces a residual the
+    trust region rejects).  Tests both forward and sealed behaviour.
+    """
+    import fluids.fittings
+    from incompressible import CheckValve, Incompressible_Fluid, Line_Segment
+
+    fluid = Incompressible_Fluid(
+        density=ureg.Quantity(62.4, "lb/ft^3"),
+        viscosity=ureg.Quantity(1.0, "cP"),
+    )
+    D_q = ureg.Quantity(4.026, "inch")
+    K_fwd = fluids.fittings.K_swing_check_valve_Crane(
+        D=D_q.to("m").magnitude, angled=True,
+    )
+    cv = CheckValve(Di=D_q, K=K_fwd, name="CV")
+
+    # --- forward flow: 1000 BPD Q-spec'd into a P-spec'd outlet.
+    net_f = Network()
+    Q_in = ureg.Quantity(1000.0, "oil_bbl/day")
+    net_f.add_node("A", Q_ext=Q_in)
+    net_f.add_node("B", P=ureg.Quantity(100.0, "psi"))
+    net_f.add_edge("CV", "A", "B", cv)
+    res_f = net_f.solve(fluid)
+    Q_f = res_f["Q_m3s"]["CV"]
+    bpd = ureg.Quantity(1.0, "m^3/s").to("oil_bbl/day").magnitude
+    dP_psi = (res_f["P_Pa"]["B"] - res_f["P_Pa"]["A"]) / 6894.757
+    rho = fluid.density_si
+    A_si = np.pi * cv.Di_si**2 / 4.0
+    dP_direct = -K_fwd * 0.5 * rho * (Q_in.to("m^3/s").magnitude / A_si)**2 / 6894.757
+    print(
+        f"[check-valve-fwd]  Q = {Q_f * bpd:+.2f} BPD,  "
+        f"dP = {dP_psi:+.4f} psi  (direct {dP_direct:+.4f})"
+    )
+    assert res_f.converged
+    assert Q_f > 0.0
+    assert abs(dP_psi - dP_direct) < 1e-4
+
+    # --- sealed: back-pressure with both ends P-spec'd (GUI screenshot scenario).
+    net_s = Network()
+    net_s.add_node("A", P=ureg.Quantity(100.0, "psi"))
+    net_s.add_node("B", P=ureg.Quantity(100.1, "psi"))
+    net_s.add_edge("CV", "A", "B", cv)
+    res_s = net_s.solve(fluid)
+    Q_s = res_s["Q_m3s"]["CV"]
+    print(
+        f"[check-valve-seal] Q = {Q_s * bpd:+.4e} BPD  "
+        f"(sealed; |Q| should be << any open-valve flow)"
+    )
+    assert res_s.converged
+    assert Q_s < 0.0
+    assert abs(Q_s) < 1e-5, f"sealed CV leakage too high: |Q|={abs(Q_s):.2e} m^3/s"
+
+    # --- junction topology: supply node feeds a junction, junction feeds a
+    #     sealed check valve on one branch and a low-pressure outlet on the
+    #     other.  Reproduces the second GUI failure -- a multi-edge network
+    #     where the check valve must hold a back-pressure while the bulk
+    #     flow routes around it.  Sensitive to initial guesses; we test
+    #     both the default and a small-init fallback.
+    pipe = Line_Segment(
+        roughness=ureg.Quantity(0.00015, "ft"),
+        id_val=D_q,
+        length=ureg.Quantity(2000.0, "ft"),
+        elevation_change=ureg.Quantity(0.0, "ft"),
+        name="pipe",
+    )
+    cv_j = CheckValve(Di=D_q, K=K_fwd, name="CV_junction")
+    net_j = Network()
+    net_j.add_node("S",  Q_ext=ureg.Quantity(10000.0, "oil_bbl/day"))
+    net_j.add_node("J")
+    net_j.add_node("S1", P=ureg.Quantity(100.0, "psi"))
+    net_j.add_node("S3", P=ureg.Quantity( 50.0, "psi"))
+    net_j.add_edge("S->J",  "S", "J",  [])
+    net_j.add_edge("J->S1", "J", "S1", cv_j)
+    net_j.add_edge("J->S3", "J", "S3", pipe)
+    res_j = net_j.solve(fluid)
+    Q_cv = res_j["Q_m3s"]["J->S1"] * bpd
+    Q_pipe = res_j["Q_m3s"]["J->S3"] * bpd
+    print(
+        f"[check-valve-junction] Q_cv = {Q_cv:+.4e} BBL/D, "
+        f"Q_pipe = {Q_pipe:.2f} BBL/D, P_J = {res_j['P_Pa']['J']/6894.757:.3f} psi"
+    )
+    assert res_j.converged
+    assert Q_cv < 0.0 and abs(Q_cv) < 10.0   # sealed, tiny back-leakage
+    assert Q_pipe > 9000.0                   # most flow takes the pipe path
+
+
 def _test_three_modes():
     """Round-trip consistency check for the three calculation-mode wrappers.
 
@@ -1491,7 +2012,12 @@ if __name__ == "__main__":
     # _test_screenshot_forward_PIPE5()
     # print()
     # _test_screenshot_reverse_PIPE5()
+    # print()
     # _test_specflow()
     # print()
     # _test_query_api()
-    _test_three_modes()
+    # print()
+    # _test_check_valve_forward_and_sealed()
+    # print()
+    # _test_three_modes()
+    _test_numerous_viscosities()
