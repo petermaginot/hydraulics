@@ -34,6 +34,18 @@ class MainWindow(QMainWindow):
         self.composition_screen  = CompressibleCompositionScreen(self.state)
         self.cnetwork_screen     = CompressibleNetworkScreen(self.state)
 
+        # Display-unit combos live on the composition screen; the compressible
+        # network screen reads them via these attribute assignments.
+        self.cnetwork_screen.d_pressure    = self.composition_screen.d_pressure
+        self.cnetwork_screen.d_flow        = self.composition_screen.d_flow
+        self.cnetwork_screen.d_temperature = self.composition_screen.d_temperature
+        for _combo in (self.composition_screen.d_pressure,
+                       self.composition_screen.d_flow,
+                       self.composition_screen.d_temperature):
+            _combo.currentTextChanged.connect(
+                self.cnetwork_screen._rerender_with_current_units
+            )
+
         self.stack = QStackedWidget()
         self.stack.addWidget(self.start_screen)
         self.stack.addWidget(self.segment_screen)

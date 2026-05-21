@@ -6,7 +6,9 @@ This software performs hydraulic analysis of piping systems for both incompressi
 2. Set up the fluid properties — either via an `Incompressible_Fluid` instance (for liquids) or a CoolProp `AbstractState` (for gases/mixtures).
 3. Call the component's calculating method (`dP` for incompressible, `dP_dT` for compressible) to solve for outlet conditions at a given flow rate.
 
-Pipeline branches can be wired in series and/or parallel via the helpers in `parallel.py`, which solve the flow-split balance such that every branch ends up at the same outlet pressure.
+All functions can be run directly in the terminal or via dedicated python scripts. For examples, see [textbook_test_functions.py](textbook_test_functions.py). Additionally, a GUI was Claude'd together to enable more user-friendly setup of single-line-segment and network scenarios. Run it by running `python run_gui.py`.
+
+Pipeline branches can be wired in series and/or parallel via the helpers in `parallel.py`, which solve the flow-split balance such that every branch ends up at the same outlet pressure. For more complex networks (including potential for reverse flow), `network.py` and `compressible_network.py` can be used to construct a pipeline and component network and solve material and energy balances at node. For more details on the network solving methods, see [network.md](network.md)
 
 Most quantities accept [pint](https://pint.readthedocs.io/) `Quantity` inputs for unit-safe entry, and the unit registry includes custom standard-volume units (`scm`, `scf`, `mscf`, `mmscf`) defined as mole equivalents so they can be supplied directly as flow rates.
 
@@ -212,3 +214,6 @@ End-to-end examples that check the program's calculations against textbook probl
 ## Utilities - [utilities.py](utilities.py)
 
 File for containing utility functions.
+
+## To do's
+-Add orifice plates

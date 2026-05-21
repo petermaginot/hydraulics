@@ -17,6 +17,7 @@ import gui.dialogs as dialogs
 import pyqtgraph as pg
 from PySide6.QtCore import Qt, Signal
 from PySide6.QtWidgets import (
+    QCheckBox,
     QComboBox,
     QFileDialog,
     QFormLayout,
@@ -221,10 +222,29 @@ class SegmentScreen(QWidget):
 
         self.c_rough = _LabeledField("0.00015", U.ROUGHNESS, "ft")
 
+        self.c_downsample_chk = QCheckBox("Downsample profile")
+        self.c_downsample_chk.setToolTip(
+            "Reduce dense profiles to diameter-change points, elevation "
+            "inflections, and a maximum step length.  Speeds up compressible "
+            "flow calculations."
+        )
+        self.c_downsample_chk.toggled.connect(self._on_downsample_toggled)
+
+        self.c_max_step = _LabeledField("1000", U.LENGTH, "m")
+        self.c_max_step.edit.setEnabled(False)
+        self.c_max_step.combo.setEnabled(False)
+
+        self.c_elev_tol = _LabeledField("0.1", U.LENGTH, "m")
+        self.c_elev_tol.edit.setEnabled(False)
+        self.c_elev_tol.combo.setEnabled(False)
+
         form = QFormLayout()
-        form.addRow("Profile CSV:",  self.csv_path_lbl)
-        form.addRow("",              pick_btn)
-        form.addRow("Roughness:",    self.c_rough.widget())
+        form.addRow("Profile CSV:",   self.csv_path_lbl)
+        form.addRow("",               pick_btn)
+        form.addRow("Roughness:",     self.c_rough.widget())
+        form.addRow("",               self.c_downsample_chk)
+        form.addRow("Max step:",      self.c_max_step.widget())
+        form.addRow("Elev. tol.:",    self.c_elev_tol.widget())
 
         help_lbl = QLabel(
             "CSV must have header columns: distance, elevation, and either "
@@ -244,6 +264,12 @@ class SegmentScreen(QWidget):
         v.addStretch()
         return tab
 
+    def _on_downsample_toggled(self, checked):
+        self.c_max_step.edit.setEnabled(checked)
+        self.c_max_step.combo.setEnabled(checked)
+        self.c_elev_tol.edit.setEnabled(checked)
+        self.c_elev_tol.combo.setEnabled(checked)
+
     def _pick_csv(self):
         path, _ = QFileDialog.getOpenFileName(
             self, "Select profile CSV", "", "CSV files (*.csv);;All files (*)"
@@ -258,10 +284,20 @@ class SegmentScreen(QWidget):
             QMessageBox.warning(self, "No file", "Choose a CSV file first.")
             return
         try:
+            downsample = False
+            elev_tol   = 0.0
+            if self.c_downsample_chk.isChecked():
+                qty = self.c_max_step.quantity()
+                downsample = float(qty.to("m").magnitude) if qty is not None else 1000.0
+                et_qty = self.c_elev_tol.quantity()
+                elev_tol = float(et_qty.to("m").magnitude) if et_qty is not None else 0.0
+
             Line_Segment = _load_segment_class(self.state.flow_type)
             seg = Line_Segment.from_csv(
-                csv_path  = self.csv_path,
-                roughness = self.c_rough.quantity(),
+                csv_path   = self.csv_path,
+                roughness  = self.c_rough.quantity(),
+                downsample = downsample,
+                elev_tol   = elev_tol,
             )
         except Exception as e:
             self._error("Could not load profile", e)

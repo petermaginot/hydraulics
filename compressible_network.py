@@ -539,14 +539,6 @@ class Compressible_Network(Network):
                         walked_P_out[e_idx] - P[outlet_i_of[e_idx]]
                     ) / P_ref
 
-            nfev_counter[0] += 1
-            if progress_callback is not None:
-                try:
-                    progress_callback(nfev_counter[0],
-                                      float(np.linalg.norm(res)))
-                except Exception:
-                    pass
-
             return res
 
         # scipy.optimize.least_squares with the Trust Region Reflective

@@ -33,6 +33,7 @@ from PySide6.QtWidgets import (
 )
 
 import composition
+from gui import units as U
 
 
 class CompressibleCompositionScreen(QWidget):
@@ -102,6 +103,40 @@ class CompressibleCompositionScreen(QWidget):
         mode_v.addWidget(self.rb_adiabatic)
         mode_v.addWidget(self.rb_isothermal)
 
+        # ---- Result display units (shared with the network canvas) ----
+        self.d_pressure = QComboBox()
+        self.d_pressure.addItems(U.PRESSURE)
+        self.d_pressure.setCurrentText("psi")
+
+        self.d_flow = QComboBox()
+        self.d_flow.addItems([
+            "kg/s", "kg/h", "lb/h",
+            "mol/s", "mol/h",
+            "mmscf/day", "mscf/day", "scf/min", "scm/h",
+        ])
+        self.d_flow.setCurrentText("mmscf/day")
+
+        self.d_temperature = QComboBox()
+        self.d_temperature.addItems(U.TEMPERATURE)
+        self.d_temperature.setCurrentText("degF")
+
+        du_form = QFormLayout()
+        du_form.addRow("Pressure:",    self.d_pressure)
+        du_form.addRow("Flow:",        self.d_flow)
+        du_form.addRow("Temperature:", self.d_temperature)
+        du_box = QGroupBox("Result display units")
+        du_box.setLayout(du_form)
+
+        # EOS + mode on the left; display units on the right
+        left_col = QVBoxLayout()
+        left_col.addLayout(eos_form)
+        left_col.addWidget(mode_box)
+        left_col.addStretch()
+
+        eos_mode_row = QHBoxLayout()
+        eos_mode_row.addLayout(left_col, 1)
+        eos_mode_row.addWidget(du_box)
+
         hint = QLabel(
             "Inlet pressure, temperature, and per-stream flow are specified "
             "per Source/Sink on the next screen — a network can have "
@@ -126,8 +161,7 @@ class CompressibleCompositionScreen(QWidget):
 
         layout = QVBoxLayout(self)
         layout.addWidget(comp_box, 1)
-        layout.addLayout(eos_form)
-        layout.addWidget(mode_box)
+        layout.addLayout(eos_mode_row)
         layout.addWidget(hint)
         layout.addWidget(self.status)
         layout.addLayout(nav)

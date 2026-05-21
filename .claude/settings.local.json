@@ -2,7 +2,8 @@
   "permissions": {
     "allow": [
       "WebFetch(domain:github.com)",
-      "WebFetch(domain:pandapipes.readthedocs.io)"
+      "WebFetch(domain:pandapipes.readthedocs.io)",
+      "Bash(python -c \"import ast; ast.parse\\(open\\('component_classes.py', encoding='utf-8'\\).read\\(\\)\\); print\\('OK'\\)\")"
     ]
   }
 }

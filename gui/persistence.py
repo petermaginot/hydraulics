@@ -225,8 +225,12 @@ def load_canvas(path, screen):
             else:
                 csv_full = rel_or_abs
             try:
+                max_step_m = spec.get("downsample_max_step_m", 0.0)
+                elev_tol_m = spec.get("downsample_elev_tol_m", 0.0)
+                downsample = float(max_step_m) if max_step_m > 0.0 else False
                 tmp_seg = screen.LINE_SEGMENT_CLS.from_csv(
                     csv_full, roughness=1e-6,
+                    downsample=downsample, elev_tol=elev_tol_m,
                 )
                 spec["csv_path"]    = csv_full
                 spec["csv_profile"] = list(tmp_seg.profile)
@@ -237,8 +241,10 @@ def load_canvas(path, screen):
                     f"Switched to manual mode -- geometry fields are blank."
                 )
                 spec["mode"] = "manual"
-                spec.pop("csv_path",    None)
-                spec.pop("csv_profile", None)
+                spec.pop("csv_path",              None)
+                spec.pop("csv_profile",           None)
+                spec.pop("downsample_max_step_m", None)
+                spec.pop("downsample_elev_tol_m", None)
 
         screen.node_specs[new_node.id] = spec
         old_to_new[n["id"]] = new_node

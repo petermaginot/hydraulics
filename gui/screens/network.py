@@ -35,6 +35,7 @@ import traceback
 from PySide6.QtCore import Qt, Signal
 from PySide6.QtWidgets import (
     QButtonGroup,
+    QCheckBox,
     QComboBox,
     QFileDialog,
     QFormLayout,
@@ -418,6 +419,9 @@ class NetworkScreen(QWidget):
             "angle_str":  "0",
             "D_str":      "4.026",  "D_unit":  "inch",
             "style_str":  "0",
+            # User-specified K/Cv/Kv branch.
+            "spec_mode":    "K",     # "K" | "Cv" | "Kv"
+            "spec_val_str": "1.0",
         }
 
     @staticmethod
@@ -561,7 +565,6 @@ class NetworkScreen(QWidget):
         self.p_clear_csv_btn.setVisible(False)
         self.p_source_label = QLabel("(manual input)")
         self.p_source_label.setStyleSheet("color: #555; font-style: italic;")
-        self.p_source_label.setWordWrap(True)
 
         self.p_id     = _LabeledField("4.026",   U.DIAMETER,  "inch")
         self.p_od     = _LabeledField("",        U.DIAMETER,  "inch")
@@ -575,26 +578,49 @@ class NetworkScreen(QWidget):
         self.p_details_btn.clicked.connect(self._show_current_node_details)
         self.p_details_btn.setVisible(False)
 
-        csv_row = QHBoxLayout()
-        csv_row.addWidget(self.p_csv_btn)
-        csv_row.addWidget(self.p_clear_csv_btn)
-        csv_row.addStretch()
+        self.p_downsample_chk = QCheckBox("Downsample profile")
+        self.p_downsample_chk.setToolTip(
+            "Reduce dense profiles to diameter-change points, elevation "
+            "inflections, and a maximum step length.  Speeds up compressible "
+            "flow calculations."
+        )
+        self.p_downsample_chk.toggled.connect(self._on_pipe_downsample_toggled)
+
+        self.p_max_step = _LabeledField("1000", U.LENGTH, "m")
+        self.p_max_step.edit.setEnabled(False)
+        self.p_max_step.combo.setEnabled(False)
+
+        self.p_elev_tol = _LabeledField("0.1", U.LENGTH, "m")
+        self.p_elev_tol.edit.setEnabled(False)
+        self.p_elev_tol.combo.setEnabled(False)
 
         form = QFormLayout()
-        form.addRow("Name:",     self.p_name)
-        form.addRow("Source:",   self.p_source_label)
-        form.addRow("ID:",       self.p_id.widget())
-        form.addRow("OR OD:",    self.p_od.widget())
-        form.addRow("WT:",       self.p_wt.widget())
-        form.addRow("Length:",   self.p_length.widget())
-        form.addRow("dz:",       self.p_dz.widget())
+        form.addRow("Name:",      self.p_name)
+        form.addRow("Source:",    self.p_source_label)
+        form.addRow("ID:",        self.p_id.widget())
+        form.addRow("OR OD:",     self.p_od.widget())
+        form.addRow("WT:",        self.p_wt.widget())
+        form.addRow("Length:",    self.p_length.widget())
+        form.addRow("dz:",        self.p_dz.widget())
         form.addRow("Roughness:", self.p_rough.widget())
+        form.addRow("Max step:",   self.p_max_step.widget())
+        form.addRow("Elev. tol.:", self.p_elev_tol.widget())
+
+        load_row = QHBoxLayout()
+        load_row.addWidget(self.p_csv_btn)
+        load_row.addWidget(self.p_downsample_chk)
+        load_row.addStretch()
+
+        apply_row = QHBoxLayout()
+        apply_row.addWidget(self.p_apply)
+        apply_row.addWidget(self.p_clear_csv_btn)
+        apply_row.addStretch()
 
         page = QWidget()
         v = QVBoxLayout(page)
         v.addLayout(form)
-        v.addLayout(csv_row)
-        v.addWidget(self.p_apply)
+        v.addLayout(load_row)
+        v.addLayout(apply_row)
         v.addWidget(self.p_details_btn)
         v.addStretch()
         self.editor_stack.addWidget(page)
@@ -671,7 +697,9 @@ class NetworkScreen(QWidget):
     def _build_valve_editor(self):
         self.valve_name = QLineEdit()
         self.valve_type_combo = QComboBox()
-        self.valve_type_combo.addItems(["Globe", "Gate", "Butterfly", "Plug", "Ball"])
+        self.valve_type_combo.addItems(
+            ["Globe", "Gate", "Butterfly", "Plug", "Ball", "User specified"]
+        )
         self.valve_type_combo.currentIndexChanged.connect(self._on_valve_type_changed)
 
         # Globe sub-page (index 0)
@@ -782,12 +810,41 @@ class NetworkScreen(QWidget):
         blv.addLayout(ball_form)
         blv.addWidget(ball_hint)
 
+        # User-specified sub-page (index 5)
+        self.valve_user_D       = _LabeledField("4.026", U.DIAMETER, "inch")
+        self.valve_user_mode    = QComboBox()
+        self.valve_user_mode.addItems(["K", "Cv", "Kv"])
+        self.valve_user_mode.currentIndexChanged.connect(
+            self._on_valve_user_mode_changed
+        )
+        self.valve_user_value   = QLineEdit("1.0")
+        self.valve_user_value_label = QLabel("K value:")
+        user_form = QFormLayout()
+        user_form.addRow("Pipe ID:",      self.valve_user_D.widget())
+        user_form.addRow("Specify by:",   self.valve_user_mode)
+        user_form.addRow(self.valve_user_value_label, self.valve_user_value)
+        user_hint = QLabel(
+            "K is the dimensionless resistance coefficient referenced to "
+            "the pipe velocity head.  Cv is the US flow coefficient "
+            "[gpm/psi^0.5]; Kv is the metric flow coefficient "
+            "[m^3/h/bar^0.5].  Cv and Kv are converted to K via "
+            "K = 2.148e9 · D^4 / Cv^2 (D in m) and Cv = 1.16 · Kv."
+        )
+        user_hint.setWordWrap(True)
+        user_hint.setStyleSheet("color: #777; font-style: italic;")
+        user_page = QWidget()
+        uv = QVBoxLayout(user_page)
+        uv.setContentsMargins(0, 0, 0, 0)
+        uv.addLayout(user_form)
+        uv.addWidget(user_hint)
+
         self.valve_input_stack = QStackedWidget()
         self.valve_input_stack.addWidget(globe_page)      # index 0
         self.valve_input_stack.addWidget(gate_page)       # index 1
         self.valve_input_stack.addWidget(butterfly_page)  # index 2
         self.valve_input_stack.addWidget(plug_page)       # index 3
         self.valve_input_stack.addWidget(ball_page)       # index 4
+        self.valve_input_stack.addWidget(user_page)       # index 5
 
         self.valve_apply = QPushButton("Apply")
         self.valve_apply.clicked.connect(self._apply_valve_edits)
@@ -1096,7 +1153,7 @@ class NetworkScreen(QWidget):
             self.editor_box.setTitle(f"Selected node: {n.name()}  [Valve]")
             self.valve_name.setText(n.name())
             vt   = spec.get("valve_type", "globe")
-            _VT  = ["globe", "gate", "butterfly", "plug", "ball"]
+            _VT  = ["globe", "gate", "butterfly", "plug", "ball", "user_specified"]
             idx  = _VT.index(vt) if vt in _VT else 0
             self.valve_type_combo.setCurrentIndex(idx)
             self.valve_input_stack.setCurrentIndex(idx)
@@ -1120,6 +1177,14 @@ class NetworkScreen(QWidget):
             style_idx = int(spec.get("style_str", "0") or "0")
             self.valve_butterfly_style.setCurrentIndex(style_idx)
             self.valve_plug_style.setCurrentIndex(style_idx)
+            # User-specified branch
+            self.valve_user_D.edit.setText(spec.get("D_str", "4.026"))
+            self.valve_user_D.combo.setCurrentText(spec.get("D_unit", "inch"))
+            spec_mode = spec.get("spec_mode", "K")
+            mode_idx  = {"K": 0, "Cv": 1, "Kv": 2}.get(spec_mode, 0)
+            self.valve_user_mode.setCurrentIndex(mode_idx)
+            self.valve_user_value_label.setText(f"{spec_mode} value:")
+            self.valve_user_value.setText(spec.get("spec_val_str", "1.0"))
         elif t == "check_valve":
             self.editor_stack.setCurrentIndex(6)
             self.editor_box.setTitle(f"Selected node: {n.name()}  [Check Valve]")
@@ -1191,6 +1256,16 @@ class NetworkScreen(QWidget):
                 ).to("ft").magnitude
                 self.p_dz.edit.setText(f"{dz_ft:g}")
                 self.p_dz.combo.setCurrentText("ft")
+            # Restore downsample settings from spec.
+            max_step_m = spec.get("downsample_max_step_m", 0.0)
+            elev_tol_m = spec.get("downsample_elev_tol_m", 0.0)
+            ds_enabled = max_step_m > 0.0
+            self.p_downsample_chk.setChecked(ds_enabled)
+            self._on_pipe_downsample_toggled(ds_enabled)
+            self.p_max_step.edit.setText(f"{max_step_m:.6g}" if ds_enabled else "1000")
+            self.p_max_step.combo.setCurrentText("m")
+            self.p_elev_tol.edit.setText(f"{elev_tol_m:.6g}" if ds_enabled else "0.1")
+            self.p_elev_tol.combo.setCurrentText("m")
         else:
             self.p_clear_csv_btn.setVisible(False)
             self.p_source_label.setText("(manual input)")
@@ -1204,6 +1279,13 @@ class NetworkScreen(QWidget):
                 self._set_field_editable(field, True)
                 field.edit.setText(spec.get(f"{name}_str", ""))
                 field.combo.setCurrentText(spec.get(f"{name}_unit", default_unit))
+            # No CSV in manual mode -- reset downsample UI to defaults.
+            self.p_downsample_chk.setChecked(False)
+            self._on_pipe_downsample_toggled(False)
+            self.p_max_step.edit.setText("1000")
+            self.p_max_step.combo.setCurrentText("m")
+            self.p_elev_tol.edit.setText("0.1")
+            self.p_elev_tol.combo.setCurrentText("m")
 
     @staticmethod
     def _set_field_editable(field, editable):
@@ -1285,6 +1367,10 @@ class NetworkScreen(QWidget):
     def _on_valve_type_changed(self, index):
         self.valve_input_stack.setCurrentIndex(index)
 
+    def _on_valve_user_mode_changed(self, index):
+        mode = ("K", "Cv", "Kv")[index]
+        self.valve_user_value_label.setText(f"{mode} value:")
+
     def _on_cv_type_changed(self, index):
         self.cv_input_stack.setCurrentIndex(index)
 
@@ -1317,7 +1403,7 @@ class NetworkScreen(QWidget):
         new_name = self.valve_name.text().strip()
         if new_name and new_name != n.name():
             n.set_name(new_name)
-        _VT = ["globe", "gate", "butterfly", "plug", "ball"]
+        _VT = ["globe", "gate", "butterfly", "plug", "ball", "user_specified"]
         vt  = _VT[self.valve_type_combo.currentIndex()]
         if vt == "globe":
             spec = {
@@ -1358,7 +1444,7 @@ class NetworkScreen(QWidget):
                 "style_str": str(self.valve_plug_style.currentIndex()),
                 "D_str": "", "D_unit": "inch",
             }
-        else:  # ball
+        elif vt == "ball":
             spec = {
                 "type": "valve", "valve_type": vt,
                 "D1_str":  self.valve_ball_D1.edit.text().strip(),
@@ -1367,6 +1453,17 @@ class NetworkScreen(QWidget):
                 "D2_unit": self.valve_ball_D2.combo.currentText(),
                 "angle_str": self.valve_ball_angle.text().strip(),
                 "D_str": "", "D_unit": "inch", "style_str": "",
+            }
+        else:  # user_specified
+            spec = {
+                "type": "valve", "valve_type": vt,
+                "D_str":        self.valve_user_D.edit.text().strip(),
+                "D_unit":       self.valve_user_D.combo.currentText(),
+                "spec_mode":    ("K", "Cv", "Kv")[self.valve_user_mode.currentIndex()],
+                "spec_val_str": self.valve_user_value.text().strip(),
+                "D1_str": "", "D1_unit": "inch",
+                "D2_str": "", "D2_unit": "inch",
+                "angle_str": "", "style_str": "",
             }
         self.node_specs[n.id] = spec
         self.editor_box.setTitle(f"Selected node: {n.name()}  [Valve]")
@@ -1475,11 +1572,21 @@ class NetworkScreen(QWidget):
         if not path:
             return
         try:
+            downsample = False
+            elev_tol   = 0.0
+            if self.p_downsample_chk.isChecked():
+                qty = self.p_max_step.quantity()
+                downsample = float(qty.to("m").magnitude) if qty is not None else 1000.0
+                et_qty = self.p_elev_tol.quantity()
+                elev_tol = float(et_qty.to("m").magnitude) if et_qty is not None else 0.0
+
             # Reuse Line_Segment.from_csv for parsing/validation; the temp
             # roughness value is discarded -- only the parsed profile
             # matters.  The real roughness is read from the editor at
             # solve time.
-            tmp_seg = self.LINE_SEGMENT_CLS.from_csv(path, roughness=1e-6)
+            tmp_seg = self.LINE_SEGMENT_CLS.from_csv(
+                path, roughness=1e-6, downsample=downsample, elev_tol=elev_tol,
+            )
         except Exception as e:
             dialogs.critical(
                 self, "Could not load CSV", f"{type(e).__name__}: {e}",
@@ -1491,9 +1598,11 @@ class NetworkScreen(QWidget):
                              "CSV produced an empty profile.")
             return
         spec = self.node_specs[n.id]
-        spec["mode"]        = "csv"
-        spec["csv_path"]    = path
-        spec["csv_profile"] = profile
+        spec["mode"]                   = "csv"
+        spec["csv_path"]               = path
+        spec["csv_profile"]            = profile
+        spec["downsample_max_step_m"]  = float(downsample) if downsample is not False else 0.0
+        spec["downsample_elev_tol_m"]  = elev_tol
         self._sync_pipe_editor_to_spec(spec)
 
     def _on_clear_pipe_csv(self):
@@ -1502,9 +1611,17 @@ class NetworkScreen(QWidget):
             return
         spec = self.node_specs[n.id]
         spec["mode"] = "manual"
-        spec.pop("csv_path", None)
-        spec.pop("csv_profile", None)
+        spec.pop("csv_path",              None)
+        spec.pop("csv_profile",           None)
+        spec.pop("downsample_max_step_m", None)
+        spec.pop("downsample_elev_tol_m", None)
         self._sync_pipe_editor_to_spec(spec)
+
+    def _on_pipe_downsample_toggled(self, checked):
+        self.p_max_step.edit.setEnabled(checked)
+        self.p_max_step.combo.setEnabled(checked)
+        self.p_elev_tol.edit.setEnabled(checked)
+        self.p_elev_tol.combo.setEnabled(checked)
 
     # ------------------------------------------------------------------
     # Solve: translate canvas graph into solver Network and run.
@@ -1932,6 +2049,25 @@ class NetworkScreen(QWidget):
             )
             return self.VALVE_CLS(Di=D_q, K=K, name=node.name())
 
+        if vt == "user_specified":
+            D_q  = _qty("D_str", "D_unit")
+            mode = spec.get("spec_mode", "K")
+            s    = spec.get("spec_val_str", "").strip()
+            if not s:
+                raise ValueError(
+                    f"Valve '{node.name()}': {mode} value is required."
+                )
+            val = float(s)
+            if mode == "K":
+                return self.VALVE_CLS(Di=D_q, K=val, name=node.name())
+            if mode == "Cv":
+                return self.VALVE_CLS(Di=D_q, Cv=val, name=node.name())
+            if mode == "Kv":
+                return self.VALVE_CLS(Di=D_q, Kv=val, name=node.name())
+            raise ValueError(
+                f"Valve '{node.name()}': unknown spec_mode {mode!r}."
+            )
+
         D1_q      = _qty("D1_str", "D1_unit")
         D2_q      = _qty("D2_str", "D2_unit")
         D1_si     = D1_q.to("m").magnitude
@@ -2337,7 +2473,7 @@ class NetworkScreen(QWidget):
         t    = spec.get("type")
         if t == "valve":
             vt = spec.get("valve_type", "globe")
-            if vt == "butterfly":
+            if vt in ("butterfly", "user_specified"):
                 return _qty_to_m(spec.get("D_str"), spec.get("D_unit", "inch"))
             D1 = _qty_to_m(spec.get("D1_str"), spec.get("D1_unit", "inch"))
             D2 = _qty_to_m(spec.get("D2_str"), spec.get("D2_unit", "inch"))

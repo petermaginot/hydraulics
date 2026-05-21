@@ -107,6 +107,7 @@ from component_classes import (
     Base_Contraction_Expansion,
     Base_Valve,
     Base_CheckValve,
+    downsample_profile,
     ureg,
 )
 
@@ -615,111 +616,7 @@ class Contraction_Expansion(Base_Contraction_Expansion):
         )
 
 
-# ---------------------------------------------------------------------------
-# Profile downsampling
-# ---------------------------------------------------------------------------
-
-def downsample_profile(profile, max_step_m=1000.0,
-                       slope_tol=1e-6, diameter_tol=1e-9):
-    """Downsample a pipe-segment profile, keeping only geometrically
-    meaningful points and enforcing a maximum spacing between them.
-
-    Profile is the list-of-tuples format used by Base_Line_Segment: each
-    row is (distance_m, elevation_m, D_h_m, flow_area_m2).  The same
-    format is returned, sorted by distance and starting at the first
-    row of the input.
-
-    Closely-spaced profile points dramatically slow compressible-flow
-    integrations because compressible_pipe_segment() is called once per
-    consecutive point pair.  This helper produces a coarser profile
-    that retains the features that actually affect the result:
-
-      * The first and last point are always kept.
-      * Both points bounding any diameter change are kept, so the
-        area-change correction sees the correct A_in/A_out.
-      * Any interior point whose left-slope (to its previous neighbor)
-        differs from its right-slope (to its next neighbor) by more
-        than slope_tol is kept -- i.e. grade breaks and other polyline
-        vertices.
-      * Between any two kept points whose spacing exceeds max_step_m,
-        evenly-spaced intermediate points are inserted from the
-        original profile to cap the spacing.
-
-    Args:
-        profile      : list of (dist_m, elev_m, D_h_m, A_m2) tuples,
-                       sorted by ascending distance.
-        max_step_m   : float, maximum allowed spacing [m] between
-                       retained points.  Default 1000.0.
-        slope_tol    : float, slope-difference threshold for declaring
-                       a polyline vertex (dimensionless m/m).
-                       Default 1e-6.
-        diameter_tol : float, |dD_h| threshold for declaring a
-                       diameter change [m].  Default 1e-9.
-
-    Returns:
-        New list of profile rows.  Always at least min(2, len(profile))
-        points.
-    """
-    n = len(profile)
-    if n <= 2:
-        return list(profile)
-
-    keep = [False] * n
-    keep[0]  = True
-    keep[-1] = True
-
-    # Diameter changes -- keep both sides of the step so an area-change
-    # correction can be applied across the discontinuity.
-    for i in range(1, n):
-        if abs(profile[i][2] - profile[i - 1][2]) > diameter_tol:
-            keep[i - 1] = True
-            keep[i]     = True
-
-    # Polyline slope breaks.
-    for i in range(1, n - 1):
-        d0, e0 = profile[i - 1][0], profile[i - 1][1]
-        d1, e1 = profile[i    ][0], profile[i    ][1]
-        d2, e2 = profile[i + 1][0], profile[i + 1][1]
-        # Guard against duplicate-distance rows: if either neighbor sits
-        # at the same station, the slope is undefined -- keep the point
-        # rather than silently dropping a possible vertex.
-        if d1 <= d0 or d2 <= d1:
-            keep[i] = True
-            continue
-        slope_left  = (e1 - e0) / (d1 - d0)
-        slope_right = (e2 - e1) / (d2 - d1)
-        if abs(slope_right - slope_left) > slope_tol:
-            keep[i] = True
-
-    # Enforce max_step by inserting points from the original profile
-    # wherever the spacing between consecutive kept points is too large.
-    kept_idx = [i for i, k in enumerate(keep) if k]
-    final_idx = [kept_idx[0]]
-    for k in range(1, len(kept_idx)):
-        i0 = final_idx[-1]
-        i1 = kept_idx[k]
-        gap = profile[i1][0] - profile[i0][0]
-        if gap > max_step_m:
-            n_sub = int(math.ceil(gap / max_step_m))
-            for j in range(1, n_sub):
-                target = profile[i0][0] + j * gap / n_sub
-                lo = final_idx[-1] + 1
-                hi = i1 - 1
-                if lo > hi:
-                    break
-                best = lo
-                best_diff = abs(profile[best][0] - target)
-                for m in range(lo + 1, hi + 1):
-                    diff = abs(profile[m][0] - target)
-                    if diff < best_diff:
-                        best = m
-                        best_diff = diff
-                if best > final_idx[-1]:
-                    final_idx.append(best)
-        final_idx.append(i1)
-
-    return [profile[i] for i in final_idx]
-
+# downsample_profile is defined in component_classes and imported above.
 
 # ---------------------------------------------------------------------------
 # Flow-rate helper

@@ -1,6 +1,6 @@
 # Pipe-network solver — status
 
-A general directed-graph solver for pipe networks built on top of the existing component classes in [incompressible.py](incompressible.py) and [compressible_flow.py](compressible_flow.py) (and the base geometry / CSV-loading code in [component_classes.py](component_classes.py)). Two solvers live alongside the existing per-component physics:
+A general directed-graph solver for pipe networks built on top of the existing component classes in [incompressible.py](incompressible.py) and [compressible_flow.py](compressible_flow.py) (and the base geometry / CSV-loading code in [component_classes.py](component_classes.py)).  `component_classes.py` also exposes `downsample_profile(profile, max_step_m=1000, elev_tol=0, ...)`, a helper that reduces dense survey CSVs (e.g. QGIS polyline exports) to the points that actually affect the solver: diameter-change boundaries, elevation slope-breaks above `elev_tol`, and a maximum spacing cap — substantially cutting the number of pipe slices and therefore solve time for compressible cases. Two solvers live alongside the existing per-component physics:
 
 - [network.py](network.py) — `Network`, the incompressible-flow solver.
 - [compressible_network.py](compressible_network.py) — `Compressible_Network`, a subclass that handles compressible flow with uniform composition.
@@ -311,7 +311,9 @@ callers who need to mix in custom subclasses.
   **either** the full `profile` point list **or** a `csv_path` (and the
   loader re-reads the CSV via `from_csv()` so edits to the CSV propagate
   without re-saving the network).  CSV origin is tracked via a
-  `_csv_path` attribute set by `from_csv()`.
+  `_csv_path` attribute set by `from_csv()`.  `from_csv()` also accepts
+  `downsample` (bool or float — max step [m]) and `elev_tol` (float [m]) to
+  pass through to `downsample_profile()` before constructing the segment.
 - `Base_Bend`: `Di_m`, `ang_deg`, `bend_dias`, `name`.
 - `Base_Valve` / `Base_CheckValve`: `Di_m`, `K`, `name`.  The K-factor is
   the resolved Crane value; the original valve "type" (globe/gate/...)

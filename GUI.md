@@ -66,7 +66,7 @@ Four radio choices ("Point-to-point: Incompressible (liquid)" / "Point-to-point:
 Two tabs:
 
 - **Manual** — fields for ID (or OD + WT), length, elevation change, roughness, each with a unit dropdown. Builds a 2-point `Base_Line_Segment` via the regime-appropriate `Line_Segment` subclass.
-- **Load CSV profile** — file picker plus a roughness input. Reuses `Line_Segment.from_csv()`; the CSV header determines geometry mode (`ID`/`OD`/`WT` or `D_h`/`flow_area`).
+- **Load CSV profile** — file picker plus a roughness input. Reuses `Line_Segment.from_csv()`; the CSV header determines geometry mode (`ID`/`OD`/`WT` or `D_h`/`flow_area`).  A **Downsample profile** checkbox (off by default) enables profile thinning before the segment is built: when checked, **Max step** (default 1000 m) caps the spacing between retained points, and **Elev. tol.** (default 0.1 m) suppresses slope-break points whose elevation hasn't moved enough from the last retained point — useful for QGIS polyline exports where the quantized elevation model produces many nearly-redundant step boundaries.  Internally the checkbox calls `downsample_profile()` from [component_classes.py](component_classes.py).
 
 After a successful build, the screen draws an **ID-vs-distance** chart (pyqtgraph) on the left Y axis and an **elevation-vs-distance** overlay on a linked secondary right-hand Y axis. The X axis is in feet, ID in inches, elevation in feet by default — `pyqtgraph`'s SI-prefix scaler is intentionally bypassed for engineering English. A summary line reports points / length / net elevation change.
 
@@ -124,12 +124,14 @@ A "pipe" in the underlying `Network` solver is **not** one canvas node — it's 
 |        NodeGraphQt canvas (3 : 1 split)      |   (stacked editor)       |
 |                                              +--------------------------+
 |                                              | Result display units     |
-|                                              |   pressure / flow        |
+|                                              |   pressure / flow        |  ← incompressible only
 |                                              +--------------------------+
 |                                              | Results (text panel)     |
 +----------------------------------------------+--------------------------+
 [<- Back]
 ```
+
+For the **compressible** network screen the "Result display units" row is absent — those combos (pressure / flow / temperature) live on the Composition screen to the right of the EOS + mode selectors, freeing the side panel for a taller Results text area. `main.py` wires the combos to `_rerender_with_current_units` after both screens are constructed.
 
 ### Selected-node editor
 
@@ -137,7 +139,7 @@ A `QStackedWidget` with one page per node family, automatically swapped via `nod
 
 - **Source/Sink editor** — `P`, `Q_ext`, and elevation. The P / Q_ext fields are mutually exclusive: typing in one disables the other (`_update_PQ_exclusivity`), matching the solver's `P xor Q_ext` rule per node. The compressible subclass adds a `T` row (required on every Source/Sink even when it's currently a withdrawal — a future solve could reverse the flow and need an inflow T).
 - **Junction editor** — just elevation (decorative).
-- **Pipe Segment editor** — same shape as the point-to-point Segment screen's Manual tab (ID/OD/WT/length/dz/roughness) plus a **Load CSV...** button that switches the pipe into CSV mode. In CSV mode the manual geometry fields go read-only and display CSV-derived summaries (first/last ID, total length, net dz); a **Switch to manual** button reverts.
+- **Pipe Segment editor** — same shape as the point-to-point Segment screen's Manual tab (ID/OD/WT/length/dz/roughness). Below the geometry fields, **Max step** and **Elev. tol.** control profile thinning (enabled only when the **Downsample profile** checkbox is checked). The bottom two rows of the editor are: `[Load CSV...]  [□ Downsample profile]` and `[Apply]  [Switch to manual]`. **Load CSV...** switches the pipe into CSV mode (manual geometry fields go read-only, showing CSV-derived summaries); **Switch to manual** reverts. The downsample settings round-trip through Save / Load so the in-memory profile matches what the user originally configured.
 - **Fitting / Valve / Check Valve editors** — type-specific geometry (ID, angle, R/D, D1/D2, etc.) feeding the corresponding `fluids.fittings.K_*_Crane` correlation at solve time.
 
 ### Solving
@@ -159,7 +161,7 @@ After a successful solve, results land in two places:
 - **On the canvas** — each `SourceSinkNode` gets `P=… psi`, `T=…` (compressible only), and `Q=…` (flow into / out of the network). Each `JunctionNode` gets `P=…` and (compressible only) `T=…`. Each inline node gets a primary readout (`dP=…` for incompressible, outlet `P=…` for compressible — same widget field reused), `T=…` (compressible only), and signed `Q=…`. The incompressible per-block dP comes from `result.component(seg)`; the compressible per-block (P, T) comes from `result["component_outlet_PT"][edge_name][pos]` (see [network.md](network.md) for the solver side).
 - **In the side text panel** — a tab-aligned summary: convergence flag, every node's P (and T for compressible), every edge's signed flow, every boundary node's external Q. Currently flow magnitudes near zero are suppressed in the external-flow listing.
 
-The **Result display units** combos re-render both the canvas annotations and the text panel without re-running the solver. The default panel has Pressure and Flow; the compressible subclass appends a Temperature row via the `_add_extra_display_unit_rows(form)` hook. The flow combo lists both volumetric and mass units; `_convert_flow` picks the right source (`mdot_kgs` or `Q_m3s`) by checking the unit's pint dimensionality against cached mass-flow and volumetric-flow signatures.
+The **Result display units** combos re-render both the canvas annotations and the text panel without re-solving. For the incompressible network the combos (Pressure, Flow) live in the side panel's "Result display units" group box. For the compressible network the combos (Pressure, Flow, Temperature) live on the Composition screen — see that section — and are connected to the same `_rerender_with_current_units` handler by `main.py`. The flow combo lists both volumetric and mass units; `_convert_flow` picks the right source (`mdot_kgs` or `Q_m3s`) by checking the unit's pint dimensionality against cached mass-flow and volumetric-flow signatures.
 
 ### Per-block inspector
 
@@ -173,6 +175,24 @@ For the incompressible case all rows come from `result.component(comp)` — `pre
 
 ---
 
+## Composition screen — [`composition.py`](gui/screens/composition.py)
+
+The first stop for the compressible-network workflow, reached from Start before the canvas. Collects the gas composition, the equation of state, and the result display units, then stashes an unanchored `AbstractState` on `AppState.fluid`.
+
+**Left column — composition + EOS + mode:**
+
+- A `QTableWidget` of `(Component, Mole fraction)` rows seeded with Methane = 1.0. `+ Component` / `- Remove` / `Load CSV...` buttons manage the table; per-row combo boxes filter out names already in use so duplicates can't form.
+- EOS dropdown (`HEOS` / `PR`).
+- **Adiabatic / Isothermal** radio buttons. Isothermal is currently disabled (the network solver only supports adiabatic; the radio is shown greyed so the limitation is visible up front).
+
+**Right column — Result display units:**
+
+Three dropdowns — Pressure, Flow (mass / molar / standard-volume), and Temperature — that control how solved results are rendered on the compressible network canvas and in its text panel. These combos (`self.d_pressure`, `self.d_flow`, `self.d_temperature`) are stored as instance attributes; `main.py` assigns them to the `CompressibleNetworkScreen` after construction and connects their `currentTextChanged` signals to `_rerender_with_current_units`, so changing a unit here immediately re-renders the last solve.
+
+**Build →** validates the composition table, calls `composition.define_composition(**kwargs)`, stashes the resulting `AbstractState` (and the isothermal flag) on `AppState`, clears any stale point-to-point solver state, and navigates to the compressible network canvas.
+
+---
+
 ## Compressible Network screen — [`compressible_network.py`](gui/screens/compressible_network.py)
 
 `CompressibleNetworkScreen` subclasses `NetworkScreen` and overrides the regime-specific knobs:
@@ -180,7 +200,7 @@ For the incompressible case all rows come from `result.component(comp)` — `pre
 - **Component classes** — `LINE_SEGMENT_CLS`, `BEND_CLS`, `VALVE_CLS`, `CHECKVALVE_CLS`, `CONTRACTION_EXP_CLS` all swap to their `compressible_flow.*` equivalents; `NETWORK_CLS` swaps to `Compressible_Network`. Because the base class's `_build_*_component` helpers reach for these via `self`, the editor stack, chain walker, and canvas rendering are entirely inherited.
 - **Fluid panel** — replaced with a read-only label summarising the composition / EOS / mode that `CompressibleCompositionScreen` stashed on `AppState.fluid`. The Composition screen runs first in the start-screen routing for this regime.
 - **Source/Sink editor** — adds a `T` row (the required-on-every-Source/Sink rule lives in `_extra_kwargs_for_boundary`).
-- **Display units** — adds a Temperature combo (`degF` default) via the `_add_extra_display_unit_rows` hook.
+- **Display units** — the Pressure / Flow / Temperature combos live on the Composition screen (see below), not in the network side panel. `main.py` assigns those combo widgets to `d_pressure`, `d_flow`, and `d_temperature` on this screen after both screens are constructed, and connects their `currentTextChanged` signals to `_rerender_with_current_units`. The side panel's display-units group box is replaced with a hidden zero-height placeholder.
 - **Result rendering** — the compressible solver returns a flat dict; `_annotate_results_on_canvas` fills `P` + `T` + external `Q` on Source/Sink, `P` + `T` on Junction, and outlet `P` + `T` + edge `mdot` on inline blocks. The per-block (P, T) come from `result["component_outlet_PT"]`, indexed by each inline node's `self._inline_chain_pos`. Per-component `dP` is not separately surfaced (the user can read consecutive P values off the canvas instead).
 - **Solver progress** — `Compressible_Network.solve()` accepts a `progress_callback(nfev, residual_norm)` that fires from inside its `residuals()` after each evaluation. `CompressibleNetworkScreen._solve_network` overrides the base no-op to seed `results_text` with "Solving..." and pass `_on_solve_progress` into the solver. The callback throttles to ~150 ms, rewrites the panel with `nfev` / residual norm / elapsed seconds, and calls `QApplication.processEvents()` so the UI repaints mid-solve. The base `NetworkScreen._solve` wraps the solve in a `try/finally` that disables `self._solve_btn` for the duration — necessary because `processEvents()` would otherwise let a second click re-enter `_solve`. The final `_render_results_text` overwrites the progress line with the normal result table.
 
@@ -224,7 +244,10 @@ preserves the user's input units and the OD/WT-vs-ID and valve-type
 intent that gets flattened on the network side), and the canvas
 connections by port name.  CSV-backed pipes have their `csv_path`
 rewritten relative to the save file in `gui_extras` so the bundle is
-portable as long as the CSVs move with it.
+portable as long as the CSVs move with it.  If the user had downsampling
+enabled on a CSV pipe, `downsample_max_step_m` and `downsample_elev_tol_m`
+are also stored in the spec dict so **Load** can re-apply the identical
+`downsample_profile()` call and reproduce the same reduced profile.
 
 **Load** reads the JSON, validates same-regime files by calling
 `screen.NETWORK_CLS.from_dict(payload)` (catches malformed components,

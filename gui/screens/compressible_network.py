@@ -31,11 +31,11 @@ import CoolProp.CoolProp as CP
 
 from PySide6.QtWidgets import (
     QApplication,
-    QComboBox,
     QFormLayout,
     QGroupBox,
     QLabel,
     QVBoxLayout,
+    QWidget,
 )
 
 import compressible_flow
@@ -155,18 +155,16 @@ class CompressibleNetworkScreen(NetworkScreen):
         spec["T_unit"] = self.ss_T.combo.currentText()
 
     # ------------------------------------------------------------------
-    # Display-units hook: add a Temperature combo so result T values can be
-    # rendered in the user's preferred scale on the canvas.
+    # Display-units: combos live on the composition screen.
+    # main.py assigns d_pressure / d_flow / d_temperature to this instance
+    # after construction and connects their signals.
     # ------------------------------------------------------------------
 
-    def _add_extra_display_unit_rows(self, form):
-        self.d_temperature = QComboBox()
-        self.d_temperature.addItems(U.TEMPERATURE)
-        self.d_temperature.setCurrentText("degF")
-        self.d_temperature.currentTextChanged.connect(
-            self._rerender_with_current_units
-        )
-        form.addRow("Temperature:", self.d_temperature)
+    def _build_display_units_box(self):
+        # Provide the attribute the base-class side-panel wiring expects,
+        # but keep it invisible so it takes no layout space.
+        self.display_box = QWidget()
+        self.display_box.setVisible(False)
 
     def _extra_kwargs_for_boundary(self, spec, node_name):
         if spec.get("type") != "source_sink":
@@ -206,7 +204,7 @@ class CompressibleNetworkScreen(NetworkScreen):
         self._solve_last_update = now
         elapsed = now - self._solve_t0
         self.results_text.setPlainText(
-            f"Solving... nfev={nfev}, "
+            f"Solving... Iteration number {nfev}, "
             f"residual={residual_norm:.3e}, "
             f"elapsed={elapsed:.1f}s"
         )

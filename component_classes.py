@@ -176,6 +176,135 @@ def _flow_props_from_id(id_m):
 
 
 # ---------------------------------------------------------------------------
+# Profile downsampling
+# ---------------------------------------------------------------------------
+
+def downsample_profile(profile, max_step_m=1000.0,
+                       slope_tol=1e-6, diameter_tol=1e-9, elev_tol=0.0):
+    """Downsample a pipe-segment profile, keeping only geometrically
+    meaningful points and enforcing a maximum spacing between them.
+
+    Profile is the list-of-tuples format used by Base_Line_Segment: each
+    row is (distance_m, elevation_m, D_h_m, flow_area_m2).  The same
+    format is returned.
+
+    Closely-spaced profile points dramatically slow compressible-flow
+    integrations because the solver is called once per consecutive point
+    pair.  This helper produces a coarser profile that retains the
+    features that actually affect the result:
+
+      * The first and last point are always kept.
+      * Both points bounding any diameter change are kept, so area-change
+        corrections see the correct A_in/A_out.
+      * Any interior point whose left-slope (to its previous neighbor)
+        differs from its right-slope (to its next neighbor) by more than
+        slope_tol is kept -- i.e. grade breaks and other polyline vertices.
+      * When elev_tol > 0, slope-break-only points are then filtered: a
+        point is dropped if its elevation is within elev_tol of the last
+        retained point's elevation.  Diameter-change points are exempt.
+        This removes the redundant pairs that quantized elevation models
+        (e.g. QGIS polyline exports) produce at every step boundary.
+      * Between any two kept points whose spacing exceeds max_step_m,
+        evenly-spaced intermediate points are inserted from the original
+        profile to cap the spacing.
+
+    Args:
+        profile      : list of (dist_m, elev_m, D_h_m, A_m2) tuples,
+                       sorted by ascending distance.
+        max_step_m   : float, maximum allowed spacing [m] between
+                       retained points.  Default 1000.0.
+        slope_tol    : float, slope-difference threshold for declaring
+                       a polyline vertex (dimensionless m/m).
+                       Default 1e-6.
+        diameter_tol : float, |dD_h| threshold for declaring a
+                       diameter change [m].  Default 1e-9.
+        elev_tol     : float, minimum elevation change [m] from the last
+                       retained point required to keep a slope-break
+                       point.  0.0 (default) disables this filter.
+
+    Returns:
+        New list of profile rows.  Always at least min(2, len(profile))
+        points.
+    """
+    n = len(profile)
+    if n <= 2:
+        return list(profile)
+
+    keep = [False] * n
+    keep[0]  = True
+    keep[-1] = True
+
+    # Diameter changes -- keep both sides of the step so an area-change
+    # correction can be applied across the discontinuity.
+    diameter_required = {0, n - 1}
+    for i in range(1, n):
+        if abs(profile[i][2] - profile[i - 1][2]) > diameter_tol:
+            keep[i - 1] = True
+            keep[i]     = True
+            diameter_required.add(i - 1)
+            diameter_required.add(i)
+
+    # Polyline slope breaks.
+    for i in range(1, n - 1):
+        d0, e0 = profile[i - 1][0], profile[i - 1][1]
+        d1, e1 = profile[i    ][0], profile[i    ][1]
+        d2, e2 = profile[i + 1][0], profile[i + 1][1]
+        # Guard against duplicate-distance rows: undefined slope, keep the
+        # point rather than silently dropping a possible vertex.
+        if d1 <= d0 or d2 <= d1:
+            keep[i] = True
+            continue
+        slope_left  = (e1 - e0) / (d1 - d0)
+        slope_right = (e2 - e1) / (d2 - d1)
+        if abs(slope_right - slope_left) > slope_tol:
+            keep[i] = True
+
+    # Elevation-tolerance filter: drop slope-break-only points whose
+    # elevation is within elev_tol of the last retained point's elevation.
+    # Diameter-change points are always exempt.
+    if elev_tol > 0.0:
+        last_elev = profile[0][1]
+        for i in range(1, n - 1):
+            if not keep[i]:
+                continue
+            if i in diameter_required:
+                last_elev = profile[i][1]
+            elif abs(profile[i][1] - last_elev) < elev_tol:
+                keep[i] = False
+            else:
+                last_elev = profile[i][1]
+
+    # Enforce max_step by inserting points from the original profile
+    # wherever the spacing between consecutive kept points is too large.
+    kept_idx = [i for i, k in enumerate(keep) if k]
+    final_idx = [kept_idx[0]]
+    for k in range(1, len(kept_idx)):
+        i0 = final_idx[-1]
+        i1 = kept_idx[k]
+        gap = profile[i1][0] - profile[i0][0]
+        if gap > max_step_m:
+            n_sub = int(math.ceil(gap / max_step_m))
+            for j in range(1, n_sub):
+                target = profile[i0][0] + j * gap / n_sub
+                lo = final_idx[-1] + 1
+                hi = i1 - 1
+                if lo > hi:
+                    break
+                best = lo
+                best_diff = abs(profile[best][0] - target)
+                for m in range(lo + 1, hi + 1):
+                    diff = abs(profile[m][0] - target)
+                    if diff < best_diff:
+                        best = m
+                        best_diff = diff
+                if best > final_idx[-1]:
+                    final_idx.append(best)
+        final_idx.append(i1)
+
+    return [profile[i] for i in final_idx]
+
+
+# ---------------------------------------------------------------------------
 # Base_Line_Segment
 # ---------------------------------------------------------------------------
 
@@ -434,6 +563,8 @@ class Base_Line_Segment:
         id_tolerance=0.001,
         k_wall=None,
         name=None,
+        downsample=False,
+        elev_tol=0.0,
     ):
         """Construct a segment by loading a profile from a CSV file.
 
@@ -475,6 +606,15 @@ class Base_Line_Segment:
                            heat-transfer support.  Default None.
             name         : str or None.  Optional label for the segment.
                            Default None.
+            downsample   : bool or float.  If False (default) the full
+                           profile is used.  If True, downsample_profile()
+                           is called with its default max_step_m=1000 m.
+                           If a positive float, that value is used as
+                           max_step_m [m].
+            elev_tol     : float [m].  Passed to downsample_profile() as
+                           the minimum elevation change required to retain
+                           a slope-break point.  Only used when downsample
+                           is not False.  Default 0.0 (disabled).
 
         Returns:
             Instance of the calling class (or subclass).
@@ -540,6 +680,16 @@ class Base_Line_Segment:
         if not rows:
             raise ValueError(
                 f"Profile CSV '{csv_path}' contains no data rows."
+            )
+
+        if downsample is not False:
+            max_step_m = 1000.0 if downsample is True else float(downsample)
+            n_before = len(rows)
+            rows = downsample_profile(rows, max_step_m=max_step_m,
+                                      elev_tol=elev_tol)
+            print(
+                f"  Downsampled profile: {n_before} → {len(rows)} points "
+                f"(max_step={max_step_m:.0f} m, elev_tol={elev_tol:.3f} m)"
             )
 
         total_dist_m = max(r[0] for r in rows)
@@ -740,26 +890,74 @@ class Base_Bend:
 class Base_Valve:
     """Geometry storage for a valve fitting.
 
-    Stores the pipe inner diameter and a pre-computed K-factor (resistance
-    coefficient).  Subclasses add fluid-mechanics pressure-drop calculations
-    appropriate for the flow regime (incompressible, compressible, etc.).
+    Stores the pipe inner diameter and a resistance coefficient (K-factor).
+    The K-factor may be supplied directly, or back-calculated from a flow
+    coefficient: Cv (US, gpm/psi^0.5) or Kv (metric, m^3/h/bar^0.5).
+    Subclasses add fluid-mechanics pressure-drop calculations appropriate
+    for the flow regime (incompressible, compressible, etc.).
+
+    Exactly one of K, Cv, or Kv must be supplied.
+
+    Cv is defined as Cv = Q [gpm] * sqrt (specific gravity / ΔP [psi])
+    Kv is define similarly in metric units Kv = Q [m^3/h] * sqrt (specific gravity / ΔP [bar])
+
+    Converting units allows us to relate Cv and Kv:
+
+        Cv = 1.156 * Kv
+
+    The fluids library has correlations for valves in terms of the dimensionless K factor, so
+    we would ideally want to convert a user-specified Cv or Kv to the dimensionless K to keep 
+    the valve pressure drop calculations consistent. It's a units mess but it is doable.
+
+    You can relate the Cv-termed pressure drop to the pressure drop term
+    with the dimensionless K factor:
+
+        ΔP = K * rho * v^2/2 = (Q [gpm]/Cv)^2 * rho [lb/ft^3]/62.4
+
+    Solving for K and shaking out the units gives us:
+
+        K  = 2.166e9 * Di^4 / Cv^2     (Di in m, Cv in gpm/psi^0.5)
 
     Args:
         Di : pint Quantity or float (m if float).  Pipe inner diameter.
              Must be positive.
-        K  : float.  Resistance coefficient (K-factor), computed externally
-             and supplied at initialization.  Must be >= 0.
+        K  : float, optional.  Resistance coefficient supplied directly.
+             Must be >= 0.
+        Cv : float, optional.  US flow coefficient [gpm/psi^0.5].
+             Must be positive.
+        Kv : float, optional.  Metric flow coefficient [m^3/h/bar^0.5].
+             Must be positive.
     """
 
-    def __init__(self, Di, K, name=None):
+    def __init__(self, Di, K=None, name=None, Cv=None, Kv=None):
         self.name  = name
         self.Di_si = _to_si(Di, "m")
-        self.K     = float(K)
 
         if self.Di_si is None or self.Di_si <= 0.0:
             raise ValueError(
                 f"{self.__class__.__name__}: Di must be a positive length."
             )
+
+        n_specified = sum(v is not None for v in (K, Cv, Kv))
+        if n_specified != 1:
+            raise ValueError(
+                f"{self.__class__.__name__}: supply exactly one of K, Cv, or Kv "
+                f"(got {n_specified})."
+            )
+
+        self.Cv = float(Cv) if Cv is not None else None
+        self.Kv = float(Kv) if Kv is not None else None
+
+        if K is not None:
+            self.K = float(K)
+        else:
+            cv_used = self.Cv if self.Cv is not None else 1.156 * self.Kv
+            if cv_used <= 0.0:
+                raise ValueError(
+                    f"{self.__class__.__name__}: Cv/Kv must be positive."
+                )
+            self.K = 2.166e9 * self.Di_si ** 4 / cv_used ** 2
+
         if self.K < 0.0:
             raise ValueError(
                 f"{self.__class__.__name__}: K must be >= 0."
@@ -767,19 +965,29 @@ class Base_Valve:
 
     def __repr__(self):
         Di_q = ureg.Quantity(self.Di_si, "m")
+        extra = ""
+        if self.Cv is not None:
+            extra = f", Cv={self.Cv:.3f}"
+        elif self.Kv is not None:
+            extra = f", Kv={self.Kv:.3f}"
         return (
             f"{self.__class__.__name__}("
             f"Di={Di_q.to('inch'):.4f~P}, "
-            f"K={self.K:.4f})"
+            f"K={self.K:.4f}{extra})"
         )
 
     def to_dict(self):
-        return {
+        d = {
             "kind": "valve",
             "name": self.name,
             "Di_m": float(self.Di_si),
             "K":    float(self.K),
         }
+        if self.Cv is not None:
+            d["Cv"] = self.Cv
+        if self.Kv is not None:
+            d["Kv"] = self.Kv
+        return d
 
     @classmethod
     def from_dict(cls, payload):
@@ -788,6 +996,12 @@ class Base_Valve:
                 f"{cls.__name__}.from_dict: expected kind='valve', "
                 f"got {payload.get('kind')!r}."
             )
+        if "Cv" in payload:
+            return cls(Di=payload["Di_m"], Cv=payload["Cv"],
+                       name=payload.get("name"))
+        if "Kv" in payload:
+            return cls(Di=payload["Di_m"], Kv=payload["Kv"],
+                       name=payload.get("name"))
         return cls(Di=payload["Di_m"], K=payload["K"], name=payload.get("name"))
 
 
