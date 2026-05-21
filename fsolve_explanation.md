@@ -1,6 +1,6 @@
 # How `scipy.optimize.fsolve` Works
 
-*An explanation for someone who took multivariate calculus 20 years ago.*
+*An explanation for someone who took multivariate calculus 20 years ago (sheesh I'm old).*
 
 > **How to read this file.** The formulas below use LaTeX. In VSCode press
 > `Ctrl+Shift+V` to open the Markdown preview, or view the file on GitHub —
