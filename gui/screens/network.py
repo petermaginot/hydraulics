@@ -828,7 +828,7 @@ class NetworkScreen(QWidget):
             "the pipe velocity head.  Cv is the US flow coefficient "
             "[gpm/psi^0.5]; Kv is the metric flow coefficient "
             "[m^3/h/bar^0.5].  Cv and Kv are converted to K via "
-            "K = 2.148e9 · D^4 / Cv^2 (D in m) and Cv = 1.16 · Kv."
+            "K = 2.166e9 · D^4 / Cv^2 (D in m) and Cv = 1.156 · Kv."
         )
         user_hint.setWordWrap(True)
         user_hint.setStyleSheet("color: #777; font-style: italic;")

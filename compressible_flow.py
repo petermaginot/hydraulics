@@ -76,7 +76,10 @@ compressible_K(abstract_state, mdot, flow_area, K)
     Outlet conditions for a constant-area fitting with a known loss
     coefficient K.  Applies a single-step analytical result from the
     combined energy, continuity, entropy, and EOS derivation, then corrects
-    temperature to satisfy the stagnation-enthalpy balance.
+    temperature to satisfy the stagnation-enthalpy balance. As of this writing,
+    the single-step is taken based on inlet conditions, so this function is only 
+    accurate for relatively small pressure changes (<5% ish) where properties do
+    not appreciably change across the fitting.
 
 compressible_pipe_segment(abstract_state, mdot, dL, dz, D_h, roughness,
                           flow_area, ...)
@@ -1040,9 +1043,13 @@ def compressible_changing_area_K(
     Mass continuity is satisfied implicitly: v_out = mdot / (rho_out * A_out).
 
     The two-equation system in (P_out, T_out) is solved with
-    scipy.optimize.root using the isentropic area-change result as the
-    initial guess. Note that this routine can take a lot of iterations (and corresponding
-    abstract updates) to converge, which can take quite a long time!
+    scipy.optimize.root.  Initial guess: isentropic area-change result plus
+    a closed-form correction for the K dissipation (so high-K cases don't
+    start far from the solution).  An analytic Jacobian assembled from
+    CoolProp partials is supplied to the solver; with the HEOS mixture
+    backend each PT_INPUTS update costs ~tens of ms, but the partials at
+    the just-computed state are ~1 us, so providing the Jacobian eliminates
+    the two finite-difference column updates per Newton step.
 
     Args:
         abstract_state : CoolProp AbstractState, pre-updated to inlet (P, T)
@@ -1100,25 +1107,73 @@ def compressible_changing_area_K(
 
     H_total = H_in + 0.5 * v_in**2    # stagnation enthalpy [J/kg], conserved as no work or heat input is assumed
     e_loss  = 0.5 * K * v_in**2       # mechanical energy dissipated per unit mass [J/kg]
+    Cp_in   = AS.cpmass()             # cached for initial-guess T correction
+
+    # Residual scaling: r_energy is in J/kg (~v_in^2 magnitude), r_entropy is in
+    # J/(kg·K) (~e_loss/T_in magnitude).  Without scaling the two equations
+    # differ by 2-3 orders of magnitude and hybr wastes steps on the small one.
+    r_energy_scale  = max(v_in**2, 1.0)
+    r_entropy_scale = max(e_loss / T_in, 1e-3)
+
+    # Cache state info inside the residual so the Jacobian callback can reuse
+    # the AS partials computed at the same (P, T).  scipy's hybr calls jac
+    # separately from fun, so we key on the input vector.
+    cache = {"x": None}
 
     def residuals(x):
         P, T = x
         _safe_update_PT(AS, P, T, T_cricondentherm, P_cricondenbar, T_critical, P_critical)
-        v   = mdot / (AS.rhomass() * A_out)
+        rho = AS.rhomass()
+        v   = mdot / (rho * A_out)
         T_avg = 0.5 * (T_in + T)
         #energy balance: Stagnation enthalpy = outlet enthalpy + outlet kinetic energy
         r_energy  = AS.hmass() + 0.5 * v**2 - H_total
         #entropy accounting: Outlet entropy = inlet entropy + entropy generated from friction heating [(K*v^2/2) / average temperature]
         #note that if there are significant temperature changes, this method will lose some accuracy.
         r_entropy = AS.smass() - S_in - e_loss / T_avg
-        return [r_energy, r_entropy]
+        # Cache state-dependent quantities for the Jacobian.  AS partials are
+        # ~1 us each vs. ~100 ms for a fresh PT update on HEOS mixtures, so
+        # grabbing them now (instead of re-updating in jacobian()) is essentially free.
+        cache["x"]       = (P, T)
+        cache["v"]       = v
+        cache["rho"]     = rho
+        cache["T_avg"]   = T_avg
+        cache["dH_dP_T"] = AS.first_partial_deriv(CP.iHmass, CP.iP, CP.iT)
+        cache["dH_dT_P"] = AS.first_partial_deriv(CP.iHmass, CP.iT, CP.iP)
+        cache["dS_dP_T"] = AS.first_partial_deriv(CP.iSmass, CP.iP, CP.iT)
+        cache["dS_dT_P"] = AS.first_partial_deriv(CP.iSmass, CP.iT, CP.iP)
+        cache["dRho_dP_T"] = AS.first_partial_deriv(CP.iDmass, CP.iP, CP.iT)
+        cache["dRho_dT_P"] = AS.first_partial_deriv(CP.iDmass, CP.iT, CP.iP)
+        return [r_energy / r_energy_scale, r_entropy / r_entropy_scale]
 
-    # Initial guess: isentropic area change (K=0 limit).
-    # compressible_changing_area leaves AS at inlet conditions, 
-    # so AS is still valid for the root solver after this call.
+    def jacobian(x):
+        if cache["x"] != tuple(x):
+            #cache miss: force a residual eval to repopulate partials at this x.
+            residuals(x)
+        v       = cache["v"]
+        rho     = cache["rho"]
+        T_avg   = cache["T_avg"]
+        # v = mdot/(rho*A_out)  =>  dv/dP = -v/rho * dRho/dP,  dv/dT = -v/rho * dRho/dT
+        # r_energy = h + v^2/2 - H_total
+        dEdP = cache["dH_dP_T"] - (v * v / rho) * cache["dRho_dP_T"]
+        dEdT = cache["dH_dT_P"] - (v * v / rho) * cache["dRho_dT_P"]
+        # r_entropy = s - S_in - e_loss / T_avg,  d(1/T_avg)/dT = -0.5/T_avg^2
+        dSdP = cache["dS_dP_T"]
+        dSdT = cache["dS_dT_P"] + 0.5 * e_loss / (T_avg * T_avg)
+        return [[dEdP / r_energy_scale,  dEdT / r_energy_scale],
+                [dSdP / r_entropy_scale, dSdT / r_entropy_scale]]
+
+    # Initial guess: isentropic area change, then apply the closed-form K-correction
+    # (same form as compressible_K at low Mach) to nudge the guess in the right
+    # direction for K > 0.  Without this the solver starts at the K=0 solution
+    # and must walk the full e_loss distance.
+    # compressible_changing_area leaves AS at inlet conditions, so AS partials
+    # (Cp_in) computed above are still valid.
     P0, T0 = compressible_changing_area(AS, mdot, A_in, A_out)
+    P0 += -0.5 * K * rho_in * v_in**2
+    T0 += 0.5 * K * v_in**2 / Cp_in
 
-    sol = root(residuals, [P0, T0], method="hybr")
+    sol = root(residuals, [P0, T0], jac=jacobian, method="hybr")
 
     if not sol.success:
         raise RuntimeError(
