@@ -1190,7 +1190,7 @@ def compressible_changing_area_K(
 def compressible_K(
     abstract_state, mdot, flow_area, K,
     T_cricondentherm=None, P_cricondenbar=None,
-    T_critical=None, P_critical=None,
+    T_critical=None, P_critical=None, dPmax = 0.05,
 ):
     """Outlet conditions for a compressible fluid passing through a fitting
     with a known loss coefficient K and no area change.
@@ -1209,10 +1209,10 @@ def compressible_K(
 
     See the hand-derivation in /Derivation_images/dP_for_K
     Note that for the entropy accounting, no change in temperature is assumed across the fitting.
-    The error introduced by this is probably less than the uncertainty of the K-factor correlation for most realistic
-    scenarios. If a dramatic temperature change occurs over the fitting, you may be better off with
-    the compressible_changing_area_K function which uses the average temperature in its entropy balance.
-    That function is more rigorous but substantially more computationally intensive.
+    The error introduced by this is probably less than the uncertainty of the K-factor correlation for scenarios with minor pressure
+    changes across the fitting. If a dramatic temperature or pressure change occurs over the fitting, this function will give 
+    inaccurate results. You are better off with the compressible_changing_area_K function which uses the average temperature 
+    in its entropy balance. That function is more rigorous but substantially more computationally intensive.
 
     Args:
         abstract_state : CoolProp AbstractState, pre-updated to inlet (P, T)
@@ -1222,6 +1222,9 @@ def compressible_K(
         flow_area      : float, flow area [m^2].
         K              : float, loss coefficient referenced to inlet velocity
                          head (dimensionless, >= 0).
+        T_cricondentherm, T_cricondenbar, T_critical, P_critical : Critical point values from phase envelope
+        dPmax          : Maximum relative dP (dP/P_in) before switching to a rigorous energy/entropy balance method
+
 
     Returns:
         None.  abstract_state is updated in place to outlet conditions.
@@ -1267,34 +1270,49 @@ def compressible_K(
     dHdP_T   = AS.first_partial_deriv(CP.iHmass, CP.iP,     CP.iT)      # (dH/dP)_T
 
     # dP: derived from energy + continuity + entropy + EOS with dA = 0. See full derivation in Derivation_images/dP_for_K
-    inner  = 1.0 - (v_in**2 / rho_in) * drhodH_P
-    dP     = (-K * v_in**2 * rho_in / 2.0) / (1.0 - v_in**2 * drhodP_H / inner)
-    P_out  = P_in + dP
 
-    # dT: from thermodynamic identity dH = Cp*dT + (dH/dP)_T * dP
-    dT    = (K * v_in**2 / 2.0 + (1.0 / rho_in - dHdP_T) * dP) / Cp
-    T_out = T_in + dT
-
-    _safe_update_PT(AS, P_out, T_out, T_cricondentherm, P_cricondenbar, T_critical, P_critical)
-    #This is an initial guess for T_out, but we can perform an energy balance to make sure energy is conserved.
-    # Stagnation enthalpy is conserved (adiabatic, no elevation change).
-    # Nudge T_out so the computed state satisfies the energy balance exactly.
-    H_stag = H_in + v_in**2 / 2.0
-    rho_out_calc = AS.rhomass()
-    v_out_calc   = mdot / (flow_area * rho_out_calc)
-    energy_error = H_stag - (AS.hmass() + v_out_calc**2 / 2.0)
-    Cp_out    = AS.cpmass()
-    drhodT_P  = AS.first_partial_deriv(CP.iDmass, CP.iT, CP.iP)
-    T_out = T_out + energy_error / (Cp_out - mdot**2/(flow_area**2*rho_out_calc**3) * drhodT_P)
-    _safe_update_PT(AS, P_out, T_out, T_cricondentherm, P_cricondenbar, T_critical, P_critical)
-
-    rho_out = AS.rhomass()
-    Ma_out  = (mdot / (rho_out * flow_area)) / AS.speed_sound()
-    if Ma_out >= choke_mach_limit:
-        raise RuntimeError(
-            f"compressible_K: outlet Mach number Ma={Ma_out:.4f} is near-sonic.  "
-            f"Reduce flow rate or check geometry."
+    denominator = (1.0 - v_in**2 * drhodP_H) / ( 1.0 - (v_in**2 / rho_in) * drhodH_P)
+    dP     = (-K * v_in**2 * rho_in / 2.0) / denominator
+    
+    #Check if calculated dP is greater than maximum or if near choked conditions (denominator < 0.5) If it is, switch to a more rigorous method
+    if (abs(dP) / P_in > dPmax) or (denominator < 0.5):
+        compressible_changing_area_K(
+            abstract_state = AS, mdot = mdot, A_in=flow_area, A_out = flow_area, K = K,
+            T_cricondentherm=T_cricondentherm, P_cricondenbar=P_cricondenbar,
+            T_critical=T_critical, P_critical=P_critical,
         )
+
+    else: #small dP, not near choked
+
+        P_out  = P_in + dP
+
+        # dT: from thermodynamic identity dH = Cp*dT + (dH/dP)_T * dP
+        dT    = (K * v_in**2 / 2.0 + (1.0 / rho_in - dHdP_T) * dP) / Cp
+        T_out = T_in + dT
+
+        _safe_update_PT(AS, P_out, T_out, T_cricondentherm, P_cricondenbar, T_critical, P_critical)
+        #This is an initial guess for T_out, but we can perform an energy balance to make sure energy is conserved.
+        # Stagnation enthalpy is conserved (adiabatic, no elevation change).
+        # Nudge T_out so the computed state satisfies the energy balance exactly.
+        H_stag = H_in + v_in**2 / 2.0
+        rho_out_calc = AS.rhomass()
+        v_out_calc   = mdot / (flow_area * rho_out_calc)
+        energy_error = H_stag - (AS.hmass() + v_out_calc**2 / 2.0)
+        Cp_out    = AS.cpmass()
+        drhodT_P  = AS.first_partial_deriv(CP.iDmass, CP.iT, CP.iP)
+        T_out = T_out + energy_error / (Cp_out - mdot**2/(flow_area**2*rho_out_calc**3) * drhodT_P)
+        _safe_update_PT(AS, P_out, T_out, T_cricondentherm, P_cricondenbar, T_critical, P_critical)
+
+        rho_out = AS.rhomass()
+        Ma_out  = (mdot / (rho_out * flow_area)) / AS.speed_sound()
+        if Ma_out >= choke_mach_limit:
+            raise RuntimeError(
+                f"compressible_K: outlet Mach number Ma={Ma_out:.4f} is near-sonic.  "
+                f"Reduce flow rate or check geometry."
+            )
+
+        
+
 
 
 def compressible_pipe_segment(

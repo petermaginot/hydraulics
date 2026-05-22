@@ -36,6 +36,27 @@ import os
 from compressible_network import save_compressible_result_bundle
 
 
+def _ask_locate_csv(parent, pipe_name, missing_path, exc):
+    """Prompt the user to locate a missing CSV file; return the chosen path or None."""
+    from PySide6.QtWidgets import QMessageBox, QFileDialog
+    msg = QMessageBox(parent)
+    msg.setWindowTitle("CSV file not found")
+    msg.setText(
+        f"Pipe {pipe_name!r}: cannot open\n{missing_path}"
+        f"\n\n({type(exc).__name__}: {exc})"
+    )
+    browse_btn = msg.addButton("Browse for file…", QMessageBox.ButtonRole.ActionRole)
+    msg.addButton("Skip (use manual mode)", QMessageBox.ButtonRole.RejectRole)
+    msg.exec()
+    if msg.clickedButton() is browse_btn:
+        chosen, _ = QFileDialog.getOpenFileName(
+            parent, f"Locate CSV for {pipe_name!r}", "",
+            "CSV files (*.csv);;All files (*)",
+        )
+        return chosen or None
+    return None
+
+
 # Spec-type discriminator -> NodeGraphQt registered type id.  Both regimes
 # register the same six node classes (see network.py at the top).
 _SPEC_TYPE_TO_NODEGRAPH_TYPE = {
@@ -160,15 +181,25 @@ def load_canvas(path, screen):
     # blank for incompressible -> compressible loads.
     file_regime = payload.get("regime")
     target_regime = screen.NETWORK_CLS.REGIME
+    save_dir = os.path.dirname(os.path.abspath(path))
+
+    # Resolve relative csv_paths in the headless layer before validation.
+    # Canvas reconstruction uses gui_extras, so this mutation is harmless there.
+    from network import _resolve_csv_paths
+    _resolve_csv_paths(payload, save_dir)
+
     if file_regime == target_regime:
         # Round-trip same-regime: validate by reconstructing the Network.
         # We don't actually keep the rebuilt Network -- it would lose the
         # canvas's preferred display units -- but the construction acts
-        # as an integrity check.
-        screen.NETWORK_CLS.from_dict(payload)
+        # as an integrity check.  Suppress FileNotFoundError since missing
+        # CSVs are handled per-pipe in the canvas loop below.
+        try:
+            screen.NETWORK_CLS.from_dict(payload)
+        except (FileNotFoundError, OSError):
+            pass
 
     warnings = []
-    save_dir = os.path.dirname(os.path.abspath(path))
 
     gui_extras = payload.get("gui_extras") or {}
     canvas_nodes       = gui_extras.get("canvas_nodes",       [])
@@ -235,16 +266,36 @@ def load_canvas(path, screen):
                 spec["csv_path"]    = csv_full
                 spec["csv_profile"] = list(tmp_seg.profile)
             except Exception as exc:
-                warnings.append(
-                    f"Pipe {n.get('name', '?')!r}: could not read CSV "
-                    f"{rel_or_abs!r} ({type(exc).__name__}: {exc}). "
-                    f"Switched to manual mode -- geometry fields are blank."
-                )
-                spec["mode"] = "manual"
-                spec.pop("csv_path",              None)
-                spec.pop("csv_profile",           None)
-                spec.pop("downsample_max_step_m", None)
-                spec.pop("downsample_elev_tol_m", None)
+                new_path = _ask_locate_csv(screen, n.get("name", "?"), rel_or_abs, exc)
+                if new_path:
+                    try:
+                        tmp_seg = screen.LINE_SEGMENT_CLS.from_csv(
+                            new_path, roughness=1e-6,
+                            downsample=downsample, elev_tol=elev_tol_m,
+                        )
+                        spec["csv_path"]    = new_path
+                        spec["csv_profile"] = list(tmp_seg.profile)
+                    except Exception as exc2:
+                        warnings.append(
+                            f"Pipe {n.get('name', '?')!r}: could not read chosen file "
+                            f"({type(exc2).__name__}: {exc2}). "
+                            "Switched to manual mode -- geometry fields are blank."
+                        )
+                        spec["mode"] = "manual"
+                        spec.pop("csv_path",              None)
+                        spec.pop("csv_profile",           None)
+                        spec.pop("downsample_max_step_m", None)
+                        spec.pop("downsample_elev_tol_m", None)
+                else:
+                    warnings.append(
+                        f"Pipe {n.get('name', '?')!r}: CSV not found ({rel_or_abs!r}). "
+                        "Switched to manual mode -- geometry fields are blank."
+                    )
+                    spec["mode"] = "manual"
+                    spec.pop("csv_path",              None)
+                    spec.pop("csv_profile",           None)
+                    spec.pop("downsample_max_step_m", None)
+                    spec.pop("downsample_elev_tol_m", None)
 
         screen.node_specs[new_node.id] = spec
         old_to_new[n["id"]] = new_node

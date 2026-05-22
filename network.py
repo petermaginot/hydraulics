@@ -1038,8 +1038,10 @@ class Network:
 
     def save(self, path, *, gui_extras=None):
         """Write the network to `path` as JSON.  Pass through gui_extras."""
+        payload = self.to_dict(gui_extras=gui_extras)
+        _relativize_csv_paths(payload, os.path.dirname(os.path.abspath(path)))
         with open(path, "w", encoding="utf-8") as f:
-            json.dump(self.to_dict(gui_extras=gui_extras), f, indent=2)
+            json.dump(payload, f, indent=2)
 
     @classmethod
     def load(cls, path, *, component_classes=None):
@@ -1054,7 +1056,33 @@ class Network:
         """
         with open(path, "r", encoding="utf-8") as f:
             payload = json.load(f)
+        _resolve_csv_paths(payload, os.path.dirname(os.path.abspath(path)))
         return cls.from_dict(payload, component_classes=component_classes)
+
+
+# ---------------------------------------------------------------------------
+# CSV-path helpers used by Network.save() / Network.load() and persistence.py
+# ---------------------------------------------------------------------------
+
+def _relativize_csv_paths(payload, base_dir):
+    """Rewrite absolute csv_path entries in edges/components to be relative to base_dir."""
+    for edge in payload.get("edges", []):
+        for comp in edge.get("components", []):
+            p = comp.get("csv_path")
+            if p:
+                try:
+                    comp["csv_path"] = os.path.relpath(p, base_dir).replace("\\", "/")
+                except ValueError:
+                    pass  # different drive on Windows — leave absolute
+
+
+def _resolve_csv_paths(payload, base_dir):
+    """Resolve relative csv_path entries in edges/components to absolute paths."""
+    for edge in payload.get("edges", []):
+        for comp in edge.get("components", []):
+            p = comp.get("csv_path")
+            if p and not os.path.isabs(p):
+                comp["csv_path"] = os.path.normpath(os.path.join(base_dir, p))
 
 
 # ---------------------------------------------------------------------------

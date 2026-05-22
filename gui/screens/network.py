@@ -1880,6 +1880,30 @@ class NetworkScreen(QWidget):
                     for pos, nid in enumerate(chain_node_ids):
                         self._pipe_edge_names[nid] = edge_name
                         self._inline_chain_pos[nid] = pos
+
+        # Source/Sink nodes must have exactly one connecting edge.  A
+        # multi-edge Source/Sink hides a thermodynamic inconsistency in
+        # the compressible solver: if one of those edges happens to carry
+        # reversed flow, the outward walk leaves the node at T_spec
+        # rather than the energy-balanced mixed T of the actual incoming
+        # streams.  Mixing/splitting must be done at Junctions, whose T
+        # is back-solved by the energy balance.
+        for node in boundary_nodes:
+            spec = self.node_specs.get(node.id, {})
+            if spec.get("type") != "source_sink":
+                continue
+            ss_name = node.name()
+            touching = [
+                e for e in net._edges
+                if e.from_node == ss_name or e.to_node == ss_name
+            ]
+            if len(touching) != 1:
+                raise ValueError(
+                    f"Source/Sink '{ss_name}' has {len(touching)} "
+                    f"connected edges.  Source/Sink nodes must have "
+                    f"exactly one connection -- add a Junction node and "
+                    f"route mixing/splitting through it."
+                )
         return net
 
     def _kwargs_for_boundary(self, spec, node_name):

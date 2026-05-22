@@ -9,7 +9,10 @@ from compressible_flow import (
     Bend as Compressible_Bend,
     Contraction_Expansion as Compressible_Contraction_Expansion,
     Line_Segment as Compressible_Line_Segment,
+    Valve as Compressible_Valve,
+    _build_phase_limits,
     _resolve_mdot,
+    _safe_update_PT,
     compressible_pipe_segment,
 )
 from incompressible import (
@@ -171,6 +174,8 @@ def test_compressible_line_segment_csv():
     plt.show()
 
 
+
+
 def test_compressible_fittings():
     D_small = ureg.Quantity(3.826, "in")
     D_large = ureg.Quantity(4.026, "in")
@@ -307,10 +312,85 @@ def test_incompressible_csv_profile():
     export_pressure_profile(segment, fluid, flow_rate, output_csv, P0=P0)
 
 
+def test_K():
+    """Tests compressible_K via Valve.dP_dT across three flow regimes.
+
+    Valve: Cv=1.0, Di=0.5 inch.
+    Fluid: 100 psi / 150 °F natural gas from example_composition.csv.
+
+    Scenario 1 — linear path:  small mdot, |dP|/P_in << 5%, linearized formula used.
+    Scenario 2 — fallback:     moderate mdot, |dP|/P_in > 5%,
+                               compressible_changing_area_K invoked.
+    Scenario 3 — choked inlet: near-sonic velocity, RuntimeError raised.
+    """
+    csv_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "example_composition.csv")
+    P_in = ureg.Quantity(100, "psi").to("Pa").magnitude
+    T_in = ureg.Quantity(150, "degF").to("degK").magnitude
+
+    AS = composition.define_composition_from_csv(csv_path)
+    phase_limits = _build_phase_limits(AS)
+    T_cricondentherm, P_cricondenbar, T_critical, P_critical = phase_limits
+
+    valve = Compressible_Valve(Di=ureg.Quantity(0.5, "inch"), Cv=1.0)
+    A = math.pi * valve.Di_si ** 2 / 4.0
+
+    print("\ntest_K")
+
+    # --- Scenario 1: linear path (|dP|/P_in ~ 0.06%, denominator ~ 1.0) ---
+    mdot_s1 = ureg.Quantity(0.001, "kg/s")
+    _safe_update_PT(AS, P_in, T_in, *phase_limits)
+    H_in   = AS.hmass()
+    rho_in = AS.rhomass()
+    v_in   = mdot_s1.to("kg/s").magnitude / (rho_in * A)
+
+    valve.dP_dT(AS, mdot_s1,
+                T_cricondentherm=T_cricondentherm, P_cricondenbar=P_cricondenbar,
+                T_critical=T_critical, P_critical=P_critical)
+
+    P_out1    = AS.p()
+    rel_dP1   = (P_in - P_out1) / P_in
+    v_out1    = mdot_s1.to("kg/s").magnitude / (AS.rhomass() * A)
+    energy_err = abs((H_in + v_in**2 / 2.0) - (AS.hmass() + v_out1**2 / 2.0))
+
+    assert P_out1 < P_in, f"Scenario 1: expected P_out < P_in"
+    assert rel_dP1 < 0.05, f"Scenario 1: |dP|/P_in={rel_dP1:.3%} should be < 5% (linear regime)"
+    assert energy_err < 5.0, f"Scenario 1: stagnation-enthalpy error {energy_err:.2f} J/kg > 5 J/kg"
+    print(f"  Scenario 1 (linear):   P_out={P_out1:.0f} Pa, |dP|/P_in={rel_dP1:.3%}, "
+          f"energy residual={energy_err:.3f} J/kg")
+
+    # --- Scenario 2: fallback via |dP|/P_in > dPmax (~12-13% at this flow rate) ---
+    mdot_s2 = ureg.Quantity(0.015, "kg/s")
+    _safe_update_PT(AS, P_in, T_in, *phase_limits)
+
+    valve.dP_dT(AS, mdot_s2,
+                T_cricondentherm=T_cricondentherm, P_cricondenbar=P_cricondenbar,
+                T_critical=T_critical, P_critical=P_critical)
+
+    P_out2  = AS.p()
+    rel_dP2 = (P_in - P_out2) / P_in
+
+    assert P_out2 < P_in, f"Scenario 2: expected P_out < P_in"
+    assert rel_dP2 > 0.05, f"Scenario 2: |dP|/P_in={rel_dP2:.3%} should be > 5% (fallback regime)"
+    print(f"  Scenario 2 (fallback): P_out={P_out2:.0f} Pa, |dP|/P_in={rel_dP2:.3%}")
+
+    # --- Scenario 3: Ma_in >= 0.98, RuntimeError expected ---
+    mdot_s3 = ureg.Quantity(0.25, "kg/s")
+    _safe_update_PT(AS, P_in, T_in, *phase_limits)
+
+    try:
+        valve.dP_dT(AS, mdot_s3,
+                    T_cricondentherm=T_cricondentherm, P_cricondenbar=P_cricondenbar,
+                    T_critical=T_critical, P_critical=P_critical)
+        raise AssertionError("Scenario 3: expected RuntimeError for choked flow but none was raised")
+    except RuntimeError as e:
+        print(f"  Scenario 3 (choked):   RuntimeError correctly raised: {e}")
+
+
 if __name__ == "__main__":
     # test_compressible_fittings()
     # test_compressible_line_segment_csv()
     # test_comp_hydraulics()
     # test_incompressible_p2p()
     # test_incompressible_cont()
-    test_incompressible_csv_profile()
+    # test_incompressible_csv_profile()
+    test_K()

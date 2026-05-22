@@ -138,7 +138,7 @@ Modeled as adiabatic. Adds **`dP_dT(abstract_state, flow_rate, ...)`** which obt
 
   via `scipy.optimize.root` (hybrid method), with the isentropic ideal gas result as the initial guess. Updates the `AbstractState` in place. This function is rather slow, as the scipy root finding takes a lot of iterations with a lot of abstract state updates, but unfortunately there's no easy one-step process to estimate this.
 
-- **`compressible_K(abstract_state, mdot, flow_area, K, ...)`** — outlet conditions for a constant-area fitting (e.g. bend, valve) with a known `K`. Applies a single-step analytical result derived from the combined energy + continuity + entropy + EOS equations with `dA = 0`:
+- **`compressible_K(abstract_state, mdot, flow_area, K, dPmax=0.05, ...)`** — outlet conditions for a constant-area fitting (e.g. bend, valve) with a known `K`. Applies a single-step analytical result derived from the combined energy + continuity + entropy + EOS equations with `dA = 0`:
 
   ```
   dP = -K·v²·ρ/2  /  [1  −  v²·(∂ρ/∂P)_H / (1 − (v²/ρ)·(∂ρ/∂H)_P)]
@@ -146,6 +146,8 @@ Modeled as adiabatic. Adds **`dP_dT(abstract_state, flow_rate, ...)`** which obt
   ```
 
   For low Mach numbers `dP` reduces to the familiar `−K·ρ·v²/2`. A one-iteration Newton correction is then applied to `T_out` to enforce stagnation-enthalpy conservation exactly. A somewhat illegible handwritten derivation appears in the Derivation_images folder.
+
+  **Adaptive fallback:** after computing the linearized `dP`, if `|dP|/P_in > dPmax` (default 5%) or the compressibility denominator `< 0.5` (indicating near-sonic conditions where the linearization breaks down), the function automatically delegates to `compressible_changing_area_K` with `A_in = A_out`. This makes `Valve.dP_dT` and `Bend.dP_dT` regime-aware without any API change. Pass a larger `dPmax` to force the fast path, or smaller to be more conservative.
 
 ### Helpers
 
@@ -157,7 +159,7 @@ Modeled as adiabatic. Adds **`dP_dT(abstract_state, flow_rate, ...)`** which obt
 
   This function builds the phase envelope on a temporary abstract state so the working abstract state's internal solver state is not corrupted.  CoolProp's build_phase_envelope leaves the AbstractState at the last envelope point it visited; subsequent update() calls on the same object then fail unpredictably.
 
-  The envelope tracer is fragile (some HEOS mixtures and the PR backend can fail to converge), so the critical-point query is wrapped separately.  When the envelope fails but the critical point succeeds, returns (None, None, T_critical, P_critical) -- callers can still use the critical point as a coarser phase hint via _safe_update_PT.
+  The envelope tracer is fragile (some HEOS or Peng Robinson mixtures can fail to converge), so the critical-point query is wrapped separately.  When the envelope fails but the critical point succeeds, returns (None, None, T_critical, P_critical) -- callers can still use the critical point as a coarser phase hint via _safe_update_PT.
 - **`_safe_update_PT(AS, P, T, ...)`** — wraps `AS.update(PT_INPUTS, ...)` with an explicit phase hint when the state is definitely outside the two-phase region. Bypasses CoolProp's internal phase-stability analysis, which can return false two-phase detections near the envelope for some mixtures. This function is dramatically faster and more reliable than using CoolProp's native abstract state update function when operating well outside of the two-phase region.
 
 ---
@@ -217,3 +219,6 @@ File for containing utility functions.
 
 ## To do's
 -Add orifice plates
+-Handle flow choking due to pipe area, friction, or heat transfer on pipe segments
+-Handle cavitation checks for incompressible fluids (need to add fluid vapor pressure as property)
+-Add heat transfer calculation to pipe segments

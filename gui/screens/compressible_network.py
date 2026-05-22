@@ -245,8 +245,15 @@ class CompressibleNetworkScreen(NetworkScreen):
             if t == "source_sink":
                 name = node.name()
                 P_Pa = P_dict.get(name)
-                T_K  = T_dict.get(name)
                 mass = ext_mdot_dict.get(name)
+                # Acting as sink: show the temperature of the fluid
+                # actually arriving (the upstream-edge outlet T), not the
+                # user's backup T_spec.  Acting as source / zero-flow:
+                # T_spec IS the supply T, so keep the solver's echo.
+                if mass is not None and mass < 0.0:
+                    T_K = self._sink_arriving_T_K(name, result)
+                else:
+                    T_K = T_dict.get(name)
                 self._set_widget(node, "P_result",
                                  self._format_pressure(P_Pa, P_unit))
                 self._set_widget(node, "T_result",
@@ -293,10 +300,23 @@ class CompressibleNetworkScreen(NetworkScreen):
             lines.append(f"  {name:<16} {P_val:>12.3f}")
         lines.append("")
 
+        ss_names = {
+            self.graph.get_node_by_id(nid).name()
+            for nid, spec in self.node_specs.items()
+            if spec.get("type") == "source_sink"
+            and self.graph.get_node_by_id(nid) is not None
+        }
+        ext_mdot_dict = result["Q_ext_mdot_kgs"]
         lines.append(f"Node temperatures ({T_unit}):")
         for name, T_K in result["T_K"].items():
+            note = ""
+            if name in ss_names:
+                mass = ext_mdot_dict.get(name)
+                if mass is not None and mass < 0.0:
+                    T_K = self._sink_arriving_T_K(name, result)
+                    note = "  (arriving)"
             T_val = ureg.Quantity(T_K, "K").to(U.to_pint(T_unit)).magnitude
-            lines.append(f"  {name:<16} {T_val:>12.3f}")
+            lines.append(f"  {name:<16} {T_val:>12.3f}{note}")
         lines.append("")
 
         lines.append(f"Edge mass flow ({Q_unit}, sign per nominal direction):")
@@ -403,6 +423,37 @@ class CompressibleNetworkScreen(NetworkScreen):
             if e.name == edge_name:
                 return e
         raise KeyError(f"edge {edge_name!r} not on last solved network")
+
+    def _sink_arriving_T_K(self, ss_name, result):
+        """T_K of the fluid actually arriving at a sink-acting Source/Sink.
+
+        Source/Sinks are constrained to a single connecting edge at
+        build time (see NetworkScreen._build_network), so this is the
+        flow-direction outlet of the last component on that one edge --
+        which mirrors what the energy balance would mix in for a
+        free-T junction at the same location.  Falls back to the spec
+        T if the result is missing the expected bookkeeping.
+        """
+        edge = next(
+            (e for e in self._last_net._edges
+             if e.from_node == ss_name or e.to_node == ss_name),
+            None,
+        )
+        if edge is None:
+            return result["T_K"][ss_name]
+        mdot    = result["mdot_kgs"][edge.name]
+        pt_list = result.get("component_outlet_PT", {}).get(edge.name, [])
+        if not pt_list:
+            return result["T_K"][ss_name]
+        # component_outlet_PT is in original components order, each entry
+        # the flow-direction outlet of that component.  The arriving-T at
+        # ss_name is the flow-direction-last outlet on the edge -- which
+        # is pt_list[-1] when ss_name sits at edge.to_node and mdot>=0,
+        # pt_list[0] when ss_name sits at edge.from_node and mdot<0, etc.
+        if ss_name == edge.to_node:
+            return pt_list[-1][1] if mdot >= 0.0 else pt_list[0][1]
+        else:
+            return pt_list[0][1]  if mdot >= 0.0 else pt_list[-1][1]
 
     def _density_at(self, P_Pa, T_K):
         """Snapshot density at (P, T) without leaving AS perturbed."""
