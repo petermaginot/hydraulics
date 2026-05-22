@@ -1126,3 +1126,117 @@ class Base_Contraction_Expansion:
             Di_DS=payload["Di_DS_m"],
             name=payload.get("name"),
         )
+
+
+# ---------------------------------------------------------------------------
+# Base_Orifice
+# ---------------------------------------------------------------------------
+
+_ORIFICE_VALID_TAPS = {"corner", "D and D/2", "flange"}
+
+
+class Base_Orifice:
+    """Geometry storage for a square-edged concentric orifice plate.
+
+    Stores the pipe inner diameter, orifice bore diameter, and tap type.
+    Subclasses add fluid-mechanics pressure-drop calculations appropriate
+    for the flow regime (incompressible, compressible, etc.).
+
+    The discharge coefficient is computed per ISO 5167-2 / Reader-Harris-
+    Gallagher unless overridden.  Valid beta range for the RHG correlation
+    is 0.10–0.75; a warning is issued outside this range.
+
+    Args:
+        Di          : pint Quantity or float (m if float).  Pipe inner
+                      diameter.  Must be positive.
+        Do          : pint Quantity or float (m if float).  Orifice bore
+                      diameter.  Must satisfy 0 < Do < Di.
+        taps        : str.  Pressure tap type: 'corner' (default),
+                      'D and D/2', or 'flange'.
+        Cd_override : float or None.  Fixed discharge coefficient.  If
+                      supplied, the RHG correlation is bypassed entirely.
+                      Must be in (0, 1].  Default None.
+    """
+
+    def __init__(self, Di, Do, taps="corner", Cd_override=None, name=None):
+        self.name  = name
+        self.Di_si = _to_si(Di, "m")
+        self.Do_si = _to_si(Do, "m")
+
+        if self.Di_si is None or self.Di_si <= 0.0:
+            raise ValueError(
+                f"{self.__class__.__name__}: Di must be a positive length."
+            )
+        if self.Do_si is None or self.Do_si <= 0.0 or self.Do_si >= self.Di_si:
+            raise ValueError(
+                f"{self.__class__.__name__}: Do must satisfy 0 < Do < Di "
+                f"(got Di={self.Di_si:.6f} m, Do={self.Do_si:.6f} m)."
+            )
+
+        self.beta = self.Do_si / self.Di_si
+
+        if self.beta < 0.10 or self.beta > 0.75:
+            warnings.warn(
+                f"{self.__class__.__name__}: beta={self.beta:.4f} is outside "
+                f"the ISO 5167-2 / RHG correlation range [0.10, 0.75].  "
+                f"Discharge coefficient accuracy may be reduced.",
+                UserWarning,
+                stacklevel=2,
+            )
+
+        if taps not in _ORIFICE_VALID_TAPS:
+            raise ValueError(
+                f"{self.__class__.__name__}: taps must be one of "
+                f"{sorted(_ORIFICE_VALID_TAPS)}, got {taps!r}."
+            )
+        self.taps = taps
+
+        if Cd_override is not None:
+            Cd_override = float(Cd_override)
+            if not (0.0 < Cd_override <= 1.0):
+                raise ValueError(
+                    f"{self.__class__.__name__}: Cd_override must be in (0, 1], "
+                    f"got {Cd_override}."
+                )
+        self.Cd_override = Cd_override
+
+    def __repr__(self):
+        Di_q   = ureg.Quantity(self.Di_si, "m")
+        Do_q   = ureg.Quantity(self.Do_si, "m")
+        cd_str = (f", Cd_override={self.Cd_override:.4f}"
+                  if self.Cd_override is not None else "")
+        return (
+            f"{self.__class__.__name__}("
+            f"Di={Di_q.to('inch'):.4f~P}, "
+            f"Do={Do_q.to('inch'):.4f~P}, "
+            f"beta={self.beta:.4f}, "
+            f"taps={self.taps!r}"
+            f"{cd_str})"
+        )
+
+    def to_dict(self):
+        d = {
+            "kind": "orifice",
+            "name": self.name,
+            "Di_m": float(self.Di_si),
+            "Do_m": float(self.Do_si),
+            "taps": self.taps,
+        }
+        if self.Cd_override is not None:
+            d["Cd_override"] = self.Cd_override
+        return d
+
+    @classmethod
+    def from_dict(cls, payload):
+        if payload.get("kind") != "orifice":
+            raise ValueError(
+                f"{cls.__name__}.from_dict: expected kind='orifice', "
+                f"got {payload.get('kind')!r}."
+            )
+        return cls(
+            Di=payload["Di_m"],
+            Do=payload["Do_m"],
+            taps=payload.get("taps", "corner"),
+            Cd_override=payload.get("Cd_override"),
+            name=payload.get("name"),
+        )

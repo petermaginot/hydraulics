@@ -1,0 +1,225 @@
+{
+  "format_version": 1,
+  "regime": "compressible",
+  "nodes": [
+    {
+      "name": "Source/Sink",
+      "elevation_m": 0.0,
+      "P_Pa": null,
+      "Q_ext": {
+        "magnitude": 1.0,
+        "unit": "mmscf / day"
+      },
+      "T_K": 299.81666666666666
+    },
+    {
+      "name": "Junction",
+      "elevation_m": 0.0,
+      "P_Pa": null,
+      "Q_ext": null
+    },
+    {
+      "name": "Source/Sink 1",
+      "elevation_m": 0.0,
+      "P_Pa": 689475.7293168363,
+      "Q_ext": null,
+      "T_K": 294.2611111111111
+    },
+    {
+      "name": "Junction 1",
+      "elevation_m": 0.0,
+      "P_Pa": null,
+      "Q_ext": null
+    }
+  ],
+  "edges": [
+    {
+      "name": "Source/Sink->Source/Sink 1",
+      "from_node": "Source/Sink",
+      "to_node": "Source/Sink 1",
+      "components": [
+        {
+          "kind": "line_segment",
+          "name": "Pipe Segment",
+          "roughness_m": 4.571999999999999e-05,
+          "noncircular": false,
+          "k_wall": null,
+          "profile": [
+            [
+              0.0,
+              0.0,
+              0.10226039999999999,
+              0.00821305735546811
+            ],
+            [
+              304.79999999999995,
+              0.0,
+              0.10226039999999999,
+              0.00821305735546811
+            ]
+          ]
+        },
+        {
+          "kind": "valve",
+          "name": "Valve",
+          "Di_m": 0.10226039999999999,
+          "K": 5.511139247545045
+        }
+      ]
+    }
+  ],
+  "gui_extras": {
+    "canvas_nodes": [
+      {
+        "id": "0x26fff20cc20",
+        "name": "Source/Sink",
+        "pos": [
+          -24.7850988321932,
+          239.58928871120114
+        ],
+        "spec": {
+          "type": "source_sink",
+          "P_str": "",
+          "P_unit": "psi",
+          "Q_str": "1",
+          "Q_unit": "mmscf/day",
+          "elev_str": "0",
+          "elev_unit": "ft",
+          "T_str": "80",
+          "T_unit": "degF"
+        }
+      },
+      {
+        "id": "0x26fff03aad0",
+        "name": "Junction",
+        "pos": [
+          415.83888040679733,
+          259.7845544263215
+        ],
+        "spec": {
+          "type": "junction",
+          "elev_str": "0",
+          "elev_unit": "ft"
+        }
+      },
+      {
+        "id": "0x26fff03ae90",
+        "name": "Pipe Segment",
+        "pos": [
+          322.20628481851185,
+          61.50376376877577
+        ],
+        "spec": {
+          "type": "pipe",
+          "mode": "manual",
+          "ID_str": "4.026",
+          "ID_unit": "inch",
+          "OD_str": "",
+          "OD_unit": "inch",
+          "WT_str": "",
+          "WT_unit": "inch",
+          "L_str": "1000",
+          "L_unit": "ft",
+          "dz_str": "0",
+          "dz_unit": "ft",
+          "rough_str": "0.00015",
+          "rough_unit": "ft"
+        }
+      },
+      {
+        "id": "0x26fff1a56e0",
+        "name": "Fitting",
+        "pos": [
+          657.2641023648276,
+          390.1358149511897
+        ],
+        "spec": {
+          "type": "fitting",
+          "fitting_type": "bend",
+          "Di_str": "4.026",
+          "Di_unit": "inch",
+          "angle_str": "90",
+          "bend_dias_str": "1.5",
+          "Di_US_str": "4.026",
+          "Di_US_unit": "inch",
+          "Di_DS_str": "3.0",
+          "Di_DS_unit": "inch"
+        }
+      },
+      {
+        "id": "0x26fff1a5810",
+        "name": "Valve",
+        "pos": [
+          699.4905670418975,
+          100.05836195218744
+        ],
+        "spec": {
+          "type": "valve",
+          "valve_type": "globe",
+          "D1_str": "4.026",
+          "D1_unit": "inch",
+          "D2_str": "4.026",
+          "D2_unit": "inch",
+          "angle_str": "0",
+          "D_str": "4.026",
+          "D_unit": "inch",
+          "style_str": "0",
+          "spec_mode": "K",
+          "spec_val_str": "1.0"
+        }
+      },
+      {
+        "id": "0x26fff1a5940",
+        "name": "Source/Sink 1",
+        "pos": [
+          974.8805540662661,
+          10.097632857560194
+        ],
+        "spec": {
+          "type": "source_sink",
+          "P_str": "100",
+          "P_unit": "psi",
+          "Q_str": "",
+          "Q_unit": "mmscf/day",
+          "elev_str": "0",
+          "elev_unit": "ft",
+          "T_str": "70",
+          "T_unit": "degF"
+        }
+      },
+      {
+        "id": "0x26fff1a5e00",
+        "name": "Junction 1",
+        "pos": [
+          507.23613769513804,
+          -173.52815236938935
+        ],
+        "spec": {
+          "type": "junction",
+          "elev_str": "0",
+          "elev_unit": "ft"
+        }
+      }
+    ],
+    "canvas_connections": [
+      {
+        "from_id": "0x26fff20cc20",
+        "from_port": "out",
+        "to_id": "0x26fff03ae90",
+        "to_port": "in"
+      },
+      {
+        "from_id": "0x26fff03ae90",
+        "from_port": "out",
+        "to_id": "0x26fff1a5810",
+        "to_port": "in"
+      },
+      {
+        "from_id": "0x26fff1a5810",
+        "from_port": "out",
+        "to_id": "0x26fff1a5940",
+        "to_port": "in"
+      }
+    ]
+  }
+}

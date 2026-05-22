@@ -54,6 +54,7 @@ import warnings
 from fluids.friction import friction_factor as fluids_friction_factor
 from fluids.core import Reynolds as fluids_Reynolds
 import fluids.fittings
+import fluids.flow_meter
 
 from component_classes import (
     Base_Line_Segment,
@@ -61,6 +62,7 @@ from component_classes import (
     Base_Contraction_Expansion,
     Base_Valve,
     Base_CheckValve,
+    Base_Orifice,
     _to_si,
     _resolve_id,
     _flow_props_from_id,
@@ -84,7 +86,7 @@ class Incompressible_Fluid:
         viscosity: pint Quantity or plain float (Pa*s if float).
     """
 
-    def __init__(self, density, viscosity):
+    def __init__(self, density, viscosity, vapor_pressure=None):
         if hasattr(density, "to"):
             self.density_si = density.to("kg/m^3").magnitude
         else:
@@ -94,6 +96,14 @@ class Incompressible_Fluid:
             self.viscosity_si = viscosity.to("Pa*s").magnitude
         else:
             self.viscosity_si = float(viscosity)
+
+        if vapor_pressure is not None:
+            if hasattr(vapor_pressure, "to"):
+                self.vapor_pressure_si = vapor_pressure.to("Pa").magnitude
+            else:
+                self.vapor_pressure_si = float(vapor_pressure)
+        else:
+            self.vapor_pressure_si = None
 
     @classmethod
     def from_api_gravity(cls, api_gravity, viscosity):
@@ -484,6 +494,122 @@ class CheckValve(Base_CheckValve):
         Q   = _resolve_flow_rate(flow_rate, rho)
         v   = Q / A
         return -self.K * 0.5 * rho * v ** 2
+
+
+# ---------------------------------------------------------------------------
+# Orifice -- incompressible child class
+# ---------------------------------------------------------------------------
+
+# Cavitation index thresholds for a sharp-edged orifice.
+# sigma = (P2_taps - Pv) / (P1 - P2_taps)   (downstream sigma definition)
+#
+
+_SIGMA_INCIPIENT = 2.5
+_SIGMA_CHOKED    = 0.8
+
+
+class Orifice(Base_Orifice):
+    """Square-edged concentric orifice plate with incompressible pressure-drop
+    calculation.
+
+    Inherits geometry storage and validation from Base_Orifice.  Adds dP()
+    using the fluids library Reader-Harris-Gallagher discharge-coefficient
+    correlation to compute the non-recoverable (permanent) pressure loss.
+
+    A cavitation index, sigma, is calculated based on the following reference (see page 13)
+    https://www.osti.gov/biblio/10155405
+
+    sigma = (upstream pressure - vapor pressure)/(permanent pressure drop across restriction)
+
+    Pages 74-77 of this reference give correlations for incipient and choked cavitation for a circular, concentric, sharp, thin orifice
+    
+    sigma_incipient = 1.55 + 4.88 * Cd + 5.66 * Cd**2 + 1.95 * Cd**3
+    sigma_choked = 1.08 + 2.28 * Cd - 4.38 * Cd**2 + 7.57 * Cd ** 3
+
+    Constructor arguments are identical to Base_Orifice:
+        Di          : pint Quantity or float (m if float).  Pipe inner diameter.
+        Do          : pint Quantity or float (m if float).  Orifice bore diameter.
+        Cd_override : float or None.  Fixed Cd; bypasses the RHG correlation.
+    """
+
+    def dP(self, fluid, flow_rate, P_inlet=None):
+        """Non-recoverable pressure loss through the orifice plate [Pa].
+
+        Computes the discharge coefficient via the ISO 5167-2 Reader-Harris-
+        Gallagher correlation (or uses Cd_override if set), converts to a
+        K-factor referenced to the upstream pipe velocity, and returns:
+
+            dP = -K * (1/2) * rho * v_pipe^2
+
+        If P_inlet is supplied and fluid.vapor_pressure_si is set, a
+        cavitation check is performed using the sigma index.
+
+        Args:
+            fluid     : Incompressible_Fluid instance.
+            flow_rate : pint Quantity -- volumetric or mass flow rate.
+            P_inlet   : float or None.  Absolute static pressure at the
+                        orifice inlet [Pa].  Required for cavitation check;
+                        ignored if None or if fluid.vapor_pressure_si is None.
+
+        Returns:
+            float, permanent pressure change [Pa].  Always <= 0 (loss).
+
+        Raises:
+            RuntimeError : if choked cavitation is detected
+                           (sigma < sigma_choked).
+
+        Warns:
+            UserWarning  : if incipient cavitation is possible
+                           (sigma < sigma_incipient).
+        """
+        rho = fluid.density_si
+        mu  = fluid.viscosity_si
+        Di  = self.Di_si
+        Do  = self.Do_si
+
+        A_pipe = math.pi * Di ** 2 / 4.0
+        Q      = _resolve_flow_rate(flow_rate, rho)
+        v_pipe = Q / A_pipe
+        m      = rho * Q
+
+        if self.Cd_override is not None:
+            Cd = self.Cd_override
+        else:
+            Cd = fluids.flow_meter.C_Reader_Harris_Gallagher(
+                D=Di, Do=Do, rho=rho, mu=mu, m=m, taps=self.taps
+            )
+        sigma_incipient = 1.55 + 4.88 * Cd + 5.66 * Cd**2 + 1.95 * Cd**3
+        sigma_choked = 1.08 + 2.28 * Cd - 4.38 * Cd**2 + 7.57 * Cd ** 3
+        K        = fluids.flow_meter.discharge_coefficient_to_K(D=Di, Do=Do, C=Cd)
+        dP_perm  = -K * 0.5 * rho * v_pipe ** 2
+
+        if (
+            P_inlet is not None
+            and getattr(fluid, "vapor_pressure_si", None) is not None
+        ):
+            Pv = fluid.vapor_pressure_si
+
+            P_out     = P_inlet - dP_perm
+
+            if dP_perm > 0.0:
+                sigma = (P_inlet - Pv) / dP_perm
+                name_str = f"'{self.name}'" if self.name else "orifice"
+                if sigma < sigma_choked:
+                    raise RuntimeError(
+                        f"Orifice {name_str}: choked cavitation detected "
+                        f"(sigma={sigma:.3f} < {sigma_choked}).  "
+                        f"Reduce flow rate or increase system back-pressure."
+                    )
+                if sigma < sigma_incipient:
+                    warnings.warn(
+                        f"Orifice {name_str}: incipient cavitation possible "
+                        f"(sigma={sigma:.3f} < {sigma_incipient}).  "
+                        f"Consider increasing back-pressure.",
+                        UserWarning,
+                        stacklevel=2,
+                    )
+
+        return dP_perm
 
 
 # ---------------------------------------------------------------------------
