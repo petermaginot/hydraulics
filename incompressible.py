@@ -500,14 +500,6 @@ class CheckValve(Base_CheckValve):
 # Orifice -- incompressible child class
 # ---------------------------------------------------------------------------
 
-# Cavitation index thresholds for a sharp-edged orifice.
-# sigma = (P2_taps - Pv) / (P1 - P2_taps)   (downstream sigma definition)
-#
-
-_SIGMA_INCIPIENT = 2.5
-_SIGMA_CHOKED    = 0.8
-
-
 class Orifice(Base_Orifice):
     """Square-edged concentric orifice plate with incompressible pressure-drop
     calculation.
@@ -518,6 +510,7 @@ class Orifice(Base_Orifice):
 
     A cavitation index, sigma, is calculated based on the following reference (see page 13)
     https://www.osti.gov/biblio/10155405
+    TODO This reference can also be used for detecting cavitation in valves - should add that
 
     sigma = (upstream pressure - vapor pressure)/(permanent pressure drop across restriction)
 

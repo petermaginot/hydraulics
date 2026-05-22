@@ -101,7 +101,7 @@ The current `Valve.dP()` is end-to-end lumped via K-factor on pipe velocity
 head. It cannot see the vena contracta where actual cavitation occurs.
 `Incompressible_Fluid` stores only density and viscosity — no vapor pressure.
 So today there is neither a way to detect cavitation nor anything to compare
-against if a check were added.
+against if a check were added. The following reference will be useful: (https://www.osti.gov/biblio/10155405)
 
 ### Three regimes worth distinguishing
 
