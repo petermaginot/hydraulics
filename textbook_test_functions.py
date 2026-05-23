@@ -728,6 +728,134 @@ def test_Crane_choked_steam():
             mdot = mdot * (M_target / Ma_out)
 
 
+def test_choked_mass_flux_ideal_gas_air():
+    """Ideal-gas air nozzle sanity check for choked_mass_flux.
+
+    For an ideal gas with constant gamma = 1.4, classical isentropic-nozzle
+    theory gives the critical pressure ratio P*/P0 = (2/(gamma+1))^(gamma/
+    (gamma-1)) approx 0.5283 and the critical temperature ratio T*/T0 =
+    2/(gamma+1) approx 0.8333.  The mass-flux coefficient is
+        G_max = P0 * sqrt(gamma/(R_s*T0)) * (2/(gamma+1))^((gamma+1)/(2*(gamma-1)))
+    With P0 = 10 bar, T0 = 300 K, and A_throat = 1 cm^2 = 1e-4 m^2, dry air
+    (M = 28.96 g/mol => R_s = 287.0 J/(kg.K)) gives mdot_choked ~ 0.2354 kg/s.
+
+    CoolProp's HEOS-air pseudo-pure backend is close to but not exactly
+    ideal-gas (slight Z deviation, slight gamma deviation), so we allow
+    a 1% tolerance on each quantity.
+    """
+    from compressible_flow import (
+        choked_mass_flux, _build_phase_limits, _safe_update_PT,
+    )
+
+    P0 = ureg.Quantity(10.0, "bar").to("Pa").magnitude   # 1.0e6 Pa
+    T0 = 300.0                                           # K
+    A_throat = 1.0e-4                                    # m^2
+
+    AS = AbstractState("HEOS", "Air")
+    phase_limits = _build_phase_limits(AS)
+    _safe_update_PT(AS, P0, T0, *phase_limits)
+
+    mdot_choked, P_star, T_star, rho_star, P_out, T_out = choked_mass_flux(
+        AS, A_throat, A_outlet=A_throat,
+        T_cricondentherm=phase_limits[0], P_cricondenbar=phase_limits[1],
+        T_critical=phase_limits[2],       P_critical=phase_limits[3],
+    )
+
+    # Closed-form ideal-gas reference values for gamma = 1.4, M_air = 28.96 g/mol.
+    gamma = 1.4
+    M_air = 28.96e-3
+    R_s   = 8.31446261815324 / M_air
+    P_ratio_ref = (2.0/(gamma+1.0)) ** (gamma/(gamma-1.0))             # ~0.5283
+    T_ratio_ref = 2.0/(gamma+1.0)                                       # ~0.8333
+    crit_coeff  = (2.0/(gamma+1.0)) ** ((gamma+1.0)/(2.0*(gamma-1.0)))
+    G_ref       = P0 * math.sqrt(gamma/(R_s*T0)) * crit_coeff
+    mdot_ref    = G_ref * A_throat
+
+    def check(label, value, ref, tol_rel):
+        err = abs(value - ref) / abs(ref)
+        status = "OK  " if err < tol_rel else "FAIL"
+        print(f"  [{status}] {label}: got {value:.6g}, ref {ref:.6g}, "
+              f"rel err {err:.2%} (tol {tol_rel:.0%})")
+
+    print("Ideal-gas air-nozzle choke validation (P0=10 bar, T0=300 K, A=1 cm^2):")
+    check("P*/P0",        P_star/P0,  P_ratio_ref, 0.01)
+    check("T*/T0",        T_star/T0,  T_ratio_ref, 0.01)
+    check("mdot_choked",  mdot_choked, mdot_ref,   0.02)
+    print(f"  (raw: P*={P_star:.4g} Pa, T*={T_star:.4g} K, "
+          f"rho*={rho_star:.4g} kg/m^3, mdot={mdot_choked:.4g} kg/s)")
+
+
+def test_compressible_K_choke_roundtrip():
+    """Round-trip check: pick a (P_in, T_in, A, K) such that compressible_K
+    is choked at some mdot_choked.  Verify that:
+      - mdot = 0.5 * mdot_choked  -> no exception (subsonic path; the
+        analytical formula's stiffness near choke means we need a comfortable
+        margin to exercise the not-choked branch cleanly).
+      - mdot = 1.1 * mdot_choked  -> ChokedFlowError with ce.mdot_choked
+                                     matching the direct primitive output.
+    """
+    from compressible_flow import (
+        compressible_K, choked_mass_flux, ChokedFlowError,
+        _build_phase_limits, _safe_update_PT,
+    )
+
+    P_in = ureg.Quantity(20.0, "bar").to("Pa").magnitude
+    T_in = 300.0
+    Di   = ureg.Quantity(0.5, "inch").to("m").magnitude
+    A    = math.pi * Di**2 / 4.0
+    K    = 1.5
+
+    AS = composition.define_composition(
+        y_Methane=0.95, y_Ethane=0.04, y_CarbonDioxide=0.01, eos="HEOS",
+    )
+    phase_limits = _build_phase_limits(AS)
+    _safe_update_PT(AS, P_in, T_in, *phase_limits)
+
+    # Direct primitive: find mdot_choked.
+    mdot_choked_direct, *_ = choked_mass_flux(
+        AS, A, A_outlet=A,
+        T_cricondentherm=phase_limits[0], P_cricondenbar=phase_limits[1],
+        T_critical=phase_limits[2],       P_critical=phase_limits[3],
+    )
+
+    # Subsonic case.
+    _safe_update_PT(AS, P_in, T_in, *phase_limits)
+    try:
+        compressible_K(
+            AS, 0.5 * mdot_choked_direct, A, K,
+            T_cricondentherm=phase_limits[0], P_cricondenbar=phase_limits[1],
+            T_critical=phase_limits[2],       P_critical=phase_limits[3],
+        )
+        sub_ok = True
+    except ChokedFlowError:
+        sub_ok = False
+
+    # Over-choke case.
+    _safe_update_PT(AS, P_in, T_in, *phase_limits)
+    try:
+        compressible_K(
+            AS, 1.1 * mdot_choked_direct, A, K,
+            T_cricondentherm=phase_limits[0], P_cricondenbar=phase_limits[1],
+            T_critical=phase_limits[2],       P_critical=phase_limits[3],
+        )
+        over_err = None
+    except ChokedFlowError as ce:
+        over_err = ce
+
+    print("compressible_K choke round-trip (methane-rich mixture, P_in=20 bar, T_in=300 K):")
+    print(f"  Direct primitive mdot_choked = {mdot_choked_direct:.6g} kg/s")
+    status_sub = "OK  " if sub_ok else "FAIL"
+    print(f"  [{status_sub}] mdot = 0.5*mdot_choked passes without exception")
+    if over_err is None:
+        print("  [FAIL] mdot = 1.1*mdot_choked did NOT raise ChokedFlowError")
+    else:
+        rel = abs(over_err.mdot_choked - mdot_choked_direct) / mdot_choked_direct
+        status_over = "OK  " if rel < 1e-3 else "FAIL"
+        print(f"  [{status_over}] mdot = 1.1*mdot_choked raised ChokedFlowError "
+              f"with mdot_choked={over_err.mdot_choked:.6g} kg/s "
+              f"(rel err vs direct: {rel:.2%})")
+
+
 if __name__ == "__main__":
 
     # print('Zucker & Biblarz unnumbered example in section 5.7 (isentropic converging nozzle):')
@@ -764,3 +892,15 @@ if __name__ == "__main__":
     print('--------------------------------------------------------')
     print('\nCrane TP410 example 4-10')
     test_Crane_4_10()
+
+    print('--------------------------------------------------------')
+    print('\nChoked-flow ideal-gas air nozzle')
+    test_choked_mass_flux_ideal_gas_air()
+
+    print('--------------------------------------------------------')
+    print('\ncompressible_K choke round-trip')
+    test_compressible_K_choke_roundtrip()
+
+    print('--------------------------------------------------------')
+    print('\nChoked-flow round-trip on compressible_K')
+    test_compressible_K_choke_roundtrip()

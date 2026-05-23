@@ -79,13 +79,43 @@ feedback in the denominator strengthens nonlinearly as the gas expands.
   (`dP/P_in > dPmax` — always False for negative dP) was also fixed to
   `abs(dP)/P_in > dPmax`. Covered by `test_K()` in `examples.py`.
 
+  *Subsequent fix (review of R1):* an initial refactor of the dP denominator
+  was algebraically wrong — it dropped a term and put the Fanno singularity
+  at Ma = 1/sqrt(gamma) (~0.85 for air) instead of Ma = 1. Restored the
+  correct two-line form (`inner`/`denominator`). Items 1, 3, 4, 5, 7 below
+  are now substantially mitigated by the R1 fallback: at high dP the
+  rigorous `compressible_changing_area_K` is invoked, which uses T_avg in
+  the entropy balance and a coupled (P, T) root-find that avoids the
+  inlet-property linearization.
+
+- **R1.5 [✅ DONE].** Real-gas choked-flow detection via `choked_mass_flux`
+  (Maytal 2006 isentropic march with mixture-safe (P,T)+entropy-root EOS
+  updates). Both `compressible_K` and `compressible_changing_area_K` now
+  carry a cheap ideal-gas `G_max` pre-screen; above the threshold the
+  Maytal march runs, and a dedicated `ChokedFlowError(RuntimeError)` is
+  raised when `mdot > mdot_choked`. `_NoChokeBracketError` (sentinel) is
+  raised when the grid scan finds no Mach=1 — caught and treated as "not
+  choked" by the pre-screens; genuine CoolProp / numerical failures
+  propagate. Substantially addresses item 5 (the denominator singularity
+  is now caught before being evaluated). **Stage-1 caveat (open)**: the
+  pre-screen uses `A_throat = flow_area = pipe area`, so for a valve
+  whose physical throat is much smaller, the check is loose — see R2.
+
 - **R2 [medium].** Add an internal-throat / vena-contracta choke check. If
   the user supplies x_T (or any equivalent geometric handle on internal area
-  ratio), test choke at the throat rather than the body outlet.
+  ratio), test choke at the throat rather than the body outlet.  Required
+  to close the Stage-1 caveat in R1.5.
 
 - **R3 [larger].** Switch the valve component to an ISA-75.01 / IEC-60534-2-1
   sizing model parameterized by Cv (or Kv) and x_T, with explicit choked-flow
   branch. Cv / Kv are already accepted per recent commits; the data is there.
+
+- **R3.5 [follow-on to R1.5].** Have `compressible_network.walk_edge`
+  catch `ChokedFlowError` specifically and consume `mdot_choked` from the
+  exception to clamp the solver's `dmdot` step.  Today the exception is
+  caught generically as a walk failure and the structured data on the
+  exception is discarded, so the solver still recovers via repeated
+  failed walks rather than a single targeted retreat.
 
 ---
 
@@ -296,7 +326,9 @@ the ODE becomes stiff.
   errors after the fact; incompressible flow does not detect cavitation at
   all. In both cases the cheap predictive check (closed-form Fanno choke
   length; sigma = (P_1 - P_v)/dP) is far more actionable than waiting for
-  the numerics to fail.
+  the numerics to fail.  *Status: real-gas choked-flow detection for
+  fittings is implemented via `choked_mass_flux` (R1.5); predictive
+  Fanno-choke detection for pipe segments (R7) is still open.*
 
 - **The network walk is the natural enforcement point for both
   cavitation checks and the negative-pressure sanity floor.** Absolute
@@ -307,3 +339,19 @@ the ODE becomes stiff.
   approximation; `compressible_changing_area_K` exists as the rigorous
   alternative). The fixes are mostly about *invoking* the rigorous path when
   the linearized one is out of validity, not about new derivations.
+
+- **[cross-cutting, architecture] AbstractState does not carry velocity.**
+  Functions throughout the compressible layer pass `AbstractState` as if
+  it fully specifies the thermodynamic state, but for a flowing fluid the
+  *true* state is `(AbstractState, v)` — without velocity you cannot
+  recover stagnation properties, kinetic energy, or Mach number.
+  `compressible_K`, `compressible_changing_area_K`, `compressible_pipe_segment`,
+  and `choked_mass_flux` each re-derive `v` from `mdot/(rho*A)` locally;
+  this works but leaves the calling convention implicit and creates real
+  bugs when one function's "stagnation state" assumption meets another
+  function's "static state" convention. `choked_mass_flux`'s docstring
+  claims AS is at stagnation, while every caller passes static — the
+  resulting few-percent error is exactly in the high-Ma cases where the
+  pre-screen fires. Proper fix: introduce a `FlowState` container or
+  standardize on `(AS, mdot)` (or `(AS, v)`) as the calling unit
+  throughout the compressible layer. Deferred to its own design pass.

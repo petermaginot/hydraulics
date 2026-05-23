@@ -10,6 +10,9 @@ The repo already carries dense design docs. Read them before making architectura
 - [network.md](network.md) — `Network` / `Compressible_Network` solver internals: residual form, reverse-flow handling, check-valve treatment, save/load format, open work.
 - [GUI.md](GUI.md) — PySide6 GUI architecture, screen routing, `AppState`, NodeGraphQt canvas, persistence.
 - [troubleshooting.md](troubleshooting.md) — symptom-first diagnostic guide for solver/GUI runs.
+- [improvements.md](improvements.md) - list if identified improvements to make
+
+ When referencing external sources, do not use paywalled articles or sources. All sources must be openly accessible and directly referenced with links.
 
 ## Running things
 
