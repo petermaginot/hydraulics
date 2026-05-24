@@ -92,32 +92,52 @@ Adds `dP(fluid, flow_rate)` returning the total static pressure change (Bernoull
 
 Single-phase compressible (gas) pipeline hydraulics. CoolProp `AbstractState` objects are used throughout for real-gas equation-of-state calculations, so any fluid or mixture supported by CoolProp can be used without modification. Component `dP_dT` methods mutate the `AbstractState` in place as conditions evolve along the pipe.
 
-> **Note:** the caller must initialize the abstract state to the inlet conditions by running `AS.update(CP.PT_INPUTS, P_in, T_in)` before calling any `dP_dT` method. The same `AbstractState` is read for inlet conditions and updated in place to outlet conditions on return.
+### `FlowState` — the calling unit across the compressible layer
+
+Every public function and every component `dP_dT` method in this module takes a single `FlowState` argument instead of a loose `(AbstractState, flow_rate, …)` tuple. A FlowState bundles:
+
+- `AS` — a CoolProp `AbstractState` at the **static** thermodynamic state.
+- `mdot` — mass flow rate [kg/s], invariant once set.
+- `A` — local flow cross-section area [m²].
+- `z` — local elevation above datum [m]; advanced by `compressible_pipe_segment` so gravitational PE bookkeeping stays current along a pipe.
+- Cached phase-envelope limits (`T_cricondentherm`, `P_cricondenbar`, `T_critical`, `P_critical`) so the four kwargs no longer thread through every signature. Built once via `_build_phase_limits(AS)` at construction by default.
+
+Derived properties are recomputed from `AS` on every access so they cannot desync after an in-place AS mutation: `P`, `T`, `rho`, `v = mdot/(rho·A)`, `Ma = v/a_sound`, `h_stagnation = h_static + v²/2`, `s_static`, and `h_total_with_g = h_stagnation + g·z`.
+
+```python
+from compressible_flow import FlowState
+AS.update(CP.PT_INPUTS, P_in, T_in)                  # caller anchors AS at static inlet
+fs = FlowState(AS, mdot=2.0, A=area, z=0.0)          # builds phase envelope automatically
+bend.dP_dT(fs)                                       # mutates AS to outlet static
+```
+
+Convention: AS is always at the **static** state. `v` and stagnation properties are derived. Functions that change geometry (`compressible_changing_area_K`, `compressible_pipe_segment`) mutate `fs.A` and/or `fs.z` so the FlowState stays self-consistent with its current location.
 
 ### `Line_Segment` (inherits `Base_Line_Segment`)
-Adds **`dP_dT(abstract_state, flow_rate, isothermal=False, q_wall=0.0, mu=None, ...)`**, which walks consecutive profile slices via `compressible_pipe_segment()` and applies an isentropic area-change correction (`compressible_changing_area_K` with K=0) at every inter-slice boundary where the flow area changes.
+Adds **`dP_dT(fs, isothermal=False, q_wall=0.0, mu=None, energy_tol=10.0, dPdL_rel_tol=0.05, max_split_depth=8, verbose=False)`**. On entry it absorbs any inlet-area discontinuity with the upstream component via an isentropic area-change (`_area_match` → `compressible_changing_area_K(K=0)`), then walks consecutive profile slices via `compressible_pipe_segment()`, applying another isentropic area-change correction at every inter-slice boundary where the flow area changes.
 
 Optional arguments:
 - `isothermal` — hold temperature constant per slice (solves a simpler one-equation form).
 - `q_wall` — total heat input to the fluid over the entire segment [W], distributed uniformly per unit length. Ignored when `isothermal=True`.
 - `mu` — fixed viscosity in Pa·s; if `None`, CoolProp is queried each slice with a Lee-Gonzalez-Eakin fallback for EOS backends that don't support viscosity (e.g. Peng-Robinson).
-- `T_cricondentherm`, `P_cricondenbar`, `T_critical`, `P_critical` — precomputed phase-envelope limits. Forward these on repeated calls (e.g. parallel-branch iteration) to skip the computationally-expensive per-call `build_phase_envelope`.
 - `energy_tol`, `dPdL_rel_tol`, `max_split_depth` — adaptive bisection tolerances forwarded into each slice.
 
-Returns a list of `(distance_m, P_Pa, T_K, v_ms)` tuples — one per profile point — suitable for plotting profiles. The `AbstractState` is left at outlet conditions.
+Returns a list of `(distance_m, P_Pa, T_K, v_ms)` tuples — one per profile point — suitable for plotting profiles. `fs.AS` is left at outlet conditions; `fs.A` is updated to the profile's outlet area; `fs.z` is advanced by the segment's total elevation change.
 
 ### `Bend` (inherits `Base_Bend`)
-Modeled as adiabatic. Adds **`dP_dT(abstract_state, flow_rate, mu=None, ...)`** which uses `fluids.fittings.bend_rounded()` to obtain the K-factor and delegates to `compressible_K()`.
+Modeled as adiabatic. Adds **`dP_dT(fs, mu=None)`** which absorbs any inlet-area discontinuity, then uses `fluids.fittings.bend_rounded()` to obtain the K-factor and delegates to `compressible_K()`. `fs.A` is unchanged on return (equal inlet/outlet area).
 
 ### `Valve` (inherits `Base_Valve`)
-Modeled as adiabatic. Adds **`dP_dT(abstract_state, flow_rate, ...)`** which passes the pre-computed K-factor stored on the instance directly to `compressible_K()` — no viscosity, Reynolds-number, or correlation lookup is performed.
+Modeled as adiabatic. Adds **`dP_dT(fs)`** which absorbs any inlet-area discontinuity, then passes the pre-computed K-factor stored on the instance directly to `compressible_K()` — no viscosity, Reynolds-number, or correlation lookup is performed.
 
 ### `Contraction_Expansion` (inherits `Base_Contraction_Expansion`)
-Modeled as adiabatic. Adds **`dP_dT(abstract_state, flow_rate, ...)`** which obtains the K-factor from `fluids.fittings.contraction_sharp()` (for contractions; the result is converted from a downstream- to an upstream-velocity reference) or `diffuser_sharp()` (for expansions), then delegates to `compressible_changing_area_K()`.
+Modeled as adiabatic. Adds **`dP_dT(fs)`** which absorbs any inlet-area discontinuity to land at `A_US`, obtains the K-factor from `fluids.fittings.contraction_sharp()` (for contractions; the result is converted from a downstream- to an upstream-velocity reference) or `diffuser_sharp()` (for expansions), then delegates to `compressible_changing_area_K()`. On return `fs.A == A_DS`.
 
 ### Core functions
 
-- **`compressible_pipe_segment(abstract_state, mdot, dL, dz, D_h, roughness, flow_area, q_wall=0.0, isothermal=False, mu=None, ...)`** — This one is the real beast!. It solves coupled dP/dL and dT/dL ODEs (or the simpler isothermal dP/dL equation) over a single pipe slice using a forward-Euler step with a one-iteration energy-balance correction.
+All five take a `FlowState` as their first argument; `mdot`, `A`, and the phase-envelope limits are read from it. `fs.AS` is mutated in place to the outlet static state, and area/elevation are updated when the function changes the geometry of the flow.
+
+- **`compressible_pipe_segment(fs, dL, dz, D_h, roughness, q_wall=0.0, isothermal=False, mu=None, ...)`** — This one is the real beast!. It solves coupled dP/dL and dT/dL ODEs (or the simpler isothermal dP/dL equation) over a single pipe slice using a forward-Euler step with a one-iteration energy-balance correction.
 
   After the trial step, two convergence metrics are evaluated at the trial outlet:
   1. If not isothermal, an energy balance is performed (Stagnation enthalpy + heat in in minus stagnation enthalpy out = residual) `|H_in + q/mdot + v_in²/2 − g·dz − (H_out + v_out²/2)|` vs `energy_tol`.
@@ -129,16 +149,16 @@ Modeled as adiabatic. Adds **`dP_dT(abstract_state, flow_rate, ...)`** which obt
 
   You can see a chicken scratch version of this derivation in the Derivation_images folder, or a more detailed discussion in the comments for the function.
 
-- **`compressible_changing_area(abstract_state, mdot, A_in, A_out)`** — ideal gas isentropic outlet `(P, T)` for an area change, using the area-Mach relation to find the subsonic outlet Mach number and recovering static conditions from total-condition ratios. `gamma = Cp/Cv` is taken from the `AbstractState` at inlet. Returns `(P_out, T_out)` without mutating the state. This function is used to compute the initial guess for the compressible_changing_area_K function.
+- **`compressible_changing_area(fs, A_out)`** — ideal gas isentropic outlet `(P, T)` for an area change, using the area-Mach relation to find the subsonic outlet Mach number and recovering static conditions from total-condition ratios. `gamma = Cp/Cv` is taken from `fs.AS` at inlet. Returns `(P_out, T_out)` without mutating the FlowState. This function is used to compute the initial guess for the compressible_changing_area_K function.
 
-- **`compressible_changing_area_K(abstract_state, mdot, A_in, A_out, K, ...)`** — outlet conditions for an area change with a known loss coefficient `K` (referenced to inlet velocity head). Solves the simultaneous balance equations:
+- **`compressible_changing_area_K(fs, A_out, K=0.0)`** — outlet conditions for an area change with a known loss coefficient `K` (referenced to inlet velocity head); `fs.A` is the inlet area and is updated to `A_out` on return. Solves the simultaneous balance equations:
 
   1. Stagnation-enthalpy conservation: `H_out + v_out²/2 = H_in + v_in²/2`.
   2. Entropy generation from the irreversible loss: `S_out − S_in = K·v_in² / (2·T_avg)`.
 
   via `scipy.optimize.root` (hybrid method), with the isentropic ideal gas result as the initial guess. Updates the `AbstractState` in place. This function is rather slow, as the scipy root finding takes a lot of iterations with a lot of abstract state updates, but unfortunately there's no easy one-step process to estimate this.
 
-- **`compressible_K(abstract_state, mdot, flow_area, K, dPmax=0.05, ...)`** — outlet conditions for a constant-area fitting (e.g. bend, valve) with a known `K`. Applies a single-step analytical result derived from the combined energy + continuity + entropy + EOS equations with `dA = 0`:
+- **`compressible_K(fs, K, dPmax=0.05)`** — outlet conditions for a constant-area fitting (e.g. bend, valve) with a known `K`. Applies a single-step analytical result derived from the combined energy + continuity + entropy + EOS equations with `dA = 0`:
 
   ```
   dP = -K·v²·ρ/2  /  [1  −  v²·(∂ρ/∂P)_H / (1 − (v²/ρ)·(∂ρ/∂H)_P)]
@@ -147,11 +167,15 @@ Modeled as adiabatic. Adds **`dP_dT(abstract_state, flow_rate, ...)`** which obt
 
   For low Mach numbers `dP` reduces to the familiar `−K·ρ·v²/2`. A one-iteration Newton correction is then applied to `T_out` to enforce stagnation-enthalpy conservation exactly. A somewhat illegible handwritten derivation appears in the Derivation_images folder.
 
-  **Adaptive fallback:** after computing the linearized `dP`, if `|dP|/P_in > dPmax` (default 5%) or the compressibility denominator `< 0.5` (indicating near-sonic conditions where the linearization breaks down), the function automatically delegates to `compressible_changing_area_K` with `A_in = A_out`. This makes `Valve.dP_dT` and `Bend.dP_dT` regime-aware without any API change. Pass a larger `dPmax` to force the fast path, or smaller to be more conservative.
+  **Adaptive fallback:** after computing the linearized `dP`, if `|dP|/P_in > dPmax` (default 5%) or the compressibility denominator `< 0.5` (indicating near-sonic conditions where the linearization breaks down), the function automatically delegates to `compressible_changing_area_K` with `A_out = fs.A`. This makes `Valve.dP_dT` and `Bend.dP_dT` regime-aware without any API change. Pass a larger `dPmax` to force the fast path, or smaller to be more conservative.
+
+- **`choked_mass_flux(fs, A_throat, A_outlet=None, n_grid=40)`** — real-gas choked mass flow through a throat of area `A_throat`, using the Maytal isentropic march (Cryogenics 46(1):21-29, 2006). The stagnation enthalpy reference is built from `fs.h_stagnation = h_static + 0.5·v_in²`, so the choked mass flow correctly grows when the inlet carries non-trivial kinetic energy. Used internally by `compressible_K` and `compressible_changing_area_K` as a real-gas choke pre-screen; on choke they raise `ChokedFlowError` carrying `mdot_choked` and the (recovered) outlet state.
 
 ### Helpers
 
-- **`_resolve_mdot(flow_rate, abstract_state)`** — convert a pint `Quantity` to mass flow rate [kg/s]. Accepts mass (`kg/s`, `lb/hr`), molar / standard-volume (`mol/s`, `scf/day`, `mmscf/day`), or actual volumetric (`m³/s`, `ft³/min`). Standard-volume units are defined as mole equivalents in the unit registry, so they fall through the molar branch automatically.
+- **`_safe_flowstate_update_PT(fs, P, T)`** — thin wrapper around `_safe_update_PT` that pulls the cached phase-envelope limits off `fs`. Used inside every physics function that needs to step `fs.AS` to a new `(P, T)` while respecting the supercritical phase hint.
+- **`_area_match(fs, A_target, tol=1e-6)`** — if `fs.A` differs from `A_target` beyond `tol`, run `compressible_changing_area_K(fs, A_target, K=0)` so the state at `A_target` is reached isentropically. Every component `dP_dT` calls this first so chains of mixed-diameter components no longer need an explicit `Contraction_Expansion` between them.
+- **`_resolve_mdot(flow_rate, abstract_state)`** — convert a pint `Quantity` to mass flow rate [kg/s]. Accepts mass (`kg/s`, `lb/hr`), molar / standard-volume (`mol/s`, `scf/day`, `mmscf/day`), or actual volumetric (`m³/s`, `ft³/min`). Standard-volume units are defined as mole equivalents in the unit registry, so they fall through the molar branch automatically. Used by callers that have a pint flow Quantity and want a plain `mdot` to feed into a `FlowState`.
 - **`viscosity_LGE(T, mol_wt, density)`** — Lee-Gonzalez-Eakin correlation for hydrocarbon gas viscosity. Used as a fallback when the chosen EOS (e.g. Peng-Robinson) does not support viscosity calculation. Note that this correlation is only valid for light hydrocarbon gases, so be careful. I should probably build in some sort of warning that displays if it is used with non-hydrocarbon components.
 - **`_build_phase_limits(AS)`** —     This function builds a phase envelope for a CoolProp abstract state to calculate the critical properties to aid in determining if a pressure/temperature combination is obviously in a single phase state or not by comparing it to the critical pressure/temperature and/or cricondenbar and cricondentherm. This enables us to pass a phase hint to CoolProp's abstract state update function, which increases its speed appreciably. If you don't supply a phase hint, CoolProp needs to determine the phase with every update calculation. Its routine for determining the phase also fails to converge for some cases even though it is clearly in a single phase region. This process helps avoid that error from rearing its head.
 
@@ -203,9 +227,9 @@ dP_target  = Σ(dP_i / s_i) / Σ(1 / s_i)
 Because elevation head is flow-independent, only the friction term enters the slope — this keeps Newton stable at low flow rates where elevation dominates and a ratio-based correction would stall. 
 
 ### `parallel_compressible(line_segment_list, AS, total_flow_rate)`
-Returns `(P_out_list, T_out_list, flow_fraction_list)`. The phase envelope is built once and forwarded into every `dP_dT` call so per-call `build_phase_envelope` is skipped (the composition does not change across iterations).
+Returns `(P_out_list, T_out_list, flow_fraction_list)`. The phase envelope is built once and cached on every `FlowState` constructed during the iteration, so per-call `build_phase_envelope` is skipped (the composition does not change across iterations).
 
-Each iteration resets `AS` to the common inlet `(P0, T0)` before walking a branch (since `dP_dT` mutates `AS` in place), then walks every component in the branch in series. Newton's method on flow fractions converges every branch to the same outlet pressure.
+Each iteration resets `AS` to the common inlet `(P0, T0)`, constructs one `FlowState` per branch at that inlet (the branch's mass flow comes from `_resolve_mdot(total_flow_rate * flow_fraction, AS)`), then walks every component in the branch in series via `c.dP_dT(fs)`. Newton's method on flow fractions converges every branch to the same outlet pressure.
 
 ---
 

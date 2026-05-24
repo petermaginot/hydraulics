@@ -89,7 +89,7 @@ A `QStackedWidget` swaps two panels keyed on `state.flow_type`.
 Runs the calculation on `showEvent` and again on the Re-run button.
 
 - **Incompressible** path: `state.segment.pressure_profile(fluid, P0, flow_rate)` returns the per-point list directly.
-- **Compressible** path: re-anchors the AS with `AS.update(PT_INPUTS, P_inlet, T_inlet)` before each run (because `dP_dT` mutates AS in place), then calls `dP_dT(AS, flow_rate, isothermal=...)` and normalizes the tuple-of-tuples return into the same dict shape used downstream.
+- **Compressible** path: re-anchors the AS with `AS.update(PT_INPUTS, P_inlet, T_inlet)` before each run (because `dP_dT` mutates AS in place), constructs a `FlowState(AS, mdot, A=segment.inlet_area_si, z=0)` from that anchor — `mdot` from `_resolve_mdot(flow_rate, AS)` — then calls `segment.dP_dT(fs, isothermal=...)` and normalizes the tuple-of-tuples return into the same dict shape used downstream.
 
 The plot is a pressure-vs-distance curve (left Y axis, blue) with an X-axis distance-unit selector and Y-axis pressure-unit selector. **Compressible adds a secondary right-hand axis** (linked ViewBox) carrying the temperature trace, with its own unit selector. Unit-selector changes re-render against `state.results` without re-running the solver — the underlying data is always SI.
 
@@ -171,7 +171,7 @@ Each inline editor page (Pipe / Fitting / Valve / Check Valve) carries a **"Show
 - **Valve / Check Valve** — K-factor, mass flow, dP, and velocity through the **smallest** characteristic diameter (seat bore `D1` for reducer types, single pipe `D` for butterfly / swing / tilting-disk). Compressible adds inlet/outlet P + T rows.
 - **Fitting** — mass flow, dP, velocity. Bend reports velocity at the pipe ID; sudden contraction/expansion reports velocity at `min(Di_US, Di_DS)` (the point of maximum velocity).
 
-For the incompressible case all rows come from `result.component(comp)` — `pressure_profile()` already supplies per-point `v_ms` so the profile window consumes it directly. For the compressible case, inlet/outlet (P, T) come from `_inline_inlet_outlet_PT()`, which reads `result["component_outlet_PT"]` and walks one step back in flow direction (handling reverse flow); inlet density for velocity comes from a save / restore around `AS.update(PT_INPUTS, P, T)`. The compressible pipe profile is generated lazily on **Plot profile…** click by re-running `compressible_flow.Line_Segment.dP_dT` against an AS reseeded to the inlet (P, T) — the returned `(distance, P, T, v)` tuples feed `PipeProfileWindow` directly.
+For the incompressible case all rows come from `result.component(comp)` — `pressure_profile()` already supplies per-point `v_ms` so the profile window consumes it directly. For the compressible case, inlet/outlet (P, T) come from `_inline_inlet_outlet_PT()`, which reads `result["component_outlet_PT"]` and walks one step back in flow direction (handling reverse flow); inlet density for velocity comes from a save / restore around `AS.update(PT_INPUTS, P, T)`. The compressible pipe profile is generated lazily on **Plot profile…** click by re-anchoring the AS to the inlet (P, T), building a fresh `FlowState(AS, mdot, A=seg.inlet_area_si, z=0)`, and running `compressible_flow.Line_Segment.dP_dT(fs)` — the returned `(distance, P, T, v)` tuples feed `PipeProfileWindow` directly.
 
 ---
 

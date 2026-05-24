@@ -61,6 +61,7 @@ from network import (
 from compressible_flow import (
     _build_phase_limits, _safe_update_PT,
     _is_sealed_check_valve, _sealed_outlet_PT,
+    FlowState,
 )
 
 
@@ -372,6 +373,7 @@ class Compressible_Network(Network):
 
             P_in_e = P[inlet_i]
             T_in_e = T[inlet_i]
+            z_in_e = self._nodes[node_names[inlet_i]].elevation_m
             abs_mdot = abs(mdot_e)
 
             # If any component in the walked path is a sealed check-valve
@@ -403,13 +405,18 @@ class Compressible_Network(Network):
             try:
                 _safe_update_PT(abstract_state, P_in_e, T_in_e,
                                 T_cric, P_bar, T_c, P_c)
+                # Seed the FlowState's local area from the first component's
+                # inlet area so its internal _area_match is a no-op; any
+                # downstream area discontinuity (mixed-diameter chain) is
+                # absorbed automatically inside each component's dP_dT.
+                fs = FlowState(
+                    abstract_state, abs_mdot,
+                    A=comps[0].inlet_area_si, z=z_in_e,
+                    T_cricondentherm=T_cric, P_cricondenbar=P_bar,
+                    T_critical=T_c, P_critical=P_c,
+                )
                 for c in comps:
-                    c.dP_dT(
-                        abstract_state,
-                        ureg.Quantity(abs_mdot, "kg/s"),
-                        T_cricondentherm=T_cric, P_cricondenbar=P_bar,
-                        T_critical=T_c, P_critical=P_c,
-                    )
+                    c.dP_dT(fs)
             except (RuntimeError, ValueError):
                 _safe_update_PT(abstract_state, P_in_e, T_in_e,
                                 T_cric, P_bar, T_c, P_c)
@@ -640,14 +647,16 @@ class Compressible_Network(Network):
 
             _safe_update_PT(abstract_state, P_arr[inlet_i], T_arr[inlet_i],
                             T_cric, P_bar, T_c, P_c)
+            z_inlet_recon = self._nodes[node_names[inlet_i]].elevation_m
+            fs_recon = FlowState(
+                abstract_state, abs(mdot_e),
+                A=walk_comps[0].inlet_area_si, z=z_inlet_recon,
+                T_cricondentherm=T_cric, P_cricondenbar=P_bar,
+                T_critical=T_c, P_critical=P_c,
+            )
             walked_PT = []
             for c in walk_comps:
-                c.dP_dT(
-                    abstract_state,
-                    ureg.Quantity(abs(mdot_e), "kg/s"),
-                    T_cricondentherm=T_cric, P_cricondenbar=P_bar,
-                    T_critical=T_c, P_critical=P_c,
-                )
+                c.dP_dT(fs_recon)
                 walked_PT.append((float(abstract_state.p()),
                                   float(abstract_state.T())))
             # For reverse flow, walked_PT[k] is the flow-direction outlet of
@@ -752,11 +761,15 @@ def save_compressible_result_bundle(dir_path, net, result, abstract_state,
                         P_in, T_in = pt_list[pos + 1]
                 try:
                     abstract_state.update(CP.PT_INPUTS, P_in, T_in)
-                    raw = comp.dP_dT(
-                        abstract_state=abstract_state,
-                        flow_rate=ureg.Quantity(abs(mdot), "kg/s"),
-                        isothermal=isothermal,
+                    # FlowState carries area+envelope.  inlet_area_si makes
+                    # the component's internal _area_match a no-op; z is
+                    # set to 0 here since this re-walk is only used to
+                    # generate a profile and z doesn't feed back into it.
+                    fs_profile = FlowState(
+                        abstract_state, abs(mdot),
+                        A=comp.inlet_area_si, z=0.0,
                     )
+                    raw = comp.dP_dT(fs_profile, isothermal=isothermal)
                 except Exception as exc:
                     profile_errors[f"{edge.name}#{pos}"] = (
                         f"{type(exc).__name__}: {exc}"
@@ -822,11 +835,12 @@ def _test_single_segment_forward():
     # ---- Direct reference walk.
     T_cric, P_bar, T_c, P_c = _build_phase_limits(AS)
     _safe_update_PT(AS, P_in, T_in, T_cric, P_bar, T_c, P_c)
-    seg.dP_dT(
-        AS, ureg.Quantity(mdot_kgs, "kg/s"),
+    fs_ref = FlowState(
+        AS, mdot_kgs, A=seg.inlet_area_si, z=0.0,
         T_cricondentherm=T_cric, P_cricondenbar=P_bar,
         T_critical=T_c, P_critical=P_c,
     )
+    seg.dP_dT(fs_ref)
     P_out_ref = AS.p()
     T_out_ref = AS.T()
     print(f"[single-fwd]  direct walk:    "
@@ -1023,11 +1037,12 @@ def _test_mixing_junction():
     # Walk each from its inlet (P_in, T_in) at the solved mdot and read h.
     def walked_h_at_MIX(seg, T_inlet, mdot):
         _safe_update_PT(AS, P_in_Pa, T_inlet, T_cric, P_bar, T_c, P_c)
-        seg.dP_dT(
-            AS, ureg.Quantity(mdot, "kg/s"),
+        fs_check = FlowState(
+            AS, mdot, A=seg.inlet_area_si, z=0.0,
             T_cricondentherm=T_cric, P_cricondenbar=P_bar,
             T_critical=T_c, P_critical=P_c,
         )
+        seg.dP_dT(fs_check)
         return AS.hmass()
 
     h_H_arriving = walked_h_at_MIX(pipe_H, T_hot,  mdot_H)

@@ -10,6 +10,7 @@ from compressible_flow import (
     Contraction_Expansion as Compressible_Contraction_Expansion,
     Line_Segment as Compressible_Line_Segment,
     Valve as Compressible_Valve,
+    FlowState,
     _build_phase_limits,
     _resolve_mdot,
     _safe_update_PT,
@@ -56,14 +57,13 @@ def test_comp_hydraulics():
     print('\n')
     print(f'inputs: P = {P_gas}, Smass= {S_in}, velocity = {v_in}, Mach number = {Ma_in}')
     # print('\n')
+    fs_iso = FlowState(AS_g, mdot, A=A_gas, z=0.0)
     compressible_pipe_segment(
-        abstract_state=AS_g,   # already updated to (P_gas, T_gas) above
-        mdot=mdot,
+        fs_iso,
         dL=dL_gas,
         dz=dz_gas,
         D_h=D_gas,
         roughness=eps_gas,
-        flow_area=A_gas,
         isothermal=True,
     )
     outlet_P = AS_g.p()
@@ -81,14 +81,13 @@ def test_comp_hydraulics():
 
     AS_g.update(CP.PT_INPUTS, P_gas, T_gas) #reinitialize abstract state
 
+    fs_ad = FlowState(AS_g, mdot, A=A_gas, z=0.0)
     compressible_pipe_segment(
-        abstract_state=AS_g,   # already updated to (P_gas, T_gas) above
-        mdot=mdot,
+        fs_ad,
         dL=dL_gas,
         dz=dz_gas,
         D_h=D_gas,
         roughness=eps_gas,
-        flow_area=A_gas,
         isothermal=False,
         q_wall = ureg.Quantity(0, "Btu/hr").to("watt").magnitude,
     )
@@ -131,7 +130,8 @@ def test_compressible_line_segment_csv():
     print("\ntest_line_segment_csv")
     print(f"  inlet: P={P_in:.4g} Pa, T={T_in} K, Ma={Ma_in:.4f}")
 
-    profile_points = seg.dP_dT(abstract_state=AS, flow_rate=Q_scfd, isothermal=True, mu = 1.1e-5)
+    fs_seg = FlowState(AS, _resolve_mdot(Q_scfd, AS), A=seg.inlet_area_si, z=0.0)
+    profile_points = seg.dP_dT(fs_seg, isothermal=True, mu=1.1e-5)
     P_out = AS.p()
     T_out = AS.T()
 
@@ -196,11 +196,13 @@ def test_compressible_fittings():
     )
     AS.update(CP.PT_INPUTS, P_in, T_in)
 
-    contraction_test.dP_dT(AS, Q_scfd)
+    mdot_fittings = _resolve_mdot(Q_scfd, AS)
+    fs_fit = FlowState(AS, mdot_fittings, A=contraction_test.inlet_area_si, z=0.0)
+    contraction_test.dP_dT(fs_fit)
     print(f'After contraction P:{AS.p()}, T:{AS.T()}')
-    expansion_test.dP_dT(AS, Q_scfd)
+    expansion_test.dP_dT(fs_fit)
     print(f'After expansion P:{AS.p()}, T:{AS.T()}')
-    elbow.dP_dT(abstract_state=AS, flow_rate=Q_scfd)
+    elbow.dP_dT(fs_fit)
     print(f'After elbow P:{AS.p()}, T:{AS.T()}')
 
 
@@ -343,9 +345,12 @@ def test_K():
     rho_in = AS.rhomass()
     v_in   = mdot_s1.to("kg/s").magnitude / (rho_in * A)
 
-    valve.dP_dT(AS, mdot_s1,
-                T_cricondentherm=T_cricondentherm, P_cricondenbar=P_cricondenbar,
-                T_critical=T_critical, P_critical=P_critical)
+    fs_s1 = FlowState(
+        AS, mdot_s1.to("kg/s").magnitude, A=A, z=0.0,
+        T_cricondentherm=T_cricondentherm, P_cricondenbar=P_cricondenbar,
+        T_critical=T_critical, P_critical=P_critical,
+    )
+    valve.dP_dT(fs_s1)
 
     P_out1    = AS.p()
     rel_dP1   = (P_in - P_out1) / P_in
@@ -362,9 +367,12 @@ def test_K():
     mdot_s2 = ureg.Quantity(0.015, "kg/s")
     _safe_update_PT(AS, P_in, T_in, *phase_limits)
 
-    valve.dP_dT(AS, mdot_s2,
-                T_cricondentherm=T_cricondentherm, P_cricondenbar=P_cricondenbar,
-                T_critical=T_critical, P_critical=P_critical)
+    fs_s2 = FlowState(
+        AS, mdot_s2.to("kg/s").magnitude, A=A, z=0.0,
+        T_cricondentherm=T_cricondentherm, P_cricondenbar=P_cricondenbar,
+        T_critical=T_critical, P_critical=P_critical,
+    )
+    valve.dP_dT(fs_s2)
 
     P_out2  = AS.p()
     rel_dP2 = (P_in - P_out2) / P_in
@@ -378,19 +386,38 @@ def test_K():
     _safe_update_PT(AS, P_in, T_in, *phase_limits)
 
     try:
-        valve.dP_dT(AS, mdot_s3,
-                    T_cricondentherm=T_cricondentherm, P_cricondenbar=P_cricondenbar,
-                    T_critical=T_critical, P_critical=P_critical)
+        fs_s3 = FlowState(
+            AS, mdot_s3.to("kg/s").magnitude, A=A, z=0.0,
+            T_cricondentherm=T_cricondentherm, P_cricondenbar=P_cricondenbar,
+            T_critical=T_critical, P_critical=P_critical,
+        )
+        valve.dP_dT(fs_s3)
         raise AssertionError("Scenario 3: expected RuntimeError for choked flow but none was raised")
     except RuntimeError as e:
         print(f"  Scenario 3 (choked):   RuntimeError correctly raised: {e}")
 
 
+def test_contraction_expansion():
+    import fluids
+    OD = 60.32
+    WTs = [1.65,	2.77,3.18,3.91,	5.54,8.74,	11.07]
+    ID_min = OD - 2 * max(WTs)
+    for i in WTs:
+        ID = OD - i*2
+        K_ds = fluids.fittings.contraction_sharp(Di1=ID, Di2=ID_min)
+        Kcont    = K_ds * (ID_min / ID) ** 4
+    
+        # Expansion: fluids returns K w.r.t. upstream velocity directly.
+        Kexp = fluids.fittings.diffuser_sharp(Di1=ID_min, Di2=ID)
+        print(f'WT:{i},K contraction: {Kcont}, K expansion: {Kexp}')
+
 if __name__ == "__main__":
+    
     # test_compressible_fittings()
     # test_compressible_line_segment_csv()
     # test_comp_hydraulics()
     # test_incompressible_p2p()
     # test_incompressible_cont()
     # test_incompressible_csv_profile()
-    test_K()
+    #test_K()
+    test_contraction_expansion()

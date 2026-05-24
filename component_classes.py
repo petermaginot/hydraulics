@@ -796,6 +796,14 @@ class Base_Line_Segment:
             vol += area_in * (dist_out - dist_in)
         return vol
 
+    @property
+    def inlet_area_si(self):
+        return self.profile[0][3]
+
+    @property
+    def outlet_area_si(self):
+        return self.profile[-1][3]
+
     def __repr__(self):
         first = self.profile[0]
         dh_q  = ureg.Quantity(first[2], "m")
@@ -858,6 +866,14 @@ class Base_Bend:
             f"angle={self.ang_deg:.1f} deg, "
             f"bend_diameters={self.bend_dias:.2f})"
         )
+
+    @property
+    def inlet_area_si(self):
+        return math.pi * self.Di_si ** 2 / 4.0
+
+    @property
+    def outlet_area_si(self):
+        return math.pi * self.Di_si ** 2 / 4.0
 
     def to_dict(self):
         return {
@@ -976,6 +992,14 @@ class Base_Valve:
             f"K={self.K:.4f}{extra})"
         )
 
+    @property
+    def inlet_area_si(self):
+        return math.pi * self.Di_si ** 2 / 4.0
+
+    @property
+    def outlet_area_si(self):
+        return math.pi * self.Di_si ** 2 / 4.0
+
     def to_dict(self):
         d = {
             "kind": "valve",
@@ -1047,6 +1071,14 @@ class Base_CheckValve:
             f"K_fwd={self.K:.4f})"
         )
 
+    @property
+    def inlet_area_si(self):
+        return math.pi * self.Di_si ** 2 / 4.0
+
+    @property
+    def outlet_area_si(self):
+        return math.pi * self.Di_si ** 2 / 4.0
+
     def to_dict(self):
         return {
             "kind": "check_valve",
@@ -1105,6 +1137,14 @@ class Base_Contraction_Expansion:
             f"Di_US={US_q.to('inch'):.4f~P}, "
             f"Di_DS={DS_q.to('inch'):.4f~P})"
         )
+
+    @property
+    def inlet_area_si(self):
+        return math.pi * self.Di_US_si ** 2 / 4.0
+
+    @property
+    def outlet_area_si(self):
+        return math.pi * self.Di_DS_si ** 2 / 4.0
 
     def to_dict(self):
         return {

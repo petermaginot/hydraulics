@@ -340,18 +340,31 @@ the ODE becomes stiff.
   alternative). The fixes are mostly about *invoking* the rigorous path when
   the linearized one is out of validity, not about new derivations.
 
-- **[cross-cutting, architecture] AbstractState does not carry velocity.**
-  Functions throughout the compressible layer pass `AbstractState` as if
-  it fully specifies the thermodynamic state, but for a flowing fluid the
-  *true* state is `(AbstractState, v)` — without velocity you cannot
-  recover stagnation properties, kinetic energy, or Mach number.
-  `compressible_K`, `compressible_changing_area_K`, `compressible_pipe_segment`,
-  and `choked_mass_flux` each re-derive `v` from `mdot/(rho*A)` locally;
-  this works but leaves the calling convention implicit and creates real
-  bugs when one function's "stagnation state" assumption meets another
-  function's "static state" convention. `choked_mass_flux`'s docstring
-  claims AS is at stagnation, while every caller passes static — the
-  resulting few-percent error is exactly in the high-Ma cases where the
-  pre-screen fires. Proper fix: introduce a `FlowState` container or
-  standardize on `(AS, mdot)` (or `(AS, v)`) as the calling unit
-  throughout the compressible layer. Deferred to its own design pass.
+- **[cross-cutting, architecture] AbstractState does not carry velocity. ✅ DONE.**
+  Introduced [`FlowState`](compressible_flow.py) — a container bundling
+  `(AS at static, mdot, A_local, z, cached phase-envelope limits)` — and
+  refactored the compressible layer to take it as the calling unit
+  throughout. `v`, `Ma`, stagnation enthalpy, and gravitational PE are
+  derived properties on the container, so the static/stagnation
+  distinction is now operative rather than implicit in docstrings.
+  Bare functions (`compressible_K`, `compressible_changing_area_K`,
+  `compressible_changing_area`, `compressible_pipe_segment`,
+  `choked_mass_flux`) and component `dP_dT` methods now all take
+  FlowState; the network walk in
+  [compressible_network.py](compressible_network.py) constructs one
+  FlowState at each edge inlet and passes it through the component
+  chain.  Side benefits: area-change discontinuities between
+  consecutive components are absorbed automatically (via `_area_match`
+  → `compressible_changing_area_K(K=0)`), and the phase-envelope kwargs
+  no longer thread through every call signature.
+
+  *Bug fixed as a consequence:* `choked_mass_flux` now builds its
+  stagnation reference from `fs.h_stagnation = h_static + v_in**2/2`
+  instead of taking `AS.hmass()` literally — the old code claimed AS
+  was at stagnation in the docstring while every caller passed static,
+  silently undercounting `h0` by `v_in**2/2`.  Validation: at P=20 bar,
+  T=300 K methane-rich mixture, the choked mass flow rises ~15% when
+  v_in is raised from ~0 to ~a/2 — under the old code these would have
+  returned the same value.  See
+  `test_compressible_K_choke_roundtrip` in
+  [textbook_test_functions.py](textbook_test_functions.py).

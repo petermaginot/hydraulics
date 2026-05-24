@@ -116,6 +116,138 @@ from component_classes import (
 )
 
 
+# ---------------------------------------------------------------------------
+# FlowState
+# ---------------------------------------------------------------------------
+#
+# Convention for the compressible layer:
+#   - AS is always at the STATIC thermodynamic state (P, T).
+#   - mdot, A, and z ride along on the FlowState so that v, Ma, stagnation
+#     enthalpy, and gravitational PE can be derived consistently.
+#   - Physics functions (compressible_K, compressible_changing_area_K,
+#     compressible_changing_area, compressible_pipe_segment,
+#     choked_mass_flux) take a FlowState and mutate it in place: AS to a
+#     new static state, and A and/or z when the function changes the
+#     geometry of the flow (area-change boundaries, line-segment slices).
+#   - mdot is invariant once set.
+#
+# Phase-envelope limits are cached on the FlowState so callers never need
+# to forward T_cricondentherm / P_cricondenbar / T_critical / P_critical
+# explicitly through every layer.
+
+_GRAVITY_MS2 = 9.80665
+
+
+class FlowState:
+    """Flowing-fluid state at one location.
+
+    Carries the static thermodynamic state (mutable AS), the conserved mass
+    flow, the local flow area and elevation, and the cached phase-envelope
+    limits.  Velocity, Mach number, stagnation properties, and gravitational
+    PE are derived properties so they always reflect the current AS after
+    any in-place mutation.
+
+    Args:
+        AS    : CoolProp AbstractState at the static (P, T).  Mutated in
+                place by the compressible-flow functions.
+        mdot  : float, mass flow rate [kg/s].  Magnitude, not signed --
+                reverse-flow geometry is handled by network._reversed_component.
+        A     : float, local flow cross-section area [m^2].
+        z     : float, local elevation above datum [m].  Default 0.
+        T_cricondentherm, P_cricondenbar, T_critical, P_critical :
+                optional pre-computed phase-envelope limits.  If all four
+                are None and build_envelope is True, the envelope is built
+                via _build_phase_limits on construction.
+        build_envelope : bool.  If False and the four limits are all None,
+                construction skips _build_phase_limits and the FlowState
+                carries None for all four (callers that don't need the
+                phase hint can skip the build cost).  Default True.
+    """
+
+    __slots__ = ("AS", "mdot", "A", "z",
+                 "T_cricondentherm", "P_cricondenbar",
+                 "T_critical", "P_critical")
+
+    def __init__(self, AS, mdot, A, z=0.0, *,
+                 T_cricondentherm=None, P_cricondenbar=None,
+                 T_critical=None, P_critical=None,
+                 build_envelope=True):
+        self.AS   = AS
+        self.mdot = float(mdot)
+        self.A    = float(A)
+        self.z    = float(z)
+        if (T_cricondentherm is None and P_cricondenbar is None
+                and T_critical is None and P_critical is None
+                and build_envelope):
+            (self.T_cricondentherm, self.P_cricondenbar,
+             self.T_critical, self.P_critical) = _build_phase_limits(AS)
+        else:
+            self.T_cricondentherm = T_cricondentherm
+            self.P_cricondenbar   = P_cricondenbar
+            self.T_critical       = T_critical
+            self.P_critical       = P_critical
+
+    # ---- Direct AS reads --------------------------------------------------
+    @property
+    def P(self):
+        return self.AS.p()
+
+    @property
+    def T(self):
+        return self.AS.T()
+
+    @property
+    def rho(self):
+        return self.AS.rhomass()
+
+    @property
+    def h(self):
+        return self.AS.hmass()
+
+    @property
+    def s(self):
+        # Entropy is unchanged by kinetic energy, so static s == stagnation s.
+        return self.AS.smass()
+
+    # ---- Derived flow quantities -----------------------------------------
+    @property
+    def v(self):
+        return self.mdot / (self.rho * self.A)
+
+    @property
+    def Ma(self):
+        return self.v / self.AS.speed_sound()
+
+    @property
+    def h_stagnation(self):
+        # Gas-dynamic stagnation enthalpy: h_static + v^2/2.  Excludes
+        # gravitational PE on purpose; use h_total_with_g for full Bernoulli.
+        return self.AS.hmass() + 0.5 * self.v ** 2
+
+    @property
+    def h_total_with_g(self):
+        return self.h_stagnation + _GRAVITY_MS2 * self.z
+
+
+def _safe_flowstate_update_PT(fs, P, T):
+    """Update fs.AS to (P, T) using fs's cached phase-envelope limits."""
+    _safe_update_PT(fs.AS, P, T,
+                    fs.T_cricondentherm, fs.P_cricondenbar,
+                    fs.T_critical, fs.P_critical)
+
+
+def _area_match(fs, A_target, tol=1e-6):
+    """If fs.A != A_target within tol, run an isentropic area change so
+    that fs.AS reflects the state at A_target and fs.A == A_target.
+
+    No-op when fs.A is already at A_target.  Used at the top of every
+    component dP_dT method to absorb any area discontinuity between
+    consecutive components automatically.
+    """
+    if abs(fs.A - A_target) / max(fs.A, A_target) > tol:
+        compressible_changing_area_K(fs, A_target, K=0.0)
+
+
 class Line_Segment(Base_Line_Segment):
     """Pipe segment with compressible-flow pressure and temperature calculation.
 
@@ -130,15 +262,10 @@ class Line_Segment(Base_Line_Segment):
 
     def dP_dT(
         self,
-        abstract_state,
-        flow_rate,
+        fs,
         isothermal=False,
         q_wall=0.0,
         mu=None,
-        T_cricondentherm=None,
-        P_cricondenbar=None,
-        T_critical=None,
-        P_critical=None,
         energy_tol=10.0,
         dPdL_rel_tol=0.05,
         max_split_depth=8,
@@ -154,57 +281,43 @@ class Line_Segment(Base_Line_Segment):
         Heat input q_wall is distributed uniformly per unit pipe length across
         all slices.
 
+        On entry fs.AS must be at the segment inlet (P, T).  If fs.A does
+        not match the profile-inlet area, an isentropic area-change is
+        applied first to absorb the discontinuity.  On return fs.AS is at
+        the outlet (P, T), fs.A == profile-outlet area, and fs.z is
+        advanced by the segment's total elevation change.
+
         Args:
-            abstract_state : CoolProp AbstractState pre-configured for the
-                             working fluid AND already updated to the segment
-                             inlet (P, T).  Read in-place to obtain the inlet
-                             conditions, and mutated in place during
-                             integration; must not be shared across threads.
-            flow_rate      : pint Quantity -- mass ([mass]/[time]), molar or
-                             standard-volume ([substance]/[time], e.g. mol/s,
-                             mmscf/day), or actual volumetric
-                             ([length]^3/[time]) flow rate.
-            isothermal     : bool, if True temperature is held constant
-                             through each slice.  Default False.
-            q_wall         : float, total heat input to the fluid over the
-                             entire segment [W].  Distributed uniformly per
-                             unit length.  Ignored when isothermal=True.
-                             Default 0.0 (adiabatic).
-            mu             : float or None, viscosity [Pa*s] forwarded to
-                             compressible_pipe_segment() for every slice.  If
-                             None (default), CoolProp is queried at each slice
-                             and falls back to Lee-Gonzalez-Eakin on failure.
-            T_cricondentherm,
-            P_cricondenbar,
-            T_critical,
-            P_critical     : optional precomputed phase-envelope limits [K, Pa].
-                             If all four are supplied, the internal call to
-                             _build_phase_limits is skipped.  Useful when
-                             dP_dT is invoked many times on the same fluid
-                             (e.g. parallel-flow iteration), since
-                             build_phase_envelope is expensive for
-                             multicomponent HEOS mixtures.  Default None
-                             (envelope is built on each call).
-            energy_tol     : float, stagnation-enthalpy residual tolerance
-                             [J/kg] forwarded to compressible_pipe_segment()'s
-                             adaptive splitter.  Default 10.0.  Ignored when
-                             isothermal=True.
-            dPdL_rel_tol   : float, relative dP/dL-change tolerance forwarded
-                             to compressible_pipe_segment()'s adaptive
-                             splitter.  Default 0.05 (5%).
-            max_split_depth: int, maximum recursive bisection depth permitted
-                             per profile slice.  Default 8 (=256x refinement).
+            fs              : FlowState.  fs.AS must be at the segment
+                              inlet (P, T) when called; mutated in place.
+            isothermal      : bool, if True temperature is held constant
+                              through each slice.  Default False.
+            q_wall          : float, total heat input to the fluid over the
+                              entire segment [W].  Distributed uniformly per
+                              unit length.  Ignored when isothermal=True.
+                              Default 0.0 (adiabatic).
+            mu              : float or None, viscosity [Pa*s] forwarded to
+                              compressible_pipe_segment() for every slice.  If
+                              None (default), CoolProp is queried at each slice
+                              and falls back to Lee-Gonzalez-Eakin on failure.
+            energy_tol      : float, stagnation-enthalpy residual tolerance
+                              [J/kg] forwarded to compressible_pipe_segment()'s
+                              adaptive splitter.  Default 10.0.  Ignored when
+                              isothermal=True.
+            dPdL_rel_tol    : float, relative dP/dL-change tolerance forwarded
+                              to compressible_pipe_segment()'s adaptive
+                              splitter.  Default 0.05 (5%).
+            max_split_depth : int, maximum recursive bisection depth permitted
+                              per profile slice.  Default 8 (=256x refinement).
 
         Returns:
             profile_points: a list of (distance_m, pressure_Pa, temperature_K,
             velocity_ms) tuples, one per profile point (inlet through outlet),
             suitable for constructing pressure, temperature, or velocity
-            profile plots.  abstract_state is updated in place to outlet
-            conditions.
+            profile plots.  fs is mutated in place to outlet conditions.
 
         Raises:
-            ValueError   : if the profile has fewer than two points or
-                           flow_rate dimensions are unrecognized.
+            ValueError   : if the profile has fewer than two points.
             RuntimeError : if two-phase conditions, choked flow, or a
                            CoolProp failure occur during integration.
         """
@@ -213,31 +326,12 @@ class Line_Segment(Base_Line_Segment):
                 "Line_Segment.dP_dT: profile must have at least two points."
             )
 
-        AS = abstract_state
-        # If the caller supplied any limits, trust them and skip the rebuild --
-        # _build_phase_limits is allowed to return Nones for fields it couldn't
-        # compute (e.g. envelope failed but critical point succeeded), and we
-        # don't want to retry on every call.
-        if (
-            T_cricondentherm is None
-            and P_cricondenbar is None
-            and T_critical is None
-            and P_critical is None
-        ):
-            T_cric, P_bar, T_c, P_c = _build_phase_limits(AS)
-        else:
-            T_cric, P_bar, T_c, P_c = (
-                T_cricondentherm,
-                P_cricondenbar,
-                T_critical,
-                P_critical,
-            )
-        # Inlet conditions come from AS as the caller provided it; consistent
-        # with Bend.dP_dT and Contraction_Expansion.dP_dT, which also assume
-        # the caller has updated AS to the inlet (P, T) before calling.
-        P0   = AS.p()
-        T0   = AS.T()
-        mdot = _resolve_mdot(flow_rate, AS)
+        # Absorb any area discontinuity with the upstream component, then read
+        # inlet (P, T) for the inlet-point record.
+        _area_match(fs, self.profile[0][3])
+        P0   = fs.AS.p()
+        T0   = fs.AS.T()
+        mdot = fs.mdot
 
         total_length  = self.total_length_m
         q_per_length  = q_wall / total_length if total_length > 0.0 else 0.0
@@ -247,7 +341,7 @@ class Line_Segment(Base_Line_Segment):
 
         # Record inlet conditions at profile point 0.
         dist0, _elev0, _D_h0, area0 = self.profile[0]
-        v0 = mdot / (AS.rhomass() * area0)
+        v0 = mdot / (fs.AS.rhomass() * area0)
         profile_points = [(dist0, P0, T0, v0)]
 
         for i in range(n - 1):
@@ -259,21 +353,18 @@ class Line_Segment(Base_Line_Segment):
             dz      = elev_out - elev_in   # m, elevation rise (positive = uphill)
             q_slice = q_per_length * dL    # W, heat for this slice
 
+            # Invariant: fs.A == area_in at this point (set either by the
+            # outer _area_match for the first slice, or by the previous
+            # iteration's area-change correction).
             compressible_pipe_segment(
-                abstract_state=AS,
-                mdot=mdot,
+                fs,
                 dL=dL,
                 dz=dz,
                 D_h=D_h_in,
                 roughness=self.roughness_si,
-                flow_area=area_in,
                 isothermal=isothermal,
                 q_wall=q_slice,
                 mu=mu,
-                T_cricondentherm=T_cric,
-                P_cricondenbar=P_bar,
-                T_critical=T_c,
-                P_critical=P_c,
                 energy_tol=energy_tol,
                 dPdL_rel_tol=dPdL_rel_tol,
                 _max_split_depth=max_split_depth,
@@ -282,16 +373,12 @@ class Line_Segment(Base_Line_Segment):
             # Area-change correction at the boundary to the next slice.
             area_ratio = abs(area_out - area_in) / max(area_in, area_out)
             if area_ratio > _AREA_TOL:
-                compressible_changing_area_K(
-                    AS, mdot, area_in, area_out, K=0.0,
-                    T_cricondentherm=T_cric, P_cricondenbar=P_bar,
-                    T_critical=T_c, P_critical=P_c,
-                )
+                compressible_changing_area_K(fs, area_out, K=0.0)
 
             # Record conditions at this profile point after all corrections.
-            P_cur   = AS.p()
-            T_cur   = AS.T()
-            v_cur   = mdot / (AS.rhomass() * area_out)
+            P_cur   = fs.AS.p()
+            T_cur   = fs.AS.T()
+            v_cur   = mdot / (fs.AS.rhomass() * area_out)
             profile_points.append((dist_out, P_cur, T_cur, v_cur))
             if verbose:
                 msg = str(f"Segment {self.name} Step: {i+1} of {n-1}, P = {P_cur}, T = {T_cur}")
@@ -314,69 +401,45 @@ class Bend(Base_Bend):
         bend_dias : float.  Bend radius as a multiple of Di.
     """
 
-    def dP_dT(
-        self,
-        abstract_state,
-        flow_rate,
-        mu=None,
-        T_cricondentherm=None,
-        P_cricondenbar=None,
-        T_critical=None,
-        P_critical=None,
-    ):
+    def dP_dT(self, fs, mu=None):
         """Outlet conditions for a compressible fluid passing through the bend.
 
-        The caller must update abstract_state to the inlet (P, T) conditions
-        before calling.  Uses fluids.fittings.bend_rounded() to obtain K, then
-        delegates to compressible_K().
+        Absorbs any inlet-area discontinuity isentropically, then uses
+        fluids.fittings.bend_rounded() to obtain K and delegates to
+        compressible_K().  fs.A is unchanged on return (point fitting with
+        equal inlet/outlet area).
 
         Args:
-            abstract_state : CoolProp AbstractState, pre-updated to inlet (P, T)
-                             by the caller.  Updated in-place on return.
-            flow_rate      : pint Quantity -- mass, molar, or volumetric flow.
-            mu             : float or None, viscosity [Pa*s] used in the
-                             Reynolds number calculation.  If None (default),
-                             CoolProp is queried and falls back to
-                             Lee-Gonzalez-Eakin on failure.
-            T_cricondentherm,
-            P_cricondenbar,
-            T_critical,
-            P_critical     : optional precomputed phase-envelope limits, forwarded
-                             to compressible_K() so PT updates can specify a
-                             supercritical phase hint and bypass HEOS phase
-                             stability analysis (which fails for some mixtures).
-        Returns:
-            None.  abstract_state is updated in place to outlet conditions.
-        """
-        AS   = abstract_state
-        mdot = _resolve_mdot(flow_rate, AS)
+            fs : FlowState at the upstream connection (static).  fs.AS must
+                 be at the inlet (P, T); mutated in place to the outlet state.
+            mu : float or None, viscosity [Pa*s] used in the Reynolds number
+                 calculation.  If None (default), CoolProp is queried and
+                 falls back to Lee-Gonzalez-Eakin on failure.
 
+        Returns:
+            None.  fs is mutated in place.
+        """
         Di = self.Di_si
         A  = math.pi * Di ** 2 / 4.0
 
-        rho_in = AS.rhomass()
+        _area_match(fs, A)
+
+        rho_in = fs.rho
         if mu is None:
             try:
-                mu = AS.viscosity()
+                mu = fs.AS.viscosity()
             except Exception:
-                mu = viscosity_LGE(AS.T(), AS.molar_mass() * 1000.0, rho_in)
+                mu = viscosity_LGE(fs.T, fs.AS.molar_mass() * 1000.0, rho_in)
 
-        v_in = mdot / (rho_in * A)
-        Re   = fluids_Reynolds(V=v_in, D=Di, rho=rho_in, mu=mu)
-        K    = fluids.fittings.bend_rounded(
+        Re = fluids_Reynolds(V=fs.v, D=Di, rho=rho_in, mu=mu)
+        K  = fluids.fittings.bend_rounded(
             Di=Di,
             bend_diameters=self.bend_dias,
             angle=self.ang_deg,
             Re=Re,
         )
 
-        compressible_K(
-            AS, mdot, A, K,
-            T_cricondentherm=T_cricondentherm,
-            P_cricondenbar=P_cricondenbar,
-            T_critical=T_critical,
-            P_critical=P_critical,
-        )
+        compressible_K(fs, K)
 
 
 class Valve(Base_Valve):
@@ -392,49 +455,24 @@ class Valve(Base_Valve):
              pipe velocity head.
     """
 
-    def dP_dT(
-        self,
-        abstract_state,
-        flow_rate,
-        T_cricondentherm=None,
-        P_cricondenbar=None,
-        T_critical=None,
-        P_critical=None,
-    ):
+    def dP_dT(self, fs):
         """Outlet conditions for a compressible fluid passing through the valve.
 
-        The caller must update abstract_state to the inlet (P, T) conditions
-        before calling.  Delegates directly to compressible_K() using the
-        K-factor stored on the instance.
+        Absorbs any inlet-area discontinuity isentropically, then delegates
+        to compressible_K() using the instance's K-factor.  fs.A is unchanged
+        on return.
 
         Args:
-            abstract_state : CoolProp AbstractState, pre-updated to inlet (P, T)
-                             by the caller.  Updated in-place on return.
-            flow_rate      : pint Quantity -- mass, molar, or volumetric flow.
-            T_cricondentherm,
-            P_cricondenbar,
-            T_critical,
-            P_critical     : optional precomputed phase-envelope limits, forwarded
-                             to compressible_K() so PT updates can specify a
-                             supercritical phase hint and bypass HEOS phase
-                             stability analysis (which fails for some mixtures).
+            fs : FlowState at the upstream connection (static).  fs.AS must
+                 be at the inlet (P, T); mutated in place to outlet state.
 
         Returns:
-            None.  abstract_state is updated in place to outlet conditions.
+            None.  fs is mutated in place.
         """
-        AS   = abstract_state
-        mdot = _resolve_mdot(flow_rate, AS)
-
         Di = self.Di_si
         A  = math.pi * Di ** 2 / 4.0
-
-        compressible_K(
-            AS, mdot, A, self.K,
-            T_cricondentherm=T_cricondentherm,
-            P_cricondenbar=P_cricondenbar,
-            T_critical=T_critical,
-            P_critical=P_critical,
-        )
+        _area_match(fs, A)
+        compressible_K(fs, self.K)
 
 
 # When network._reversed_component substitutes K = _SEALING_K (~ 1e9) on a
@@ -491,58 +529,31 @@ class CheckValve(Base_CheckValve):
         K  : float.  Forward-flow K-factor.
     """
 
-    def dP_dT(
-        self,
-        abstract_state,
-        flow_rate,
-        T_cricondentherm=None,
-        P_cricondenbar=None,
-        T_critical=None,
-        P_critical=None,
-    ):
+    def dP_dT(self, fs):
         """Outlet conditions for a compressible fluid passing through the
         check valve.
 
-        The caller must update abstract_state to the inlet (P, T) conditions
-        before calling.  Forward flow (physical K) delegates to
-        compressible_K().  Reverse flow (sealing K substituted by
-        _reversed_component) is short-circuited to a clamped sealed-state
+        Forward flow (physical K) absorbs any inlet-area discontinuity, then
+        delegates to compressible_K().  Reverse flow (sealing K substituted
+        by _reversed_component) is short-circuited to a clamped sealed-state
         outlet, see module-level _SEALED_* constants.
 
         Args:
-            abstract_state : CoolProp AbstractState, pre-updated to inlet (P, T)
-                             by the caller.  Updated in-place on return.
-            flow_rate      : pint Quantity -- mass, molar, or volumetric flow.
-            T_cricondentherm,
-            P_cricondenbar,
-            T_critical,
-            P_critical     : optional precomputed phase-envelope limits,
-                             forwarded to compressible_K() / _safe_update_PT().
+            fs : FlowState at the upstream connection (static).  fs.AS must
+                 be at the inlet (P, T); mutated in place to outlet state.
 
         Returns:
-            None.  abstract_state is updated in place to outlet conditions.
+            None.  fs is mutated in place.
         """
-        AS   = abstract_state
-        mdot = _resolve_mdot(flow_rate, AS)
-
         if self.K >= _SEALED_K_THRESHOLD:
-            P_out, T_out = _sealed_outlet_PT(AS.p(), AS.T())
-            _safe_update_PT(
-                AS, P_out, T_out,
-                T_cricondentherm, P_cricondenbar, T_critical, P_critical,
-            )
+            P_out, T_out = _sealed_outlet_PT(fs.AS.p(), fs.AS.T())
+            _safe_flowstate_update_PT(fs, P_out, T_out)
             return
 
         Di = self.Di_si
         A  = math.pi * Di ** 2 / 4.0
-
-        compressible_K(
-            AS, mdot, A, self.K,
-            T_cricondentherm=T_cricondentherm,
-            P_cricondenbar=P_cricondenbar,
-            T_critical=T_critical,
-            P_critical=P_critical,
-        )
+        _area_match(fs, A)
+        compressible_K(fs, self.K)
 
 
 class Contraction_Expansion(Base_Contraction_Expansion):
@@ -557,43 +568,23 @@ class Contraction_Expansion(Base_Contraction_Expansion):
         Di_DS : pint Quantity or float (m if float).  Downstream inner diameter.
     """
 
-    def dP_dT(
-        self,
-        abstract_state,
-        flow_rate,
-        T_cricondentherm=None,
-        P_cricondenbar=None,
-        T_critical=None,
-        P_critical=None,
-    ):
+    def dP_dT(self, fs):
         """Outlet abstract state for a compressible fluid passing through the
         contraction/expansion.
 
-        The caller must update abstract_state to the inlet (P, T) conditions
-        before calling.
-
-        Uses fluids.fittings.contraction_sharp() or diffuser_sharp() to obtain
-        the K-factor, then calls compressible_changing_area_K() with that K
-        referenced to the upstream (inlet) velocity head.
+        Absorbs any inlet-area discontinuity with the upstream component
+        (so that fs.A == A_US before the K is applied), then uses
+        fluids.fittings.contraction_sharp() or diffuser_sharp() to obtain
+        the K-factor referenced to the upstream velocity head, and calls
+        compressible_changing_area_K().  On return fs.A == A_DS.
 
         Args:
-            abstract_state : CoolProp AbstractState instance, pre-updated to
-                             inlet (P, T) by the caller.  Updated in-place on
-                             return to outlet conditions.
-            flow_rate      : pint Quantity -- mass, molar, or volumetric flow.
-            T_cricondentherm,
-            P_cricondenbar,
-            T_critical,
-            P_critical     : optional precomputed phase-envelope limits, forwarded
-                             to compressible_changing_area_K() for the
-                             supercritical phase hint.
+            fs : FlowState at the upstream connection (static).  fs.AS must
+                 be at the inlet (P, T); mutated in place to outlet state.
 
         Returns:
-            None.  abstract_state is updated in place to outlet conditions.
+            None.  fs is mutated in place.
         """
-        AS   = abstract_state
-        mdot = _resolve_mdot(flow_rate, AS)
-
         Di_US = self.Di_US_si
         Di_DS = self.Di_DS_si
 
@@ -603,6 +594,8 @@ class Contraction_Expansion(Base_Contraction_Expansion):
         A_US = math.pi * Di_US ** 2 / 4.0
         A_DS = math.pi * Di_DS ** 2 / 4.0
 
+        _area_match(fs, A_US)
+
         if Di_US > Di_DS:
             # Contraction: fluids returns K w.r.t. downstream; convert to upstream.
             K_ds = fluids.fittings.contraction_sharp(Di1=Di_US, Di2=Di_DS)
@@ -611,13 +604,7 @@ class Contraction_Expansion(Base_Contraction_Expansion):
             # Expansion: fluids returns K w.r.t. upstream velocity directly.
             K = fluids.fittings.diffuser_sharp(Di1=Di_US, Di2=Di_DS)
 
-        compressible_changing_area_K(
-            AS, mdot, A_US, A_DS, K,
-            T_cricondentherm=T_cricondentherm,
-            P_cricondenbar=P_cricondenbar,
-            T_critical=T_critical,
-            P_critical=P_critical,
-        )
+        compressible_changing_area_K(fs, A_DS, K)
 
 
 # downsample_profile is defined in component_classes and imported above.
@@ -1001,39 +988,35 @@ def _ideal_gas_G_max(AS):
     return P0 * math.sqrt(gamma / (R_s * T0)) * crit_ratio
 
 
-def choked_mass_flux(
-    AS, A_throat, A_outlet=None,
-    T_cricondentherm=None, P_cricondenbar=None,
-    T_critical=None, P_critical=None,
-    n_grid=40,
-):
-    """Real-gas choked mass flow through a throat of area A_throat, given
-    AS at the upstream stagnation state.
+def choked_mass_flux(fs, A_throat, A_outlet=None, n_grid=40):
+    """Real-gas choked mass flow through a throat of area A_throat.
 
     Uses the Maytal isentropic march (Cryogenics 46(1): 21-29, 2006) with
     (P, T) + entropy-root EOS updates so it is safe for HEOS mixtures
     (CoolProp's PSmass_INPUTS is unreliable for multicomponent fluids).
     The throat state is located where u = sqrt(2*(h0 - h)) equals the
-    local speed of sound a along the constant-s isentrope from stagnation.
+    local speed of sound a along the constant-s isentrope from the inlet
+    stagnation state.
 
     Post-throat recovery: if A_outlet is given and exceeds A_throat (only
     physically relevant for an expansion fitting whose smaller area is
-    upstream), AS is updated to an isentropically recovered state at
-    A_outlet -- s_out = s_throat = s0, mdot conserved, h_out + v_out^2/2
-    = h0. Otherwise AS is left at the throat state.
+    upstream), fs.AS is updated to an isentropically recovered state at
+    A_outlet -- s_out = s_throat = s_inlet, mdot conserved, h_out +
+    v_out^2/2 = h0. Otherwise fs.AS is left at the throat state.
 
     Args:
-        AS         : CoolProp AbstractState, pre-updated to the upstream
-                     stagnation (P0, T0) by the caller. Mutated in-place
-                     during the march and left at the component outlet
-                     state on return.
+        fs         : FlowState at the upstream STATIC inlet state. fs.AS
+                     is mutated in place during the march and left at the
+                     component outlet state on return. The stagnation
+                     reference enthalpy h0 = fs.h_stagnation = h_static +
+                     0.5 * v_in**2 is built from the static state plus
+                     fs.v -- this is the bit that was previously broken
+                     when callers passed AS at static but the function
+                     read AS.hmass() as if it were stagnation.
         A_throat   : float, throat area [m^2].
         A_outlet   : float or None, component outlet area [m^2]. If None
                      or equal to A_throat, no post-throat recovery is
                      performed.
-        T_cricondentherm, P_cricondenbar, T_critical, P_critical : optional
-                     phase-envelope limits, forwarded to every PT update
-                     via _safe_update_PT.
         n_grid     : int, number of log-spaced pressure grid points for
                      the initial bracketing scan.
 
@@ -1045,18 +1028,31 @@ def choked_mass_flux(
 
     Raises:
         _NoChokeBracketError if no Mach=1 point is bracketed within
-        [0.05*P0, 0.99*P0]. The caller should treat this as "not choked
-        for this geometry" -- the requested mdot does not exceed the
-        real-gas G_max anywhere along the accessible isentrope.  Genuine
-        CoolProp / numerical failures propagate as RuntimeError (or
-        whatever the underlying call raises).
+        [0.05*P_in, 0.99*P_in]. The caller should treat this as "not
+        choked for this geometry" -- the requested mdot does not exceed
+        the real-gas G_max anywhere along the accessible isentrope.
+        Genuine CoolProp / numerical failures propagate as RuntimeError
+        (or whatever the underlying call raises).
     """
     from scipy.optimize import brentq
 
-    P0 = AS.p()
-    T0 = AS.T()
-    h0 = AS.hmass()
-    s0 = AS.smass()
+    AS = fs.AS
+    T_cricondentherm = fs.T_cricondentherm
+    P_cricondenbar   = fs.P_cricondenbar
+    T_critical       = fs.T_critical
+    P_critical       = fs.P_critical
+
+    P_in = AS.p()
+    T_in = AS.T()
+    # True stagnation enthalpy: h_static + v_in**2/2.  The previous
+    # implementation took AS.hmass() directly and labeled it h0, which
+    # silently treated the static state as stagnation -- the cross-
+    # cutting bug fix is this single line.
+    h0 = fs.h_stagnation
+    s0 = AS.smass()         # entropy unchanged by KE: static == stagnation
+    # Aliases preserved for the inner closures below.
+    P0 = P_in
+    T0 = T_in
 
     def state_at_P(P, T_seed):
         """Advance AS to (P, T_on_isentrope), return (h, rho, u, a, T).
@@ -1182,20 +1178,20 @@ def choked_mass_flux(
     return mdot_choked, P_star, T_star, rho_star, P_out, T_out
 
 
-def compressible_changing_area(abstract_state, mdot, A_in, A_out):
-    """Isentropic pressure and temperature correction for a ideal gas compressible fluid
-    passing through a change in flow area.
+def compressible_changing_area(fs, A_out):
+    """Isentropic pressure and temperature for an ideal gas passing through
+    a change in flow area.
 
-    The caller must update abstract_state to the inlet (P, T) conditions before
-    calling.  On return, abstract_state is NOT updated to the outlet
-    (P_out, T_out) conditions - the caller must do this manually based on the returned P & T. 
+    Used as the initial-guess generator for the non-ideal solver in
+    compressible_changing_area_K.  Does NOT mutate fs (neither AS, nor A) --
+    the caller decides what to do with the returned (P_out, T_out).
 
-    Uses the isentropic area-Mach relation to find the
-    outlet Mach number satisfying continuity on the same isentropic curve, then
-    recovers outlet static conditions from total-condition ratios.  
-    The heat-capacity ratio gamma is obtained from the
-    AbstractState at inlet conditions. Note that this is only valid for an ideal gas - this function
-    is only used for an initial guess for the non-ideal solver function.
+    Uses the isentropic area-Mach relation to find the outlet Mach number
+    satisfying continuity on the same isentropic curve, then recovers
+    outlet static conditions from total-condition ratios.  gamma is taken
+    from the AbstractState at inlet conditions, so this is strictly valid
+    only for an ideal gas and serves as an initial guess for the real-gas
+    solver.
 
     Area-Mach relation (from https://www.grc.nasa.gov/www/k-12/airplane/isentrop.html):
 
@@ -1208,47 +1204,33 @@ def compressible_changing_area(abstract_state, mdot, A_in, A_out):
         T / T_total = [1 + (gamma-1)/2 * M^2] ^ [-1]
 
     Args:
-        abstract_state : CoolProp AbstractState, pre-updated to inlet (P, T)
-                         by the caller.  Updated in-place to outlet conditions
-                         on return.  Must not be shared across threads.
-        mdot           : float, mass flow rate [kg/s].
-        A_in           : float, inlet flow area [m^2].
-        A_out          : float, outlet flow area [m^2].
+        fs    : FlowState at the inlet (static), carrying mdot and A_in.
+                Not mutated.
+        A_out : float, outlet flow area [m^2].
 
     Returns:
-        P_out
-        T_out
+        (P_out, T_out) -- floats.
 
     Raises:
-        ValueError   : if mdot, A_in, or A_out are non-positive, or if the
-                       computed inlet Mach number is outside (0, 1).
+        ValueError   : if A_out is non-positive or the inlet Mach number
+                       is outside (0, 1).
         RuntimeError : if the numerical solver fails to find a subsonic root.
     """
     from scipy.optimize import brentq
 
-    if mdot <= 0.0:
-        raise ValueError(
-            f"compressible_changing_area: mdot must be positive (got {mdot})."
-        )
-    if A_in <= 0.0:
-        raise ValueError(
-            f"compressible_changing_area: A_in must be positive (got {A_in})."
-        )
     if A_out <= 0.0:
         raise ValueError(
             f"compressible_changing_area: A_out must be positive (got {A_out})."
         )
 
     # ------------------------------------------------------------------
-    # Read inlet conditions and compute Ma_in from the abstract state.
+    # Read inlet conditions and compute Ma_in from the FlowState.
     # ------------------------------------------------------------------
-    AS = abstract_state
+    AS    = fs.AS
+    A_in  = fs.A
     P_in  = AS.p()
     T_in  = AS.T()
-    rho_in = AS.rhomass()
-    a_in   = AS.speed_sound()
-    v_in   = mdot / (rho_in * A_in)
-    Ma_in  = v_in / a_in
+    Ma_in = fs.Ma
 
     if not (0.0 < Ma_in < 1.0):
         raise ValueError(
@@ -1330,18 +1312,13 @@ def compressible_changing_area(abstract_state, mdot, A_in, A_out):
     return (P_out, T_out)
 
 
-def compressible_changing_area_K(
-    abstract_state, mdot, A_in, A_out, K,
-    T_cricondentherm=None, P_cricondenbar=None,
-    T_critical=None, P_critical=None,
-):
+def compressible_changing_area_K(fs, A_out, K=0.0):
     """Outlet pressure and temperature for a compressible fluid passing through
     an area change with a known loss coefficient K applied to inlet velocity.
 
-    The caller must update abstract_state to the inlet (P, T) conditions before
-    calling.  The abstract state is updated in place to outlet conditions, so
-    the caller reads outlet pressure and temperature from the same object after
-    the call returns.
+    Mutates fs in place: fs.AS goes to the outlet static state and fs.A
+    becomes A_out.  fs.z is unchanged (area-change fittings are point
+    fittings; no elevation change).
 
     Enforces two integrated balance equations simultaneously:
 
@@ -1365,34 +1342,25 @@ def compressible_changing_area_K(
     the two finite-difference column updates per Newton step.
 
     Args:
-        abstract_state : CoolProp AbstractState, pre-updated to inlet (P, T)
-                         by the caller.  Updated in-place to outlet conditions
-                         on return.  Must not be shared across threads.
-        mdot           : float, mass flow rate [kg/s].
-        A_in           : float, inlet flow area [m^2].
-        A_out          : float, outlet flow area [m^2].
-        K              : float, loss coefficient referenced to inlet velocity
-                         head (dimensionless, >= 0).
+        fs    : FlowState at the inlet (static).  fs.AS, fs.mdot, fs.A are
+                read as the inlet state; on return fs.AS is at the outlet
+                state and fs.A == A_out.
+        A_out : float, outlet flow area [m^2].
+        K     : float, loss coefficient referenced to inlet velocity
+                head (dimensionless, >= 0).  Default 0 (isentropic area
+                change with the real-gas EOS); used by _area_match.
 
     Returns:
-        None.  abstract_state is updated in place to outlet conditions.
+        None.  fs is mutated in place.
 
     Raises:
-        ValueError   : if mdot, A_in, or A_out are non-positive, K is negative,
-                       or the inlet Mach number is outside (0, 1).
+        ValueError   : if A_out is non-positive, K is negative, or the
+                       inlet Mach number is outside (0, 1).
         RuntimeError : if the numerical solver fails to converge.
     """
     from scipy.optimize import root
 
     #input validation
-    if mdot <= 0.0:
-        raise ValueError(
-            f"compressible_changing_area_K: mdot must be positive (got {mdot})."
-        )
-    if A_in <= 0.0:
-        raise ValueError(
-            f"compressible_changing_area_K: A_in must be positive (got {A_in})."
-        )
     if A_out <= 0.0:
         raise ValueError(
             f"compressible_changing_area_K: A_out must be positive (got {A_out})."
@@ -1402,15 +1370,17 @@ def compressible_changing_area_K(
             f"compressible_changing_area_K: K must be non-negative (got {K})."
         )
 
-    AS = abstract_state
+    AS    = fs.AS
+    mdot  = fs.mdot
+    A_in  = fs.A
 
     P_in   = AS.p()
     T_in   = AS.T()
     rho_in = AS.rhomass()
     H_in   = AS.hmass()
     S_in   = AS.smass()
-    v_in   = mdot / (rho_in * A_in)
-    Ma_in  = v_in / AS.speed_sound()
+    v_in   = fs.v
+    Ma_in  = fs.Ma
 
     if not (0.0 < Ma_in < 1.0):
         raise ValueError(
@@ -1419,7 +1389,7 @@ def compressible_changing_area_K(
         )
 
     # ------------------------------------------------------------------
-    # Choked-flow pre-screen.  Ideal-gas G_max is a cheap analytical
+    # Choked-flow pre-screen.  Ideal-gas G_max is a computationally cheap analytical
     # upper bound on the real-gas choked flux at this stagnation state,
     # so anything below ~50% of it cannot be choked and we skip the
     # ~50-200 ms Maytal march entirely.  Above the threshold, run the
@@ -1432,10 +1402,7 @@ def compressible_changing_area_K(
     if mdot > 0.5 * _ideal_gas_G_max(AS) * A_throat_pre:
         try:
             mdot_choked, P_t, T_t, rho_t, P_o, T_o = choked_mass_flux(
-                AS, A_throat_pre, A_outlet=A_out,
-                T_cricondentherm=T_cricondentherm,
-                P_cricondenbar=P_cricondenbar,
-                T_critical=T_critical, P_critical=P_critical,
+                fs, A_throat_pre, A_outlet=A_out,
             )
         except _NoChokeBracketError:
             # Maytal grid scan found no Mach=1 bracket -- treat as not
@@ -1443,17 +1410,16 @@ def compressible_changing_area_K(
             # the scan; restore to inlet.  Real CoolProp / numerical
             # failures propagate (the bare RuntimeError catch would
             # have swallowed those too).
-            _safe_update_PT(AS, P_in, T_in,
-                            T_cricondentherm, P_cricondenbar,
-                            T_critical, P_critical)
+            _safe_flowstate_update_PT(fs, P_in, T_in)
         else:
             if mdot > mdot_choked:
+                # AS already at outlet state; sync fs.A to the throat-area
+                # frame the recovery returned (A_outlet == A_out).
+                fs.A = A_out
                 raise ChokedFlowError(mdot_choked, P_t, T_t, rho_t, P_o, T_o)
             # Not choked: AS was moved by the march; restore to inlet for
             # the subsonic Newton solve below.
-            _safe_update_PT(AS, P_in, T_in,
-                            T_cricondentherm, P_cricondenbar,
-                            T_critical, P_critical)
+            _safe_flowstate_update_PT(fs, P_in, T_in)
 
     H_total = H_in + 0.5 * v_in**2    # stagnation enthalpy [J/kg], conserved as no work or heat input is assumed
     e_loss  = 0.5 * K * v_in**2       # mechanical energy dissipated per unit mass [J/kg]
@@ -1472,7 +1438,7 @@ def compressible_changing_area_K(
 
     def residuals(x):
         P, T = x
-        _safe_update_PT(AS, P, T, T_cricondentherm, P_cricondenbar, T_critical, P_critical)
+        _safe_flowstate_update_PT(fs, P, T)
         rho = AS.rhomass()
         v   = mdot / (rho * A_out)
         T_avg = 0.5 * (T_in + T)
@@ -1517,9 +1483,9 @@ def compressible_changing_area_K(
     # (same form as compressible_K at low Mach) to nudge the guess in the right
     # direction for K > 0.  Without this the solver starts at the K=0 solution
     # and must walk the full e_loss distance.
-    # compressible_changing_area leaves AS at inlet conditions, so AS partials
-    # (Cp_in) computed above are still valid.
-    P0, T0 = compressible_changing_area(AS, mdot, A_in, A_out)
+    # compressible_changing_area does not mutate fs (no AS update), so fs is
+    # still at inlet conditions and the cached Cp_in is valid.
+    P0, T0 = compressible_changing_area(fs, A_out)
     P0 += -0.5 * K * rho_in * v_in**2
     T0 += 0.5 * K * v_in**2 / Cp_in
 
@@ -1534,14 +1500,11 @@ def compressible_changing_area_K(
         )
 
     P_out, T_out = sol.x
-    _safe_update_PT(AS, P_out, T_out, T_cricondentherm, P_cricondenbar, T_critical, P_critical)
+    _safe_flowstate_update_PT(fs, P_out, T_out)
+    fs.A = A_out
 
 
-def compressible_K(
-    abstract_state, mdot, flow_area, K,
-    T_cricondentherm=None, P_cricondenbar=None,
-    T_critical=None, P_critical=None, dPmax = 0.05,
-):
+def compressible_K(fs, K, dPmax=0.05):
     """Outlet conditions for a compressible fluid passing through a fitting
     with a known loss coefficient K and no area change.
 
@@ -1560,41 +1523,39 @@ def compressible_K(
     See the hand-derivation in /Derivation_images/dP_for_K
     Note that for the entropy accounting, no change in temperature is assumed across the fitting.
     The error introduced by this is probably less than the uncertainty of the K-factor correlation for scenarios with minor pressure
-    changes across the fitting. If a dramatic temperature or pressure change occurs over the fitting, this function will give 
-    inaccurate results. You are better off with the compressible_changing_area_K function which uses the average temperature 
+    changes across the fitting. If a dramatic temperature or pressure change occurs over the fitting, this function will give
+    inaccurate results. You are better off with the compressible_changing_area_K function which uses the average temperature
     in its entropy balance. That function is more rigorous but substantially more computationally intensive.
 
-    Args:
-        abstract_state : CoolProp AbstractState, pre-updated to inlet (P, T)
-                         by the caller.  Updated in-place to outlet conditions
-                         on return.  Must not be shared across threads.
-        mdot           : float, mass flow rate [kg/s].
-        flow_area      : float, flow area [m^2].
-        K              : float, loss coefficient referenced to inlet velocity
-                         head (dimensionless, >= 0).
-        T_cricondentherm, T_cricondenbar, T_critical, P_critical : Critical point values from phase envelope
-        dPmax          : Maximum relative dP (dP/P_in) before switching to a rigorous energy/entropy balance method
+    Mutates fs in place: fs.AS to the outlet static state.  fs.A and fs.z
+    are unchanged (constant-area, adiabatic, point fitting).
 
+    Args:
+        fs    : FlowState at the inlet (static).  fs.AS, fs.mdot, fs.A are
+                read as the inlet state; on return fs.AS is at the outlet
+                state.
+        K     : float, loss coefficient referenced to inlet velocity
+                head (dimensionless, >= 0).
+        dPmax : Maximum relative dP (|dP|/P_in) before switching to the
+                rigorous compressible_changing_area_K solver.
 
     Returns:
-        None.  abstract_state is updated in place to outlet conditions.
+        None.  fs is mutated in place.
 
     Raises:
-        ValueError   : if mdot or flow_area are non-positive, or K is negative.
+        ValueError   : if K is negative.
         RuntimeError : if two-phase conditions or near-sonic flow are detected.
     """
     choke_mach_limit = 0.98
 
-    if mdot <= 0.0:
-        raise ValueError(f"compressible_K: mdot must be positive (got {mdot}).")
-    if flow_area <= 0.0:
-        raise ValueError(f"compressible_K: flow_area must be positive (got {flow_area}).")
     if K < 0.0:
         raise ValueError(f"compressible_K: K must be non-negative (got {K}).")
 
-    AS = abstract_state
-    P_in  = AS.p()
-    T_in  = AS.T()
+    AS        = fs.AS
+    mdot      = fs.mdot
+    flow_area = fs.A
+    P_in      = AS.p()
+    T_in      = AS.T()
 
     if AS.phase() == _CP_PHASE_TWOPHASE:
         raise RuntimeError(
@@ -1605,8 +1566,8 @@ def compressible_K(
     rho_in = AS.rhomass()
     Cp     = AS.cpmass()
     H_in   = AS.hmass()
-    v_in   = mdot / (rho_in * flow_area)
-    Ma_in  = v_in / AS.speed_sound()
+    v_in   = fs.v
+    Ma_in  = fs.Ma
 
     if Ma_in >= choke_mach_limit:
         raise RuntimeError(
@@ -1629,11 +1590,7 @@ def compressible_K(
     # pre-screen, so we do NOT run one here -- otherwise the Maytal march
     # would execute twice for the same inlet state.
     if (abs(dP) / P_in > dPmax) or (denominator < 0.5):
-        compressible_changing_area_K(
-            abstract_state = AS, mdot = mdot, A_in=flow_area, A_out = flow_area, K = K,
-            T_cricondentherm=T_cricondentherm, P_cricondenbar=P_cricondenbar,
-            T_critical=T_critical, P_critical=P_critical,
-        )
+        compressible_changing_area_K(fs, A_out=flow_area, K=K)
 
     else: #small dP, not near choked
 
@@ -1654,24 +1611,17 @@ def compressible_K(
         if mdot > 0.5 * _ideal_gas_G_max(AS) * flow_area:
             try:
                 mdot_choked, P_t, T_t, rho_t, P_o, T_o = choked_mass_flux(
-                    AS, flow_area, A_outlet=flow_area,
-                    T_cricondentherm=T_cricondentherm,
-                    P_cricondenbar=P_cricondenbar,
-                    T_critical=T_critical, P_critical=P_critical,
+                    fs, flow_area, A_outlet=flow_area,
                 )
             except _NoChokeBracketError:
                 # Maytal march found no Mach=1 bracket in the accessible
                 # isentrope -- treat as not choked.  AS may have wandered
                 # along the isentrope during the scan; restore to inlet.
-                _safe_update_PT(AS, P_in, T_in,
-                                T_cricondentherm, P_cricondenbar,
-                                T_critical, P_critical)
+                _safe_flowstate_update_PT(fs, P_in, T_in)
             else:
                 if mdot > mdot_choked:
                     raise ChokedFlowError(mdot_choked, P_t, T_t, rho_t, P_o, T_o)
-                _safe_update_PT(AS, P_in, T_in,
-                                T_cricondentherm, P_cricondenbar,
-                                T_critical, P_critical)
+                _safe_flowstate_update_PT(fs, P_in, T_in)
 
         P_out  = P_in + dP
 
@@ -1679,7 +1629,7 @@ def compressible_K(
         dT    = (K * v_in**2 / 2.0 + (1.0 / rho_in - dHdP_T) * dP) / Cp
         T_out = T_in + dT
 
-        _safe_update_PT(AS, P_out, T_out, T_cricondentherm, P_cricondenbar, T_critical, P_critical)
+        _safe_flowstate_update_PT(fs, P_out, T_out)
         #This is an initial guess for T_out, but we can perform an energy balance to make sure energy is conserved.
         # Stagnation enthalpy is conserved (adiabatic, no elevation change).
         # Nudge T_out so the computed state satisfies the energy balance exactly.
@@ -1690,24 +1640,18 @@ def compressible_K(
         Cp_out    = AS.cpmass()
         drhodT_P  = AS.first_partial_deriv(CP.iDmass, CP.iT, CP.iP)
         T_out = T_out + energy_error / (Cp_out - mdot**2/(flow_area**2*rho_out_calc**3) * drhodT_P)
-        _safe_update_PT(AS, P_out, T_out, T_cricondentherm, P_cricondenbar, T_critical, P_critical)
+        _safe_flowstate_update_PT(fs, P_out, T_out)
 
 
 def compressible_pipe_segment(
-    abstract_state,
-    mdot,
+    fs,
     dL,
     dz,
     D_h,
     roughness,
-    flow_area,
     q_wall=0.0,
     isothermal=False,
     mu=None,
-    T_cricondentherm=None,
-    P_cricondenbar=None,
-    T_critical=None,
-    P_critical=None,
     energy_tol=10.0,
     dPdL_rel_tol=0.05,
     _split_depth=0,
@@ -1725,31 +1669,27 @@ def compressible_pipe_segment(
       2. The relative change in dP/dL between inlet and trial outlet,
          compared against dPdL_rel_tol.
 
-    If either metric exceeds its tolerance, abstract_state is restored to
-    inlet conditions and the slice is recursively bisected (halving dL, dz,
-    and q_wall) until both metrics fall within tolerance or _max_split_depth
-    is reached.  When the slice converges, a one-iteration Newton correction
-    is applied to T_out (non-isothermal case) so the final state satisfies
-    the stagnation-enthalpy balance exactly.
+    If either metric exceeds its tolerance, fs.AS is restored to inlet
+    conditions and the slice is recursively bisected (halving dL, dz, and
+    q_wall) until both metrics fall within tolerance or _max_split_depth
+    is reached.  When the slice converges, a one-iteration Newton
+    correction is applied to T_out (non-isothermal case) so the final
+    state satisfies the stagnation-enthalpy balance exactly.
 
-    The caller must update abstract_state to the inlet (P, T) conditions before
-    calling this function.  On return, abstract_state is updated in-place to the
-    outlet (P_out, T_out) conditions, so the next call can proceed without any
-    additional state update.
+    On entry fs.AS must be at the inlet (P, T) -- the caller's job.  On
+    success fs.AS is at the outlet (P, T) and fs.z is advanced by dz.
+    fs.A is unchanged (slice is uniform-area; area transitions are handled
+    by the calling component via compressible_changing_area_K).
 
     Args:
-        abstract_state  : CoolProp AbstractState instance, pre-configured for
-                          the working fluid and already updated to inlet (P, T)
-                          by the caller.  Updated in-place during integration
-                          and left at outlet conditions on return.
-                          Must not be shared across threads.
-        mdot            : float, mass flow rate [kg/s].
+        fs              : FlowState at the inlet (static).  fs.AS, fs.mdot,
+                          fs.A are read; fs.AS is mutated and fs.z is
+                          advanced by dz on success.
         dL              : float, pipe slice length [m].
         dz              : float, elevation rise over the slice [m].
                           Positive = uphill; negative = downhill.
         D_h             : float, hydraulic diameter [m].
         roughness       : float, absolute pipe-wall roughness [m].
-        flow_area       : float, cross-section flow area [m^2].
         q_wall          : float, heat flow into fluid [W] (default 0 =
                           adiabatic).  Ignored when isothermal=True.
         isothermal      : bool, if True the temperature ODE returns 0 and
@@ -1776,10 +1716,14 @@ def compressible_pipe_segment(
                           achieved within this many splits.
 
     Returns:
-        None.  abstract_state is updated in place to outlet conditions.
+        None.  fs is mutated in place.
     """
     grav_constant    = 9.8066
     choke_mach_limit = 0.98
+
+    AS        = fs.AS
+    mdot      = fs.mdot
+    flow_area = fs.A
 
     # ------------------------------------------------------------------
     # Input validation
@@ -1804,9 +1748,8 @@ def compressible_pipe_segment(
         )
 
     # ------------------------------------------------------------------
-    # Read inlet conditions from abstract_state (caller must have set it).
+    # Read inlet conditions from fs.AS (caller must have set it).
     # ------------------------------------------------------------------
-    AS   = abstract_state
     P_in = AS.p()
     T_in = AS.T()
 
@@ -1921,8 +1864,7 @@ def compressible_pipe_segment(
         
         trial_eval_error = None
         try:
-            _safe_update_PT(AS, P_out, T_out, T_cricondentherm, P_cricondenbar,
-                            T_critical, P_critical)
+            _safe_flowstate_update_PT(fs, P_out, T_out)
 
             # Pre-correction stagnation-enthalpy residual (first splitter metric).
             H_total_out  = H_in + q_wall/mdot + v_in**2/2 - grav_constant*dz
@@ -1987,22 +1929,18 @@ def compressible_pipe_segment(
             # Restore AS to inlet conditions so the recursive halves start
             # from the correct state.  This is the one extra EOS update the
             # splitter costs us per split event.
-            _safe_update_PT(AS, P_in, T_in, T_cricondentherm, P_cricondenbar,
-                            T_critical, P_critical)
+            _safe_flowstate_update_PT(fs, P_in, T_in)
             half_kwargs = dict(
-                mdot=mdot, dz=dz/2.0, D_h=D_h,
-                roughness=roughness, flow_area=flow_area,
+                dz=dz/2.0, D_h=D_h, roughness=roughness,
                 q_wall=q_wall/2.0, isothermal=isothermal, mu=mu_user,
-                T_cricondentherm=T_cricondentherm, P_cricondenbar=P_cricondenbar,
-                T_critical=T_critical, P_critical=P_critical,
                 energy_tol=energy_tol, dPdL_rel_tol=dPdL_rel_tol,
                 _split_depth=_split_depth + 1,
                 _max_split_depth=_max_split_depth,
             )
-            # First half: AS (P_in, T_in) -> (P_mid, T_mid)
-            compressible_pipe_segment(AS, dL=dL/2.0, **half_kwargs)
-            # Second half: AS (P_mid, T_mid) -> (P_out, T_out)
-            compressible_pipe_segment(AS, dL=dL/2.0, **half_kwargs)
+            # First half: fs (P_in, T_in, z_in) -> (P_mid, T_mid, z_in + dz/2)
+            compressible_pipe_segment(fs, dL=dL/2.0, **half_kwargs)
+            # Second half: fs (P_mid, T_mid, z_in + dz/2) -> (P_out, T_out, z_in + dz)
+            compressible_pipe_segment(fs, dL=dL/2.0, **half_kwargs)
             return
 
         # Converged: Finally, apply a one-step energy balance correction to the temperature so that the final state satisfies an energy balance. This costs one additional
@@ -2019,7 +1957,7 @@ def compressible_pipe_segment(
         Cp_out_state  = AS.cpmass()
         drhodT_P_out  = AS.first_partial_deriv(CP.iDmass, CP.iT, CP.iP)
         T_out = T_out + energy_error / (Cp_out_state - mdot**2/(flow_area**2*rho_out_trial**3)*drhodT_P_out)
-        _safe_update_PT(AS, P_out, T_out, T_cricondentherm, P_cricondenbar, T_critical, P_critical)
+        _safe_flowstate_update_PT(fs, P_out, T_out)
 
     else:
         #For the isothermal case, we know the outlet temperature but need to estimate the outlet pressure.
@@ -2053,8 +1991,7 @@ def compressible_pipe_segment(
         
         trial_eval_error = None
         try:
-            _safe_update_PT(AS, P_out, T_out, T_cricondentherm, P_cricondenbar,
-                            T_critical, P_critical)
+            _safe_flowstate_update_PT(fs, P_out, T_out)
             # Recompute dP/dL at the trial outlet for the splitter check.  There's
             # no energy balance to check in the isothermal case (T is fixed by
             # assumption), so dP/dL change is the only convergence metric.
@@ -2099,23 +2036,19 @@ def compressible_pipe_segment(
                     f"Reduce upstream profile slice length, loosen tolerances, "
                     f"or raise _max_split_depth."
                 )
-            _safe_update_PT(AS, P_in, T_in, T_cricondentherm, P_cricondenbar,
-                            T_critical, P_critical)
+            _safe_flowstate_update_PT(fs, P_in, T_in)
             half_kwargs = dict(
-                mdot=mdot, dz=dz/2.0, D_h=D_h,
-                roughness=roughness, flow_area=flow_area,
+                dz=dz/2.0, D_h=D_h, roughness=roughness,
                 q_wall=q_wall/2.0, isothermal=isothermal, mu=mu_user,
-                T_cricondentherm=T_cricondentherm, P_cricondenbar=P_cricondenbar,
-                T_critical=T_critical, P_critical=P_critical,
                 energy_tol=energy_tol, dPdL_rel_tol=dPdL_rel_tol,
                 _split_depth=_split_depth + 1,
                 _max_split_depth=_max_split_depth,
             )
-            compressible_pipe_segment(AS, dL=dL/2.0, **half_kwargs)
-            compressible_pipe_segment(AS, dL=dL/2.0, **half_kwargs)
+            compressible_pipe_segment(fs, dL=dL/2.0, **half_kwargs)
+            compressible_pipe_segment(fs, dL=dL/2.0, **half_kwargs)
             return
 
-    # Outlet Mach check.  AS is at the (converged) outlet state in both branches.
+    # Outlet Mach check.  fs.AS is at the (converged) outlet state in both branches.
     rho_out = AS.rhomass()
     a_out   = AS.speed_sound()
     v_out   = mdot / (rho_out * flow_area)
@@ -2125,3 +2058,8 @@ def compressible_pipe_segment(
             f"compressible_pipe_segment: outlet Mach number Ma={Ma_out:.4f} "
             f"is sonic or near-sonic.  Reduce flow rate or check geometry."
         )
+
+    # Advance fs.z by dz so subsequent components see the post-slice elevation.
+    # In the recursive-split path each child slice advances its own dz/2, so
+    # the parent's bookkeeping does not double-count.
+    fs.z += dz

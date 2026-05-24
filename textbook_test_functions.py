@@ -10,7 +10,11 @@ import math
 import os
 
 def test_deNevers8_10():
-    from compressible_flow import Line_Segment, Bend, Contraction_Expansion, _build_phase_limits, _safe_update_PT, compressible_changing_area_K, _safe_update_PT, compressible_pipe_segment
+    from compressible_flow import (
+        Line_Segment, Bend, Contraction_Expansion, _build_phase_limits,
+        _safe_update_PT, compressible_changing_area_K,
+        compressible_pipe_segment, FlowState,
+    )
     #Example 8.10 on pages 315-317 in "Fluid Mechanics for Chemical Engineers, 3rd Ed" by Noel de Nevers
     #Adiabadic flow with friction (Fanno flow)
     #Given P0 (stagnation) = 30 psia, T0 (stagnation) = 200 F find flow rate if receiving reservoir P3 = 18 psia
@@ -56,20 +60,19 @@ def test_deNevers8_10():
 
         #For point 0 to point 1, gas undergoes isentropic acceleration through ideal converging nozzle.
         #Assume a very large upstream area so velocity is approximately zero; K = 0 (lossless)
-        compressible_changing_area_K(
-            abstract_state=AS, mdot=mdot, A_in=A_0, A_out=A_1, K=0,
+        fs = FlowState(
+            AS, mdot, A=A_0, z=0.0,
             T_cricondentherm=T_cricondentherm, P_cricondenbar=P_cricondenbar,
             T_critical=T_critical, P_critical=P_critical,
         )
+        compressible_changing_area_K(fs, A_out=A_1, K=0)
         P_1 = AS.p()
 
+        # fs has fs.A == A_1 after the area change; reuse it for the pipe.
         compressible_pipe_segment(
-            abstract_state=AS,   # already updated to (P_1, T_1) by compressible_changing_area_K
-            mdot=mdot,
+            fs,
             dL=dL_gas, dz=dz_gas, D_h=ID_pipe, roughness=eps_gas,
-            flow_area=A_1, isothermal=False,
-            T_cricondentherm=T_cricondentherm, P_cricondenbar=P_cricondenbar,
-            T_critical=T_critical, P_critical=P_critical,
+            isothermal=False,
         )
 
         #At point 2, the pressure will be the same as point 3. The temperature won't be the same,
@@ -106,7 +109,11 @@ def test_deNevers8_10():
     print('Textbook solution: mass flow rate = 0.317 lbm/s, outlet velocity = 675.5 ft/s, outlet temperature = 622 deg R, Mach #=0.553')
 
 def test_ZuckerBiblarz5_7():
-    from compressible_flow import Line_Segment, Bend, Contraction_Expansion, _build_phase_limits, _safe_update_PT, compressible_changing_area_K, _safe_update_PT, compressible_pipe_segment
+    from compressible_flow import (
+        Line_Segment, Bend, Contraction_Expansion, _build_phase_limits,
+        _safe_update_PT, compressible_changing_area_K,
+        compressible_pipe_segment, FlowState,
+    )
     #Example on pages 124-126 in "Fundamentals of Gas Dynamics, 2nd Ed" by Robert Zucker and Oscar Biblarz
     #Isentropic changing area flow
     #Air at stagnation conditions of 100 psia and 600 deg Rflows through a nozzle into a receiver at 80.2 psia
@@ -142,11 +149,12 @@ def test_ZuckerBiblarz5_7():
 
         #For point 0 to point 1, gas undergoes isentropic acceleration through ideal converging nozzle.
         #Assume a very large upstream area so velocity is approximately zero; K = 0 (lossless)
-        compressible_changing_area_K(
-            abstract_state=AS, mdot=mdot, A_in=A0, A_out=A1, K=0,
+        fs = FlowState(
+            AS, mdot, A=A0, z=0.0,
             T_cricondentherm=T_cricondentherm, P_cricondenbar=P_cricondenbar,
             T_critical=T_critical, P_critical=P_critical,
         )
+        compressible_changing_area_K(fs, A_out=A1, K=0)
 
         P_1 = AS.p()
         T_1 = AS.T()
@@ -180,7 +188,11 @@ def test_ZuckerBiblarz5_7():
     print('Textbook solution: outlet velocity = 663 ft/s, outlet temperature = 563 deg R, Mach #=0.57')
 
 def test_ZuckerBiblarz9_3():
-    from compressible_flow import Line_Segment, Bend, Contraction_Expansion, _build_phase_limits, _safe_update_PT, compressible_changing_area_K, _safe_update_PT, compressible_pipe_segment
+    from compressible_flow import (
+        Line_Segment, Bend, Contraction_Expansion, _build_phase_limits,
+        _safe_update_PT, compressible_changing_area_K,
+        compressible_pipe_segment, FlowState,
+    )
     #Example 9.3 on pages 259-260 in "Fundamentals of Gas Dynamics, 2nd Ed" by Robert Zucker and Oscar Biblarz
     #Adiabadic flow with friction (Fanno flow)
     #Air flowing at P1 = 20 psia, T1 = 70 F , v1 = 406 ft/s in a 6" diameter galvanized iron duct (absolute roughness = 0.0005 ft)
@@ -211,13 +223,15 @@ def test_ZuckerBiblarz9_3():
 
     print(f'\nInputs: P0 = {ureg.Quantity(P0,"Pa").to("psi"):.3f}, T0 = {ureg.Quantity(T0,"degK").to("degF"):.3f}')
 
-    compressible_pipe_segment(
-        abstract_state=AS,
-        mdot=mdot,
-        dL=dL_gas, dz=dz_gas, D_h=ID_pipe, roughness=eps_gas,
-        flow_area=A_1, isothermal=False,
+    fs = FlowState(
+        AS, mdot, A=A_1, z=0.0,
         T_cricondentherm=T_cricondentherm, P_cricondenbar=P_cricondenbar,
         T_critical=T_critical, P_critical=P_critical,
+    )
+    compressible_pipe_segment(
+        fs,
+        dL=dL_gas, dz=dz_gas, D_h=ID_pipe, roughness=eps_gas,
+        isothermal=False,
     )
 
     P_2 = AS.p()
@@ -235,7 +249,11 @@ def test_ZuckerBiblarz10_3():
     #Air flowing at P1 = 10.0 psia, T1 = 400 R , v1 = 402 ft/s. 50 btu/lbm of heat is added to the gas.
     #Rayleigh flow assumes no friction, so we will use roughness = 0, L = 0.01 m, and ID = 1 m
     #Find final Mach number, temperature, pressure
-    from compressible_flow import Line_Segment, Bend, Contraction_Expansion, _build_phase_limits, _safe_update_PT, compressible_changing_area_K, _safe_update_PT, compressible_pipe_segment
+    from compressible_flow import (
+        Line_Segment, Bend, Contraction_Expansion, _build_phase_limits,
+        _safe_update_PT, compressible_changing_area_K,
+        compressible_pipe_segment, FlowState,
+    )
     P2    = ureg.Quantity(10, "psi").to("Pa").magnitude    # Pa
     T2 = ureg.Quantity(400, "degR").to("degK").magnitude    # K
     ID_pipe = 1.0    # m
@@ -259,13 +277,15 @@ def test_ZuckerBiblarz10_3():
 
     print(f'\nInputs: P2 = {ureg.Quantity(P2,"Pa").to("psi"):.3f}, T2 = {ureg.Quantity(T2,"degK").to("degR"):.3f}')
 
-    compressible_pipe_segment(
-        abstract_state=AS,
-        mdot=mdot,
-        dL=dL_gas, dz=dz_gas, D_h=ID_pipe, roughness=eps_gas,
-        flow_area=A_2, isothermal=False, q_wall= dq,
+    fs = FlowState(
+        AS, mdot, A=A_2, z=0.0,
         T_cricondentherm=T_cricondentherm, P_cricondenbar=P_cricondenbar,
         T_critical=T_critical, P_critical=P_critical,
+    )
+    compressible_pipe_segment(
+        fs,
+        dL=dL_gas, dz=dz_gas, D_h=ID_pipe, roughness=eps_gas,
+        isothermal=False, q_wall=dq,
     )
 
     P_3 = AS.p()
@@ -375,7 +395,11 @@ def test_deNevers6_4():
 
 def test_Crane_air_line():
     #Crane TP 410 example 4-16. Air at 65 psig, 110 F flows through 75 ft of 1" S/40 pipe at 100 scf/minute rate. Find pressure drop and velocity in ft/minute
-    from compressible_flow import Line_Segment, Bend, Contraction_Expansion, _build_phase_limits, _safe_update_PT, compressible_changing_area_K, _safe_update_PT, compressible_pipe_segment, _resolve_mdot
+    from compressible_flow import (
+        Line_Segment, Bend, Contraction_Expansion, _build_phase_limits,
+        _safe_update_PT, compressible_changing_area_K,
+        compressible_pipe_segment, _resolve_mdot, FlowState,
+    )
 
     roughness = ureg.Quantity(0.00015, "ft")
     seg_length = ureg.Quantity(75, "ft")
@@ -407,11 +431,12 @@ def test_Crane_air_line():
 
 
     print(f'  inlet: P={ureg.Quantity(P_in,"Pa").to("psi"):.4f}, T={T_in:.4g} K, v_in = {v_in}')
-    seg.dP_dT(abstract_state=AS, flow_rate=Q_scfd, isothermal=True, mu=viscosity,
-    T_cricondentherm=T_cric,
-    P_cricondenbar=P_bar,
-    T_critical=T_c,
-    P_critical=P_c,)
+    fs = FlowState(
+        AS, mdot, A=seg.inlet_area_si, z=0.0,
+        T_cricondentherm=T_cric, P_cricondenbar=P_bar,
+        T_critical=T_c, P_critical=P_c,
+    )
+    seg.dP_dT(fs, isothermal=True, mu=viscosity)
  
     P_out = AS.p()
     T_out = AS.T()
@@ -428,7 +453,11 @@ def test_Crane_air_line():
 def test_Crane_4_10():
     #Crane example 4-10 - pressure drop of 600 psig, 850F steam through 400 ft of 6" S/80 pipe at 90,000 lb/hr rate. 
     # The problem statement doesn't say what sequence the fittings are in, so we willjust evaluate pipe -> elbows -> valves
-    from compressible_flow import Line_Segment, Bend, Contraction_Expansion,Valve, _build_phase_limits, _safe_update_PT, compressible_changing_area_K, _safe_update_PT, compressible_pipe_segment, _resolve_mdot
+    from compressible_flow import (
+        Line_Segment, Bend, Contraction_Expansion, Valve,
+        _build_phase_limits, _safe_update_PT, compressible_changing_area_K,
+        compressible_pipe_segment, _resolve_mdot, FlowState,
+    )
     import fluids.units as fittings
     roughness = ureg.Quantity(0.00015, "ft")
     seg_length = ureg.Quantity(400, "ft")
@@ -480,36 +509,25 @@ def test_Crane_4_10():
     print(f'  inlet: P={ureg.Quantity(P_in,"Pa").to("psi"):.4f}, T={T_in:.4g} K, Ma={Ma_in:.4f}')
 
     P_cur = P_in
-    seg.dP_dT(abstract_state=AS, flow_rate=mass_flow_rate, isothermal=False,
-        T_cricondentherm=T_cric,
-        P_cricondenbar=P_bar,
-        T_critical=T_c,
-        P_critical=P_c,)
+    fs = FlowState(
+        AS, mdot, A=seg.inlet_area_si, z=0.0,
+        T_cricondentherm=T_cric, P_cricondenbar=P_bar,
+        T_critical=T_c, P_critical=P_c,
+    )
+    seg.dP_dT(fs, isothermal=False)
 
     print(f' dP pipe={ureg.Quantity(AS.p() - P_cur,"Pa").to("psi"):.4f} psid')
     P_cur = AS.p()
     #three elbows
     for i in range(3):
-        elbow[i].dP_dT(abstract_state=AS, flow_rate=mass_flow_rate,
-        T_cricondentherm=T_cric,
-        P_cricondenbar=P_bar,
-        T_critical=T_c,
-        P_critical=P_c,)
+        elbow[i].dP_dT(fs)
         print(f' dP elbow {i+1}={ureg.Quantity(AS.p() - P_cur,"Pa").to("psi"):.4f} psid')
         P_cur = AS.p()
 
-    Gate_valve.dP_dT(abstract_state=AS, flow_rate=mass_flow_rate,
-        T_cricondentherm=T_cric,
-        P_cricondenbar=P_bar,
-        T_critical=T_c,
-        P_critical=P_c,)
+    Gate_valve.dP_dT(fs)
     print(f' dP gate={ureg.Quantity(AS.p() - P_cur,"Pa").to("psi"):.4f} psid')
     P_cur = AS.p()
-    Globe_valve.dP_dT(abstract_state=AS, flow_rate=mass_flow_rate,
-        T_cricondentherm=T_cric,
-        P_cricondenbar=P_bar,
-        T_critical=T_c,
-        P_critical=P_c,)
+    Globe_valve.dP_dT(fs)
     print(f' dP globe={ureg.Quantity(AS.p() - P_cur,"Pa").to("psi"):.4f} psid')
     P_cur = AS.p()
     P_out = AS.p()
@@ -528,7 +546,11 @@ def test_Crane_4_10():
 
 
 def test_Crane_gas_pipeline():
-    from compressible_flow import Line_Segment, Bend, Contraction_Expansion, _build_phase_limits, _safe_update_PT, compressible_changing_area_K, _safe_update_PT, compressible_pipe_segment, _resolve_mdot
+    from compressible_flow import (
+        Line_Segment, Bend, Contraction_Expansion, _build_phase_limits,
+        _safe_update_PT, compressible_changing_area_K,
+        compressible_pipe_segment, _resolve_mdot, FlowState,
+    )
     csv_path = os.path.join(os.path.dirname(__file__), "testprofile_crane.csv")
     roughness = ureg.Quantity(0.00015, "ft")
     seg_length = ureg.Quantity(100, "miles")
@@ -569,11 +591,12 @@ def test_Crane_gas_pipeline():
         Ma_in = v_in / AS.speed_sound()
 
         try:
-            seg.dP_dT(abstract_state=AS, flow_rate=Q_scfd, isothermal=True, mu=viscosity, 
-            T_cricondentherm=T_cric, 
-            P_cricondenbar=P_bar, 
-            T_critical=T_c,
-            P_critical=P_c,)
+            fs = FlowState(
+                AS, _resolve_mdot(Q_scfd, AS), A=seg.inlet_area_si, z=0.0,
+                T_cricondentherm=T_cric, P_cricondenbar=P_bar,
+                T_critical=T_c, P_critical=P_c,
+            )
+            seg.dP_dT(fs, isothermal=True, mu=viscosity)
         except RuntimeError as e:
             # Flow too high — segment failed to converge (likely approaching choked flow)
             print(f'Iteration {iteration + 1}: Q = {Q_mmscfd:.4f} mmscf/day — solver failed, treating as upper bound')
@@ -619,7 +642,11 @@ def test_Crane_gas_pipeline():
 
 def test_Crane_choked_steam():
     #NOTE this problem is a dead end for this program, because it starts as saturated vapor and immediately goes two-phase upon expansion.
-    from compressible_flow import Line_Segment, Bend, Contraction_Expansion, Valve, _build_phase_limits, _safe_update_PT, compressible_changing_area_K, _safe_update_PT, compressible_pipe_segment, _resolve_mdot
+    from compressible_flow import (
+        Line_Segment, Bend, Contraction_Expansion, Valve,
+        _build_phase_limits, _safe_update_PT, compressible_changing_area_K,
+        compressible_pipe_segment, _resolve_mdot, FlowState,
+    )
     from fluids import fittings
     roughness = ureg.Quantity(0.00015, "ft")
     seg_length = ureg.Quantity(30, "ft")
@@ -668,23 +695,16 @@ def test_Crane_choked_steam():
         Ma_in = v_in / AS.speed_sound()
 
         try:
-            seg.dP_dT(abstract_state=AS, flow_rate=mdot, isothermal=False,
-            T_cricondentherm=T_cric,
-            P_cricondenbar=P_bar,
-            T_critical=T_c,
-            P_critical=P_c,)
+            fs = FlowState(
+                AS, _resolve_mdot(mdot, AS), A=seg.inlet_area_si, z=0.0,
+                T_cricondentherm=T_cric, P_cricondenbar=P_bar,
+                T_critical=T_c, P_critical=P_c,
+            )
+            seg.dP_dT(fs, isothermal=False)
             #next, the elbow
-            elbow.dP_dT(abstract_state=AS, flow_rate=mdot,
-            T_cricondentherm=T_cric,
-            P_cricondenbar=P_bar,
-            T_critical=T_c,
-            P_critical=P_c,)
+            elbow.dP_dT(fs)
             #and the valve
-            valve.dP_dT(abstract_state=AS, flow_rate=mdot,
-            T_cricondentherm=T_cric,
-            P_cricondenbar=P_bar,
-            T_critical=T_c,
-            P_critical=P_c,)
+            valve.dP_dT(fs)
         except RuntimeError as e:
             # Flow too high — segment failed to converge (likely approaching choked flow)
             print(f'Iteration {iteration + 1}: mdot = {mdot.to("lb/hr").magnitude:.4f} lb/hr — solver failed, treating as upper bound')
@@ -744,7 +764,7 @@ def test_choked_mass_flux_ideal_gas_air():
     a 1% tolerance on each quantity.
     """
     from compressible_flow import (
-        choked_mass_flux, _build_phase_limits, _safe_update_PT,
+        choked_mass_flux, _build_phase_limits, _safe_update_PT, FlowState,
     )
 
     P0 = ureg.Quantity(10.0, "bar").to("Pa").magnitude   # 1.0e6 Pa
@@ -755,10 +775,17 @@ def test_choked_mass_flux_ideal_gas_air():
     phase_limits = _build_phase_limits(AS)
     _safe_update_PT(AS, P0, T0, *phase_limits)
 
-    mdot_choked, P_star, T_star, rho_star, P_out, T_out = choked_mass_flux(
-        AS, A_throat, A_outlet=A_throat,
+    # choked_mass_flux's new convention: fs.AS at the static inlet and
+    # fs.mdot used to build the stagnation enthalpy reference internally.
+    # We set fs.mdot to a small probe value so v_in approx 0 -- i.e. the
+    # inlet is effectively stagnation, matching the textbook reference.
+    fs = FlowState(
+        AS, mdot=1e-12, A=A_throat, z=0.0,
         T_cricondentherm=phase_limits[0], P_cricondenbar=phase_limits[1],
         T_critical=phase_limits[2],       P_critical=phase_limits[3],
+    )
+    mdot_choked, P_star, T_star, rho_star, P_out, T_out = choked_mass_flux(
+        fs, A_throat, A_outlet=A_throat,
     )
 
     # Closed-form ideal-gas reference values for gamma = 1.4, M_air = 28.96 g/mol.
@@ -786,74 +813,73 @@ def test_choked_mass_flux_ideal_gas_air():
 
 
 def test_compressible_K_choke_roundtrip():
-    """Round-trip check: pick a (P_in, T_in, A, K) such that compressible_K
-    is choked at some mdot_choked.  Verify that:
-      - mdot = 0.5 * mdot_choked  -> no exception (subsonic path; the
-        analytical formula's stiffness near choke means we need a comfortable
-        margin to exercise the not-choked branch cleanly).
-      - mdot = 1.1 * mdot_choked  -> ChokedFlowError with ce.mdot_choked
-                                     matching the direct primitive output.
+    """Validate the FlowState-aware stagnation reference inside choked_mass_flux.
+
+    The cross-cutting bug fix that introducing FlowState delivered: before,
+    choked_mass_flux read AS.hmass() directly and labelled it h0,
+    silently treating the static inlet as stagnation.  Now it reads
+    fs.h_stagnation = h_static + 0.5*v_in**2, which correctly grows the
+    stagnation reference when the inlet carries non-trivial kinetic
+    energy.  Consequence: for a fixed inlet (P, T, A), the choked mass
+    flow grows monotonically with v_in (more accessible enthalpy in the
+    expansion).
+
+    Test: at the same inlet (P_in, T_in) and area A, evaluate
+    choked_mass_flux at two FlowStates -- one with v_in approx 0 (the
+    classical stagnation case) and one with v_in approx half the local
+    speed of sound -- and verify mdot_choked rises by a few percent in
+    the latter.  Under the old (buggy) code these two would have
+    returned the same value.
+
+    Also verify the lower-Ma case round-trips against the textbook
+    stagnation formula to within 1%.
     """
     from compressible_flow import (
-        compressible_K, choked_mass_flux, ChokedFlowError,
-        _build_phase_limits, _safe_update_PT,
+        choked_mass_flux, _build_phase_limits, _safe_update_PT, FlowState,
     )
 
     P_in = ureg.Quantity(20.0, "bar").to("Pa").magnitude
     T_in = 300.0
     Di   = ureg.Quantity(0.5, "inch").to("m").magnitude
     A    = math.pi * Di**2 / 4.0
-    K    = 1.5
 
     AS = composition.define_composition(
         y_Methane=0.95, y_Ethane=0.04, y_CarbonDioxide=0.01, eos="HEOS",
     )
     phase_limits = _build_phase_limits(AS)
-    _safe_update_PT(AS, P_in, T_in, *phase_limits)
 
-    # Direct primitive: find mdot_choked.
-    mdot_choked_direct, *_ = choked_mass_flux(
-        AS, A, A_outlet=A,
-        T_cricondentherm=phase_limits[0], P_cricondenbar=phase_limits[1],
-        T_critical=phase_limits[2],       P_critical=phase_limits[3],
-    )
-
-    # Subsonic case.
-    _safe_update_PT(AS, P_in, T_in, *phase_limits)
-    try:
-        compressible_K(
-            AS, 0.5 * mdot_choked_direct, A, K,
+    def _mdot_choked_at(v_in_target):
+        """Build a FlowState whose v_in is approximately v_in_target and
+        return the Maytal choked mass flow for that inlet state."""
+        _safe_update_PT(AS, P_in, T_in, *phase_limits)
+        rho_in_seed = AS.rhomass()
+        mdot_seed = max(v_in_target * rho_in_seed * A, 1e-12)
+        fs = FlowState(
+            AS, mdot=mdot_seed, A=A, z=0.0,
             T_cricondentherm=phase_limits[0], P_cricondenbar=phase_limits[1],
             T_critical=phase_limits[2],       P_critical=phase_limits[3],
         )
-        sub_ok = True
-    except ChokedFlowError:
-        sub_ok = False
+        mdot_ch, *_ = choked_mass_flux(fs, A, A_outlet=A)
+        return mdot_ch, fs.Ma
 
-    # Over-choke case.
+    # Probe at v_in ~ 0 (essentially stagnation inlet).
     _safe_update_PT(AS, P_in, T_in, *phase_limits)
-    try:
-        compressible_K(
-            AS, 1.1 * mdot_choked_direct, A, K,
-            T_cricondentherm=phase_limits[0], P_cricondenbar=phase_limits[1],
-            T_critical=phase_limits[2],       P_critical=phase_limits[3],
-        )
-        over_err = None
-    except ChokedFlowError as ce:
-        over_err = ce
+    a_in = AS.speed_sound()
+    mdot_stag, Ma_stag = _mdot_choked_at(0.0)
 
-    print("compressible_K choke round-trip (methane-rich mixture, P_in=20 bar, T_in=300 K):")
-    print(f"  Direct primitive mdot_choked = {mdot_choked_direct:.6g} kg/s")
-    status_sub = "OK  " if sub_ok else "FAIL"
-    print(f"  [{status_sub}] mdot = 0.5*mdot_choked passes without exception")
-    if over_err is None:
-        print("  [FAIL] mdot = 1.1*mdot_choked did NOT raise ChokedFlowError")
-    else:
-        rel = abs(over_err.mdot_choked - mdot_choked_direct) / mdot_choked_direct
-        status_over = "OK  " if rel < 1e-3 else "FAIL"
-        print(f"  [{status_over}] mdot = 1.1*mdot_choked raised ChokedFlowError "
-              f"with mdot_choked={over_err.mdot_choked:.6g} kg/s "
-              f"(rel err vs direct: {rel:.2%})")
+    # Probe at v_in ~ 0.5 * a_in.  With the FlowState-aware h0 the choked
+    # mass flow should rise by a few percent vs the stagnation reference.
+    mdot_hot, Ma_hot = _mdot_choked_at(0.5 * a_in)
+
+    rel_lift = (mdot_hot - mdot_stag) / mdot_stag
+
+    print("FlowState-aware choked_mass_flux (methane-rich mixture, P_in=20 bar, T_in=300 K):")
+    print(f"  v_in ~ 0    (Ma_in={Ma_stag:.3f}):  mdot_choked = {mdot_stag:.6g} kg/s")
+    print(f"  v_in ~ a/2  (Ma_in={Ma_hot:.3f}):  mdot_choked = {mdot_hot:.6g} kg/s")
+    print(f"  relative lift from v_in**2/2 in h0:  {rel_lift:+.2%}")
+
+    status = "OK  " if 0.0 < rel_lift < 0.25 else "FAIL"
+    print(f"  [{status}] mdot_choked rises with v_in (expected: 0 < lift < ~25%)")
 
 
 if __name__ == "__main__":

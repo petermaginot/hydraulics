@@ -114,7 +114,7 @@ A subclass of `Network` that re-uses the `Node` / `Edge` data classes, the rever
 - signed `mdot_e` on each edge.
 
 **Equations:**
-- **Pipe equation per edge** — one residual: walk the components in flow direction starting from the flow-inlet node's `(P, T)` via `dP_dT()` (which mutates the AS in place); the resulting walked outlet P must equal the flow-outlet node's P. The walked outlet T is *not* directly matched (because at a mixer the node T differs from any single edge's walked T); it feeds into the energy balance instead.
+- **Pipe equation per edge** — one residual: walk the components in flow direction starting from the flow-inlet node's `(P, T)` by constructing a single `FlowState` (carrying the `AbstractState`, mass flow, the chain's first component's inlet area, the inlet node's elevation, and the pre-built phase-envelope limits) and threading it through every component's `dP_dT(fs)`; the resulting walked outlet P must equal the flow-outlet node's P. The walked outlet T is *not* directly matched (because at a mixer the node T differs from any single edge's walked T); it feeds into the energy balance instead. Mixed-diameter chains are absorbed automatically — each `dP_dT` calls `_area_match` first to isentropically reconcile any inlet-area discontinuity with the previous component's outlet.
 - **Mass balance** at each non-P-spec node (kg/s).
 - **Energy balance** at each non-T-spec node:
   - inflows (edges + supply): contribute `|mdot| * h_inflow` where `h_inflow` is the walked outlet enthalpy of an incoming edge, or `h(P_n, T_spec)` for a supply boundary;
@@ -125,9 +125,9 @@ A subclass of `Network` that re-uses the `Node` / `Edge` data classes, the rever
 
 **Solver.** `scipy.optimize.least_squares` with the Trust Region Reflective algorithm. TRF accepts variable bounds, which keep trial pressures positive and temperatures above absolute zero — otherwise the ill-conditioned early Newton steps drive `T` deeply negative and the CoolProp PT update fails. `x_scale='jac'` normalizes unknown magnitudes automatically from the Jacobian.
 
-**Phase envelope.** Built once per `solve()` via `_build_phase_limits()` and forwarded to every `dP_dT()` call (rebuilding it is expensive for HEOS mixtures).
+**Phase envelope.** Built once per `solve()` via `_build_phase_limits()` and cached on every `FlowState` constructed inside the walk, so the four limits no longer need to thread through every call signature (rebuilding the envelope is expensive for HEOS mixtures).
 
-**Per-component outlet readout.** After convergence, one additional walk is performed per edge using the converged solution to record the flow-direction outlet `(P_Pa, T_K)` of each component. The list is reindexed back to original `edge.components` order before being returned, so callers can map results to their own per-component objects without needing to know whether the converged flow ended up running forward or reverse on that edge. The data lands in `result["component_outlet_PT"]: dict[edge_name -> list of (P_Pa, T_K)]` and powers the per-block P / T annotations on the compressible GUI canvas (see [GUI.md](GUI.md)).
+**Per-component outlet readout.** After convergence, one additional walk is performed per edge using the converged solution to record the flow-direction outlet `(P_Pa, T_K)` of each component (same `FlowState`-based pattern as `walk_edge`). The list is reindexed back to original `edge.components` order before being returned, so callers can map results to their own per-component objects without needing to know whether the converged flow ended up running forward or reverse on that edge. The data lands in `result["component_outlet_PT"]: dict[edge_name -> list of (P_Pa, T_K)]` and powers the per-block P / T annotations on the compressible GUI canvas (see [GUI.md](GUI.md)).
 
 **Per-edge initial guess.** `mdot_init_kgs` accepts either a scalar (broadcast to every edge) or a `dict {edge_name: kg/s}`. For networks with mixer/splitter junctions, a uniform scalar is mass-imbalanced at the junction and can trap the solver at the zero-flow minimum; pass a mass-balanced dict to seed properly.
 
@@ -160,7 +160,7 @@ For the incompressible solver: the reversed shadow's `dP()` at `+|mdot|` gives t
 
 The compressible solver can't reuse the tanh-blend trick directly — its dP comes from a non-linear `compressible_K()` formula coupled to a CoolProp PT update, and K=_SEALING_K plugged into that formula produces a hugely negative `dP` that drives `P_out` and `T_out` to unphysical values (e.g. `P ≈ -5×10⁹ Pa`) which CoolProp can't update against. Three layered guards live in [compressible_flow.py](compressible_flow.py) and [compressible_network.py](compressible_network.py):
 
-- **`CheckValve.dP_dT()` sealed-state short-circuit.** When the K on a CV instance is ≥ `_SEALED_K_THRESHOLD` (1e6, well above any physical K-factor), `dP_dT()` skips the inertial formula entirely and updates the AbstractState to a clamped sealed-state outlet `(P_out, T_out) = (max(0.5·P_in, 1e5 Pa), T_in)` — a defensive measure so direct calls on a sealed shadow don't crash.
+- **`CheckValve.dP_dT()` sealed-state short-circuit.** When the K on a CV instance is ≥ `_SEALED_K_THRESHOLD` (1e6, well above any physical K-factor), `dP_dT(fs)` skips the inertial formula entirely and updates `fs.AS` to a clamped sealed-state outlet `(P_out, T_out) = (max(0.5·P_in, 1e5 Pa), T_in)` — a defensive measure so direct calls on a sealed shadow don't crash.
 - **`walk_edge()` sealed-edge short-circuit.** If any component on the walked path passes `_is_sealed_check_valve()`, the network solver clamps the AS to the same sealed-outlet state and returns **without walking downstream components**. This is what keeps a Line_Segment downstream of a sealed CV from being asked to integrate at 30 psi (or worse) while compressing tens of mmscf/day's worth of gas — `compressible_pipe_segment()` would otherwise exhaust its `_max_split_depth=8` recursive bisection budget on the resulting low-density / high-velocity state.
 - **Sealed-edge residual swap.** A sealed CV is a complementarity constraint (`mdot ≥ 0` AND `walked − P_outlet ≤ 0`, with at most one active), not an equality. The standard `walked_P_out − P_outlet_node` pipe-equation residual can be accidentally driven to zero by a backflow solution whenever the clamp value happens to match the natural outlet-node pressure — exactly what was happening on a sealed-CV edge with high downstream P. For edges where `walk_edge()` flags `sealed=True`, the solver therefore swaps the pipe equation for `mdot / mdot_ref`, which is zero iff `mdot = 0` (the only physical solution through a sealed CV). When the rest of the system genuinely cannot reach `mdot = 0` (over-determined boundary conditions), the residual norm stays non-zero and the solver reports "did not converge" — preferable to a silently-wrong backflow answer.
 
@@ -348,9 +348,11 @@ GUI's "Save Results..." action:
 
 Profile CSVs use whatever columns each component's profile generator
 returns — `distance_m, elevation_m, P_Pa, v_ms` for the incompressible
-side; `distance_m, P_Pa, T_K, v_ms` for compressible (re-walked via
-`Line_Segment.dP_dT` starting from the converged flow-direction inlet
-(P, T) of each component).
+side; `distance_m, P_Pa, T_K, v_ms` for compressible.  The compressible
+re-walk builds a fresh `FlowState` at each component's converged
+flow-direction inlet `(P, T)` (with `A` seeded from the component's
+own `inlet_area_si` and `z` left at 0 since the bundle does not feed
+elevation back through the network) and runs `Line_Segment.dP_dT(fs)`.
 
 ## Open work
 

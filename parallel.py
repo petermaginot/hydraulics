@@ -190,9 +190,9 @@ def parallel_compressible(line_segment_list, AS, total_flow_rate):
 
     # Precompute the phase envelope once.  build_phase_envelope is expensive
     # for multicomponent HEOS mixtures (seconds per call), and the composition
-    # does not change across segments or iterations, so we forward the four
-    # scalars into every dP_dT call to skip the per-call envelope build.
-    from compressible_flow import _build_phase_limits, _safe_update_PT
+    # does not change across segments or iterations, so we cache the limits
+    # on every FlowState we construct.
+    from compressible_flow import _build_phase_limits, _safe_update_PT, _resolve_mdot, FlowState
     T_cric, P_bar, T_c, P_c = _build_phase_limits(AS)
     print(f"phase limits: T_cric={T_cric}, P_bar={P_bar}, T_c={T_c}, P_c={P_c}")
 
@@ -203,30 +203,20 @@ def parallel_compressible(line_segment_list, AS, total_flow_rate):
     def _branch_outlet(branch, flow_rate):
         # Reset AS to common inlet conditions before walking the branch.  AS is
         # mutated in place by every dP_dT call, so we must reseed it for each
-        # branch evaluation.  Every dP_dT (Line_Segment, Bend,
-        # Contraction_Expansion) now reads inlet conditions from AS as
-        # provided, so the protocol is uniform: ensure AS is at the upstream
-        # state, then call .dP_dT(AS, flow_rate).
+        # branch evaluation.
         _safe_update_PT(AS, P0, T0, T_cric, P_bar, T_c, P_c)
         items = branch if isinstance(branch, list) else [branch]
+        # Mass flow is conserved along a single branch, so resolve once per
+        # branch evaluation rather than per-component.
+        mdot_branch = _resolve_mdot(flow_rate, AS)
+        fs = FlowState(
+            AS, mdot_branch,
+            A=items[0].inlet_area_si, z=0.0,
+            T_cricondentherm=T_cric, P_cricondenbar=P_bar,
+            T_critical=T_c, P_critical=P_c,
+        )
         for c in items:
-            if hasattr(c, "total_length_m"):
-                # Line_Segment: forward precomputed phase-envelope limits.
-                c.dP_dT(
-                    AS, flow_rate,
-                    T_cricondentherm=T_cric, P_cricondenbar=P_bar,
-                    T_critical=T_c, P_critical=P_c,
-                )
-            else:
-                # Fitting (Bend / Valve / Contraction_Expansion).  Forward
-                # phase-envelope limits so internal PT updates can apply the
-                # same supercritical phase hint -- needed for some mixtures
-                # where HEOS phase stability analysis fails.
-                c.dP_dT(
-                    AS, flow_rate,
-                    T_cricondentherm=T_cric, P_cricondenbar=P_bar,
-                    T_critical=T_c, P_critical=P_c,
-                )
+            c.dP_dT(fs)
         return AS.p(), AS.T()
 
     def _outlet(branch, ff):
