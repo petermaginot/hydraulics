@@ -82,6 +82,7 @@ Limitations
 import copy
 import csv
 import json
+import math
 import os
 import warnings
 from dataclasses import dataclass
@@ -371,12 +372,23 @@ class Node:
                           by compressible networks only; ignored by the
                           incompressible solver.  Inlets typically have it;
                           outlets typically don't (T emerges from the solve).
+        area_m2         : float or None, the cross-section flow area
+                          associated with the node [m^2].  Used by the
+                          compressible solver to interpret the node's
+                          (P, T) as the static state at this area, so
+                          velocity head is computed against the right
+                          reference when fluid enters or leaves the node.
+                          None means "resolve at solve time from the
+                          first connected component's near-end area"
+                          (see Compressible_Network.solve).  Ignored by
+                          the incompressible solver.
     """
     name: str
     elevation_m: float = 0.0
     P_spec_Pa: Optional[float] = None
     Q_ext_spec_qty: Optional[Any] = None
     T_spec_K: Optional[float] = None
+    area_m2: Optional[float] = None
 
 
 @dataclass
@@ -426,7 +438,7 @@ class Network:
     # ------------------------------------------------------------------
 
     def add_node(self, name, *, elevation=0.0, P=None, Q_ext=None,
-                 fluid_for_units=None):
+                 diameter=None, area=None, fluid_for_units=None):
         """Add a node.
 
         Args:
@@ -442,11 +454,22 @@ class Network:
                                kg/s; pint Quantities can be mass or
                                volumetric (volumetric is converted to mass
                                at solve() time using the fluid density).
+            diameter         : pint Quantity or float (m if float).  The
+                               diameter of the cross-section associated
+                               with this node.  Used by the compressible
+                               solver to interpret the node's (P, T) as
+                               static at this area.  Mutually exclusive
+                               with `area`.  Optional; default None means
+                               "resolve from connected components at
+                               solve time".
+            area             : pint Quantity or float (m^2 if float).
+                               Direct area form of `diameter`.  Optional.
             fluid_for_units  : Kept for API stability; no longer needed
                                because conversion is deferred to solve().
 
         Specifying both P and Q_ext is an error.  Specifying neither makes
-        the node interior with Q_ext = 0.
+        the node interior with Q_ext = 0.  Specifying both `diameter` and
+        `area` is also an error.
         """
         if name in self._nodes:
             raise ValueError(f"Network.add_node: node {name!r} already exists.")
@@ -464,7 +487,25 @@ class Network:
                 f"Q_ext."
             )
 
-        self._nodes[name] = Node(name, elev_si, P_si, Q_qty)
+        if diameter is not None and area is not None:
+            raise ValueError(
+                f"Network.add_node: node {name!r} cannot specify both "
+                f"diameter and area."
+            )
+        if area is not None:
+            area_si = _to_si_or_none(area, "m**2")
+        elif diameter is not None:
+            D_si = _to_si_or_none(diameter, "m")
+            area_si = math.pi / 4.0 * D_si * D_si if D_si is not None else None
+        else:
+            area_si = None
+        if area_si is not None and area_si <= 0.0:
+            raise ValueError(
+                f"Network.add_node: node {name!r} area must be positive."
+            )
+
+        self._nodes[name] = Node(name, elev_si, P_si, Q_qty,
+                                 area_m2=area_si)
         self._node_order.append(name)
 
     def add_edge(self, name, from_node, to_node, components):
@@ -723,6 +764,43 @@ class Network:
     # Solve
     # ------------------------------------------------------------------
 
+    def _validate_edge_elevations(self, tol_m=0.1):
+        """Warn if any edge's accumulated component elevation change does
+        not match the difference between its endpoint node elevations.
+
+        Each Line_Segment carries its own net_elevation_change_m derived
+        from the segment's profile dz; non-line components (bends,
+        valves, check valves, contraction/expansions) contribute zero.
+        The sum across all components on an edge should equal
+        `to_node.elevation_m - from_node.elevation_m`.  A mismatch means
+        the node elevations and the per-segment dz inputs disagree --
+        the solver uses only the per-segment dz for gz bookkeeping, so
+        the node elevation acts as a label rather than a constraint and
+        a silent mismatch would otherwise hide a physically inconsistent
+        layout from the user.
+        """
+        for edge in self._edges:
+            from_z = self._nodes[edge.from_node].elevation_m
+            to_z   = self._nodes[edge.to_node].elevation_m
+            expected_dz = to_z - from_z
+            actual_dz = 0.0
+            for c in edge.components:
+                if hasattr(c, "net_elevation_change_m"):
+                    actual_dz += c.net_elevation_change_m
+            if abs(actual_dz - expected_dz) > tol_m:
+                warnings.warn(
+                    f"Network: edge {edge.name!r} elevation mismatch -- "
+                    f"endpoint nodes go from z={from_z:.3f} m at "
+                    f"{edge.from_node!r} to z={to_z:.3f} m at "
+                    f"{edge.to_node!r} (Δz={expected_dz:.3f} m), but "
+                    f"the edge's line segments accumulate "
+                    f"Δz={actual_dz:.3f} m.  The solver uses only the "
+                    f"per-segment dz; node elevations are labels.  Either "
+                    f"correct the segment dz inputs or update the node "
+                    f"elevations so the two agree.",
+                    stacklevel=3,
+                )
+
     def solve(self, fluid, P_init=None, mdot_init_kgs=None, verbose=False,
               xtol=1e-8, maxfev=5000):
         """Solve the network for all nodal pressures and edge mass flows.
@@ -761,6 +839,8 @@ class Network:
         n_edges    = len(self._edges)
         if n_nodes == 0 or n_edges == 0:
             raise ValueError("Network.solve: network has no nodes or edges.")
+
+        self._validate_edge_elevations()
 
         idx_of = {name: i for i, name in enumerate(node_names)}
         rho    = fluid.density_si
@@ -912,6 +992,7 @@ class Network:
         """
         from incompressible import (
             Line_Segment, Bend, Valve, CheckValve, Contraction_Expansion,
+            Orifice,
         )
         return {
             "line_segment":          Line_Segment,
@@ -919,6 +1000,7 @@ class Network:
             "valve":                 Valve,
             "check_valve":           CheckValve,
             "contraction_expansion": Contraction_Expansion,
+            "orifice":               Orifice,
         }
 
     def _node_to_dict(self, node):
@@ -938,6 +1020,8 @@ class Network:
         }
         if node.T_spec_K is not None:
             d["T_K"] = float(node.T_spec_K)
+        if node.area_m2 is not None:
+            d["area_m2"] = float(node.area_m2)
         return d
 
     def to_dict(self, *, gui_extras=None):
@@ -982,6 +1066,10 @@ class Network:
         if Q_dict is not None:
             kwargs["Q_ext"] = ureg.Quantity(
                 float(Q_dict["magnitude"]), Q_dict["unit"],
+            )
+        if node_payload.get("area_m2") is not None:
+            kwargs["area"] = ureg.Quantity(
+                float(node_payload["area_m2"]), "m**2",
             )
         self.add_node(node_payload["name"], **kwargs)
 

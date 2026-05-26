@@ -1,0 +1,123 @@
+{
+  "format_version": 1,
+  "regime": "compressible",
+  "nodes": [
+    {
+      "name": "Source/Sink",
+      "elevation_m": 0.0,
+      "P_Pa": 4860803.891683696,
+      "Q_ext": null,
+      "T_K": 322.0388888888889
+    },
+    {
+      "name": "Source/Sink 1",
+      "elevation_m": 0.0,
+      "P_Pa": 4826330.1052178545,
+      "Q_ext": null,
+      "T_K": 288.7055555555556
+    }
+  ],
+  "edges": [
+    {
+      "name": "Source/Sink->Source/Sink 1",
+      "from_node": "Source/Sink",
+      "to_node": "Source/Sink 1",
+      "components": [
+        {
+          "kind": "orifice",
+          "name": "Fitting",
+          "Di_m": 0.10226039999999999,
+          "Do_m": 0.00635,
+          "taps": "corner",
+          "Cd_override": 0.62
+        }
+      ]
+    }
+  ],
+  "gui_extras": {
+    "canvas_nodes": [
+      {
+        "id": "0x2068b4f1010",
+        "name": "Source/Sink",
+        "pos": [
+          -364.85406395615223,
+          373.41767417642393
+        ],
+        "spec": {
+          "type": "source_sink",
+          "P_str": "705",
+          "P_unit": "psi",
+          "Q_str": "",
+          "Q_unit": "mmscf/day",
+          "elev_str": "0",
+          "elev_unit": "ft",
+          "D_str": "",
+          "D_unit": "inch",
+          "T_str": "120",
+          "T_unit": "degF"
+        }
+      },
+      {
+        "id": "0x2068b263390",
+        "name": "Source/Sink 1",
+        "pos": [
+          713.3357856013188,
+          375.86177939885465
+        ],
+        "spec": {
+          "type": "source_sink",
+          "P_str": "700",
+          "P_unit": "psi",
+          "Q_str": "",
+          "Q_unit": "mmscf/day",
+          "elev_str": "0",
+          "elev_unit": "ft",
+          "D_str": "",
+          "D_unit": "inch",
+          "T_str": "60",
+          "T_unit": "degF"
+        }
+      },
+      {
+        "id": "0x2068b263750",
+        "name": "Fitting",
+        "pos": [
+          189.84276498531497,
+          375.23609016628654
+        ],
+        "spec": {
+          "type": "fitting",
+          "fitting_type": "orifice",
+          "Di_str": "4.026",
+          "Di_unit": "inch",
+          "angle_str": "90",
+          "bend_dias_str": "1.5",
+          "Di_US_str": "4.026",
+          "Di_US_unit": "inch",
+          "Di_DS_str": "3.0",
+          "Di_DS_unit": "inch",
+          "orif_Di_str": "4.026",
+          "orif_Di_unit": "inch",
+          "orif_Do_str": ".25",
+          "orif_Do_unit": "inch",
+          "orif_taps": "corner",
+          "orif_Cd_override_str": ".62"
+        }
+      }
+    ],
+    "canvas_connections": [
+      {
+        "from_id": "0x2068b4f1010",
+        "from_port": "out",
+        "to_id": "0x2068b263750",
+        "to_port": "in"
+      },
+      {
+        "from_id": "0x2068b263750",
+        "from_port": "out",
+        "to_id": "0x2068b263390",
+        "to_port": "in"
+      }
+    ]
+  }
+}

@@ -10,6 +10,7 @@ from compressible_flow import (
     Contraction_Expansion as Compressible_Contraction_Expansion,
     Line_Segment as Compressible_Line_Segment,
     Valve as Compressible_Valve,
+    Orifice as Compressible_Orifice,
     FlowState,
     _build_phase_limits,
     _resolve_mdot,
@@ -397,6 +398,115 @@ def test_K():
         print(f"  Scenario 3 (choked):   RuntimeError correctly raised: {e}")
 
 
+def pseudo_orifice():
+    from compressible_flow import compressible_changing_area_K, choked_mass_flux
+    csv_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "example_composition.csv")
+    P_in = ureg.Quantity(114.696, "psi").to("Pa").magnitude
+    T_in = ureg.Quantity(150, "degF").to("degK").magnitude
+
+    AS = composition.define_composition_from_csv(csv_path)
+    phase_limits = _build_phase_limits(AS)
+    T_cricondentherm, P_cricondenbar, T_critical, P_critical = phase_limits
+    
+    OD = ureg.Quantity(4.026, "in")
+    ID = ureg.Quantity(0.25, "in")
+
+    A = OD.magnitude**2*math.pi/4
+    A_orifice = ID.to("m").magnitude**2*math.pi/4
+
+    Beta = ID/OD
+
+    Cd = 0.62
+
+    K = (1-Beta.magnitude**4)/Cd**2
+    
+    mdot_s3 = ureg.Quantity(0.000001, "kg/s")
+    _safe_update_PT(AS, P_in, T_in, *phase_limits)
+
+    
+    fs_s3 = FlowState(
+        AS, mdot_s3.to("kg/s").magnitude, A=A, z=0.0,
+        T_cricondentherm=T_cricondentherm, P_cricondenbar=P_cricondenbar,
+        T_critical=T_critical, P_critical=P_critical,
+    )
+    results =  choked_mass_flux(fs_s3, A_orifice*.62,A)
+    mdot_choked, P_throat, T_throat, rho_throat, P_outlet, T_outlet = results
+
+    print(results)
+
+def trying_orifices():
+    from compressible_flow import compressible_changing_area_K, choked_mass_flux
+    import fluids.fittings
+    import fluids.flow_meter
+    import numpy as np
+    csv_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "example_composition.csv")
+    P_in = ureg.Quantity(100, "psi").to("Pa").magnitude
+    T_in = ureg.Quantity(150, "degF").to("degK").magnitude
+
+    AS = composition.define_composition_from_csv(csv_path)
+    phase_limits = _build_phase_limits(AS)
+    T_cricondentherm, P_cricondenbar, T_critical, P_critical = phase_limits
+
+    valve_Cv = 1.76
+    orifice_Cd = 0.62
+
+    ID = ureg.Quantity(1.939, "inch")
+    D_orifice_trim = ureg.Quantity(0.25, "inch")
+    ID_si             = ID.to("m").magnitude
+    D_orifice_trim_si = D_orifice_trim.to("m").magnitude
+    A_pipe = math.pi * ID_si ** 2 / 4
+
+    _safe_update_PT(AS, P_in, T_in, *phase_limits)
+
+    mdot = _resolve_mdot(flow_rate = ureg.Quantity(0.0001, "mmscf/day"), abstract_state=AS)
+    fs = FlowState(
+        AS=AS, mdot=mdot, A=A_pipe, z=0.0,
+        T_cricondentherm=T_cricondentherm, P_cricondenbar=P_cricondenbar,
+        T_critical=T_critical, P_critical=P_critical,
+    )
+
+    valve = Compressible_Valve(Di=ID, Cv=valve_Cv) #100% open 2" D4 with 1" trim
+
+    orifice = Compressible_Orifice(Di = ID, Do = D_orifice_trim)
+    #find equivalent discharge coefficient for this valve
+    Cd_valve = fluids.flow_meter.K_to_discharge_coefficient(ID_si, D_orifice_trim_si, valve.K)
+
+    #choked flow rate through valve
+    A_throat_valve = Cd_valve * math.pi * D_orifice_trim_si ** 2 / 4
+
+    valve_choked_rate = choked_mass_flux(fs, A_throat_valve, A_outlet=A_pipe)
+    _safe_update_PT(AS, P_in, T_in, *phase_limits) #return to initial conditions
+    orifice_choked_rate = choked_mass_flux(fs, orifice_Cd*orifice.Do_si**2/4*math.pi, A_outlet=A_pipe)
+
+
+    print(f'Cd of the valve: {Cd_valve}')
+    print(f'mdot: {mdot}, Pin = {fs.P}, Tin = {fs.T}')
+    print(f'valve choked flow rate: {valve_choked_rate}')
+    print(f'orifice choked flow rate: {orifice_choked_rate}')
+    print(f'\nmdot, P_orifice, P_valve')
+
+    for i in np.arange(0.002, .05 , 0.002):
+        flow_rate = ureg.Quantity(i, "kg/s")
+
+        mdot = _resolve_mdot(flow_rate = flow_rate, abstract_state=AS)
+        fs.mdot = mdot
+
+        _safe_update_PT(AS, P_in, T_in, *phase_limits) #return to initial conditions
+
+        valve.dP_dT(fs)
+        valve_P = fs.P
+        # print(f'Valve outlet pressure: {fs.P}, pressure ratio = {fs.P/P_in}, temperature: {fs.T}')
+        _safe_update_PT(AS, P_in, T_in, *phase_limits) #return to initial conditions
+
+
+        orifice.dP_dT(fs)
+        orifice_P = fs.P
+        # print(f'orifice outlet pressure: {fs.P}, pressure ratio = {fs.P/P_in}, temperature: {fs.T}')
+        print(f'{mdot}, {orifice_P}, {valve_P}')
+
+
+
+
 def test_contraction_expansion():
     import fluids
     OD = 60.32
@@ -420,4 +530,6 @@ if __name__ == "__main__":
     # test_incompressible_cont()
     # test_incompressible_csv_profile()
     #test_K()
-    test_contraction_expansion()
+    # test_contraction_expansion()
+    # pseudo_orifice()
+    trying_orifices()

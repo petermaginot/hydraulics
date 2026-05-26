@@ -850,7 +850,7 @@ def test_compressible_K_choke_roundtrip():
 
     def _mdot_choked_at(v_in_target):
         """Build a FlowState whose v_in is approximately v_in_target and
-        return the Maytal choked mass flow for that inlet state."""
+        return the choked mass flow for that inlet state."""
         _safe_update_PT(AS, P_in, T_in, *phase_limits)
         rho_in_seed = AS.rhomass()
         mdot_seed = max(v_in_target * rho_in_seed * A, 1e-12)

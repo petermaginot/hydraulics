@@ -934,6 +934,11 @@ class Base_Valve:
 
         K  = 2.166e9 * Di^4 / Cv^2     (Di in m, Cv in gpm/psi^0.5)
 
+    The Python fluids library also has a convenient conversion utility that I didn't find until after I had 
+    plowed through the units conversion. Goes to show that six weeks in the lab can save six hours in the library.
+    
+    fluids.fittings.Cv_to_K(Cv: float, D: float)
+
     Args:
         Di : pint Quantity or float (m if float).  Pipe inner diameter.
              Must be positive.
@@ -1239,6 +1244,14 @@ class Base_Orifice:
                     f"got {Cd_override}."
                 )
         self.Cd_override = Cd_override
+
+    @property
+    def inlet_area_si(self):
+        return math.pi * self.Di_si ** 2 / 4.0
+
+    @property
+    def outlet_area_si(self):
+        return math.pi * self.Di_si ** 2 / 4.0
 
     def __repr__(self):
         Di_q   = ureg.Quantity(self.Di_si, "m")

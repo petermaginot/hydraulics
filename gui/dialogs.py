@@ -20,16 +20,14 @@ from component_classes import ureg
 from gui import units as U
 
 
-def critical(parent, title, text):
-    """Show a critical error dialog with a scrollable text area and Copy button."""
+def _scrollable_message(parent, title, text, icon):
+    """Generic scrollable message dialog with a Copy button."""
     dlg = QDialog(parent)
     dlg.setWindowTitle(title)
     dlg.resize(600, 400)
 
     icon_label = QLabel()
-    icon_label.setPixmap(
-        dlg.style().standardPixmap(QStyle.StandardPixmap.SP_MessageBoxCritical)
-    )
+    icon_label.setPixmap(dlg.style().standardPixmap(icon))
     icon_label.setFixedSize(32, 32)
     icon_label.setScaledContents(True)
 
@@ -59,6 +57,20 @@ def critical(parent, title, text):
     layout.addWidget(buttons)
 
     dlg.exec()
+
+
+def critical(parent, title, text):
+    """Show a critical error dialog with a scrollable text area and Copy button."""
+    _scrollable_message(
+        parent, title, text, QStyle.StandardPixmap.SP_MessageBoxCritical,
+    )
+
+
+def warning(parent, title, text):
+    """Show a non-fatal warning dialog with a scrollable text area and Copy button."""
+    _scrollable_message(
+        parent, title, text, QStyle.StandardPixmap.SP_MessageBoxWarning,
+    )
 
 
 # ---------------------------------------------------------------------------

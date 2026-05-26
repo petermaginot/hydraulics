@@ -67,6 +67,7 @@ class CompressibleNetworkScreen(NetworkScreen):
     VALVE_CLS            = compressible_flow.Valve
     CHECKVALVE_CLS       = compressible_flow.CheckValve
     CONTRACTION_EXP_CLS  = compressible_flow.Contraction_Expansion
+    ORIFICE_CLS          = compressible_flow.Orifice
     NETWORK_CLS          = Compressible_Network
     DISPLAY_FLOW_UNITS   = [
         # Compressible network results are reported in mass [kg/s];
@@ -444,7 +445,12 @@ class CompressibleNetworkScreen(NetworkScreen):
         mdot    = result["mdot_kgs"][edge.name]
         pt_list = result.get("component_outlet_PT", {}).get(edge.name, [])
         if not pt_list:
-            return result["T_K"][ss_name]
+            # Zero-component edge (a topology-only connector): the fluid
+            # arrives unchanged from the node at the other end of the
+            # edge, so the arriving T is just that node's solved T.
+            other_end = (edge.from_node if ss_name == edge.to_node
+                         else edge.to_node)
+            return result["T_K"].get(other_end, result["T_K"][ss_name])
         # component_outlet_PT is in original components order, each entry
         # the flow-direction outlet of that component.  The arriving-T at
         # ss_name is the flow-direction-last outlet on the edge -- which
@@ -534,10 +540,13 @@ class CompressibleNetworkScreen(NetworkScreen):
         P_save, T_save = AS.p(), AS.T()
         try:
             AS.update(CP.PT_INPUTS, P_in, T_in)
+            fs = compressible_flow.FlowState(
+                AS, mdot=abs(mdot),
+                A=comp.inlet_area_si, z=0.0,
+            )
             raw = comp.dP_dT(
-                abstract_state = AS,
-                flow_rate      = ureg.Quantity(abs(mdot), "kg/s"),
-                isothermal     = bool(getattr(self.state, "isothermal", False)),
+                fs,
+                isothermal=bool(getattr(self.state, "isothermal", False)),
             )
         finally:
             AS.update(CP.PT_INPUTS, P_save, T_save)

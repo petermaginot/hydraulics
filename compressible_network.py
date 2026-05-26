@@ -48,6 +48,7 @@ Equations:
 
 import csv
 import json
+import math
 import os
 import warnings
 import numpy as np
@@ -61,7 +62,7 @@ from network import (
 from compressible_flow import (
     _build_phase_limits, _safe_update_PT,
     _is_sealed_check_valve, _sealed_outlet_PT,
-    FlowState,
+    FlowState, ChokedFlowError,
 )
 
 
@@ -120,6 +121,7 @@ class Compressible_Network(Network):
         compressible_flow.* component subclasses on load."""
         from compressible_flow import (
             Line_Segment, Bend, Valve, CheckValve, Contraction_Expansion,
+            Orifice,
         )
         return {
             "line_segment":          Line_Segment,
@@ -127,6 +129,7 @@ class Compressible_Network(Network):
             "valve":                 Valve,
             "check_valve":           CheckValve,
             "contraction_expansion": Contraction_Expansion,
+            "orifice":               Orifice,
         }
 
     def _add_node_from_dict(self, node_payload):
@@ -143,10 +146,14 @@ class Compressible_Network(Network):
             kwargs["Q_ext"] = _ureg.Quantity(
                 float(Q_dict["magnitude"]), Q_dict["unit"],
             )
+        if node_payload.get("area_m2") is not None:
+            kwargs["area"] = _ureg.Quantity(
+                float(node_payload["area_m2"]), "m**2",
+            )
         self.add_node(node_payload["name"], **kwargs)
 
     def add_node(self, name, *, elevation=0.0, P=None, T=None, Q_ext=None,
-                 abstract_state=None):
+                 diameter=None, area=None, abstract_state=None):
         """Add a node.
 
         Args:
@@ -159,10 +166,20 @@ class Compressible_Network(Network):
                              stored as-is; conversion to kg/s is deferred to
                              solve() time, where it uses the abstract state's
                              molar mass for molar/std-volume inputs.
+            diameter       : pint Quantity or float (m if float).  Diameter of
+                             the cross-section associated with the node.
+                             The node's (P, T) is interpreted as the static
+                             state at this area.  Mutually exclusive with
+                             `area`.  Optional; default None means "resolve
+                             at solve() time from the first connected
+                             component's near-end area".
+            area           : pint Quantity or float (m^2 if float).  Direct
+                             area form of `diameter`.  Optional.
             abstract_state : Kept for API stability; no longer needed at
                              add_node time because conversion is deferred.
 
         Specifying both P and Q_ext is rejected (over-constrains the node).
+        Specifying both `diameter` and `area` is also rejected.
         """
         if name in self._nodes:
             raise ValueError(
@@ -183,9 +200,28 @@ class Compressible_Network(Network):
                 f"both P and Q_ext."
             )
 
+        if diameter is not None and area is not None:
+            raise ValueError(
+                f"Compressible_Network.add_node: node {name!r} cannot specify "
+                f"both diameter and area."
+            )
+        if area is not None:
+            area_si = _to_si_or_none(area, "m**2")
+        elif diameter is not None:
+            D_si = _to_si_or_none(diameter, "m")
+            area_si = math.pi / 4.0 * D_si * D_si if D_si is not None else None
+        else:
+            area_si = None
+        if area_si is not None and area_si <= 0.0:
+            raise ValueError(
+                f"Compressible_Network.add_node: node {name!r} area must be "
+                f"positive."
+            )
+
         self._nodes[name] = Node(
             name=name, elevation_m=elev_si,
             P_spec_Pa=P_si, Q_ext_spec_qty=Q_qty, T_spec_K=T_si,
+            area_m2=area_si,
         )
         self._node_order.append(name)
 
@@ -240,6 +276,8 @@ class Compressible_Network(Network):
             raise ValueError(
                 "Compressible_Network.solve: network has no nodes or edges."
             )
+
+        self._validate_edge_elevations()
 
         # Convert each node's Q_ext_spec_qty to mass flow [kg/s] now that
         # the AbstractState (and hence molar mass) is available.  Validate
@@ -328,6 +366,54 @@ class Compressible_Network(Network):
         # expensive for HEOS mixtures and the composition is constant.
         T_cric, P_bar, T_c, P_c = _build_phase_limits(abstract_state)
 
+        # Resolve the cross-section flow area at every node.  Used to seed
+        # the FlowState at every edge walk so the node's (P, T) is
+        # interpreted as the static state at the node's own area, not at
+        # the first downstream component's inlet.  The first component's
+        # _area_match then absorbs any area discontinuity between node and
+        # component automatically.  Default order: explicit node area_m2,
+        # else the first connected edge's near-end component area, else
+        # BFS through zero-component edges to a node with a resolved area.
+        node_area = [None] * n_nodes
+        for i, name in enumerate(node_names):
+            spec = self._nodes[name].area_m2
+            if spec is not None:
+                node_area[i] = float(spec)
+        for i, name in enumerate(node_names):
+            if node_area[i] is not None:
+                continue
+            for edge in self._edges:
+                if not edge.components:
+                    continue
+                if edge.from_node == name:
+                    node_area[i] = float(edge.components[0].inlet_area_si)
+                    break
+                if edge.to_node == name:
+                    node_area[i] = float(edge.components[-1].outlet_area_si)
+                    break
+        changed = True
+        while changed:
+            changed = False
+            for edge in self._edges:
+                if edge.components:
+                    continue
+                fi = idx_of[edge.from_node]
+                ti = idx_of[edge.to_node]
+                if node_area[fi] is None and node_area[ti] is not None:
+                    node_area[fi] = node_area[ti]
+                    changed = True
+                elif node_area[ti] is None and node_area[fi] is not None:
+                    node_area[ti] = node_area[fi]
+                    changed = True
+        if any(a is None for a in node_area):
+            unresolved = [node_names[i] for i, a in enumerate(node_area)
+                          if a is None]
+            raise ValueError(
+                f"Compressible_Network.solve: cannot infer flow area for "
+                f"node(s) {unresolved!r}; specify a diameter on at least "
+                f"one of them."
+            )
+
         # Cache reversed-shadow components, keyed by id(original).
         reversed_cache = {}
 
@@ -405,18 +491,44 @@ class Compressible_Network(Network):
             try:
                 _safe_update_PT(abstract_state, P_in_e, T_in_e,
                                 T_cric, P_bar, T_c, P_c)
-                # Seed the FlowState's local area from the first component's
-                # inlet area so its internal _area_match is a no-op; any
-                # downstream area discontinuity (mixed-diameter chain) is
-                # absorbed automatically inside each component's dP_dT.
+                # Seed the FlowState's local area from the inlet node's
+                # resolved area so the node's (P, T) is interpreted as
+                # the static state at the node, not at the first
+                # downstream component.  Any area discontinuity between
+                # the node and the first component (or anywhere down the
+                # chain) is absorbed automatically by _area_match inside
+                # each component's dP_dT.  A zero-component edge falls
+                # through the loop and returns the inlet state as the
+                # outlet, matching the incompressible solver's implicit
+                # zero-dP connector behavior.
                 fs = FlowState(
                     abstract_state, abs_mdot,
-                    A=comps[0].inlet_area_si, z=z_in_e,
+                    A=node_area[inlet_i], z=z_in_e,
                     T_cricondentherm=T_cric, P_cricondenbar=P_bar,
                     T_critical=T_c, P_critical=P_c,
                 )
                 for c in comps:
                     c.dP_dT(fs)
+            except ChokedFlowError as e:
+                # mdot-dependent penalty so the LM solver has a gradient
+                # to follow back below choke.  A flat _WALK_FAIL_P_PA wall
+                # zeros the Jacobian column for mdot and the solver
+                # terminates on gtol before it ever steps toward the
+                # subsonic root.  Scaling the throat outlet pressure by
+                # (mdot_choked / abs_mdot)**2 makes walked_P_out increase
+                # monotonically as mdot shrinks back toward choke, so the
+                # pipe-equation residual gives a clean step direction.
+                _safe_update_PT(abstract_state, P_in_e, T_in_e,
+                                T_cric, P_bar, T_c, P_c)
+                if e.mdot_choked > 0.0 and abs_mdot > e.mdot_choked:
+                    ratio = e.mdot_choked / abs_mdot
+                    penalty_P = max(_WALK_FAIL_P_PA, e.P_outlet * ratio * ratio)
+                else:
+                    penalty_P = max(_WALK_FAIL_P_PA, e.P_outlet)
+                return (penalty_P,
+                        T_in_e,
+                        abstract_state.hmass(),
+                        inlet_i, outlet_i, False)
             except (RuntimeError, ValueError):
                 _safe_update_PT(abstract_state, P_in_e, T_in_e,
                                 T_cric, P_bar, T_c, P_c)
@@ -546,6 +658,17 @@ class Compressible_Network(Network):
                         walked_P_out[e_idx] - P[outlet_i_of[e_idx]]
                     ) / P_ref
 
+            nfev_counter[0] += 1
+            if progress_callback is not None:
+                # Swallow callback exceptions so a buggy reporter (GUI
+                # progress hook etc.) cannot abort the solve.
+                try:
+                    progress_callback(
+                        nfev_counter[0], float(np.linalg.norm(res)),
+                    )
+                except Exception:
+                    pass
+
             return res
 
         # scipy.optimize.least_squares with the Trust Region Reflective
@@ -650,13 +773,37 @@ class Compressible_Network(Network):
             z_inlet_recon = self._nodes[node_names[inlet_i]].elevation_m
             fs_recon = FlowState(
                 abstract_state, abs(mdot_e),
-                A=walk_comps[0].inlet_area_si, z=z_inlet_recon,
+                A=node_area[inlet_i], z=z_inlet_recon,
                 T_cricondentherm=T_cric, P_cricondenbar=P_bar,
                 T_critical=T_c, P_critical=P_c,
             )
+            # The reconstruction walks each converged component once for
+            # per-block reporting.  Wrap each step so a still-choked or
+            # numerically-infeasible converged mdot does not crash result
+            # assembly (the solver may have terminated on gtol without
+            # actually reaching the subsonic root -- see walk_edge above).
+            # On failure the remaining downstream components are stamped
+            # with the throat / failure state so callers still get a
+            # full-length list indexed by component position.
             walked_PT = []
+            recon_failed = False
             for c in walk_comps:
-                c.dP_dT(fs_recon)
+                if recon_failed:
+                    walked_PT.append((float(abstract_state.p()),
+                                      float(abstract_state.T())))
+                    continue
+                try:
+                    c.dP_dT(fs_recon)
+                except ChokedFlowError as e:
+                    _safe_update_PT(abstract_state,
+                                    e.P_outlet, e.T_outlet,
+                                    T_cric, P_bar, T_c, P_c)
+                    recon_failed = True
+                except (RuntimeError, ValueError):
+                    _safe_update_PT(abstract_state,
+                                    P_arr[inlet_i], T_arr[inlet_i],
+                                    T_cric, P_bar, T_c, P_c)
+                    recon_failed = True
                 walked_PT.append((float(abstract_state.p()),
                                   float(abstract_state.T())))
             # For reverse flow, walked_PT[k] is the flow-direction outlet of
@@ -954,7 +1101,16 @@ def _test_parallel_two_branches():
     assert result["converged"]
     assert errP < 0.5      # parallel_compressible's tol is 1e-6 relative
     assert errT < 0.5
-    assert err_frac < 1e-3
+    # The network solver interprets the inlet node's (P, T) as the static
+    # state at the node's single resolved area (here = seg_A's inlet,
+    # 3.068" -- the first connected component on the first edge).  Branch
+    # B's first dP_dT then runs an isentropic area change from 3.068" to
+    # 4.026" at entry, which slightly shifts the split versus
+    # parallel_compressible (which treats each branch as starting at its
+    # own diameter with no inlet area change).  The discrepancy is small
+    # but real; tolerance is set to comfortably accommodate it while
+    # still catching gross regressions.
+    assert err_frac < 5e-2
 
 
 def _test_mixing_junction():
@@ -1060,9 +1216,148 @@ def _test_mixing_junction():
     assert T_cold < T_MIX < T_hot, f"T_MIX = {T_MIX} outside ({T_cold}, {T_hot})"
 
 
+def _test_orifice_subsonic():
+    """One inlet (P, T spec) -> Orifice -> one outlet (Q_ext = -mdot).
+
+    Compares the network-solved outlet pressure to a direct Orifice.dP_dT
+    walk at the same mdot.  Tests that an orifice round-trips through the
+    network solver the same way a Valve / Bend does.
+    """
+    from compressible_flow import (
+        Orifice, _build_phase_limits, _safe_update_PT,
+    )
+    import composition
+
+    P_in     = ureg.Quantity(1000.0, "psi").to("Pa").magnitude
+    T_in     = 300.0   # K
+    mdot_kgs = 1.0     # kg/s -- comfortably subsonic for the geometry below
+
+    AS = composition.define_composition(
+        y_Methane=0.9, y_Ethane=0.05, y_Propane=0.02,
+        y_n_Butane=0.01, y_CarbonDioxide=0.02, eos="PR",
+    )
+
+    Di = ureg.Quantity(3.068, "inch").to("m").magnitude
+    Do = ureg.Quantity(1.500, "inch").to("m").magnitude
+    orf = Orifice(Di=Di, Do=Do, taps="corner", Cd_override=0.62, name="ORF")
+
+    # ---- Direct reference walk.
+    T_cric, P_bar, T_c, P_c = _build_phase_limits(AS)
+    _safe_update_PT(AS, P_in, T_in, T_cric, P_bar, T_c, P_c)
+    fs_ref = FlowState(
+        AS, mdot_kgs, A=orf.inlet_area_si, z=0.0,
+        T_cricondentherm=T_cric, P_cricondenbar=P_bar,
+        T_critical=T_c, P_critical=P_c,
+    )
+    orf.dP_dT(fs_ref)
+    P_out_ref = AS.p()
+    T_out_ref = AS.T()
+    print(f"[orifice-sub] direct walk:    "
+          f"P_out = {P_out_ref/6894.757:.4f} psi,  T_out = {T_out_ref:.4f} K")
+
+    # ---- Network solve.
+    net = Compressible_Network()
+    net.add_node("in",  P=P_in, T=T_in, diameter=Di)
+    net.add_node("out", Q_ext=-mdot_kgs)
+    net.add_edge("orf", "in", "out", orf)
+
+    _safe_update_PT(AS, P_in, T_in, T_cric, P_bar, T_c, P_c)
+    result = net.solve(AS, mdot_init_kgs=mdot_kgs, verbose=True)
+
+    P_out_net = result["P_Pa"]["out"]
+    T_out_net = result["T_K"]["out"]
+    mdot_net  = result["mdot_kgs"]["orf"]
+    print(f"[orifice-sub] network solve:  "
+          f"P_out = {P_out_net/6894.757:.4f} psi,  "
+          f"T_out = {T_out_net:.4f} K,  "
+          f"mdot = {mdot_net:.4f} kg/s")
+
+    errP = abs(P_out_net - P_out_ref) / 6894.757
+    errT = abs(T_out_net - T_out_ref)
+    errM = abs(mdot_net - mdot_kgs)
+    print(f"[orifice-sub] errors: P {errP:.3e} psi, T {errT:.3e} K, "
+          f"mdot {errM:.3e} kg/s")
+    assert result["converged"]
+    assert errP < 1e-2
+    assert errT < 1e-2
+    assert errM < 1e-6
+
+
+def _test_orifice_choke():
+    """Orifice.dP_dT raises ChokedFlowError when fs.mdot exceeds the
+    textbook ISO 5167 choked mass flow.
+
+    The orifice's choke check is the standard critical-pressure-ratio
+    test: P2/P1 < (2/(k+1))**(k/(k-1)).  Mass flow at that ratio is
+    obtained from the ISO 5167 subsonic equation (with the expansibility
+    factor) and is typically a few tens of percent above the pure ideal-
+    gas G_max * A_bore estimate -- the expansibility correction Y and
+    Cd interact non-trivially at the critical ratio.
+
+    Drives a small orifice with methane at 5 MPa and a deliberately
+    oversized mdot; checks that the raised ChokedFlowError carries a
+    sensible throat pressure (close to the critical ratio of the gas).
+    """
+    from compressible_flow import (
+        Orifice, ChokedFlowError, _build_phase_limits, _safe_update_PT,
+    )
+    import composition
+
+    AS = composition.define_composition(y_Methane=1.0, eos="HEOS")
+    T_cric, P_bar, T_c, P_c = _build_phase_limits(AS)
+
+    P_in, T_in = 5.0e6, 300.0
+    _safe_update_PT(AS, P_in, T_in, T_cric, P_bar, T_c, P_c)
+
+    Di, Do = 0.1, 0.05
+    A_pipe = math.pi * Di ** 2 / 4.0
+    Cd     = 0.62
+
+    orf = Orifice(Di=Di, Do=Do, Cd_override=Cd, name="ORF-choke")
+    # Pick mdot deliberately oversized so the trip is unambiguous (well
+    # above any sensible subsonic root for this geometry).
+    fs = FlowState(
+        AS, mdot=50.0, A=A_pipe, z=0.0,
+        T_cricondentherm=T_cric, P_cricondenbar=P_bar,
+        T_critical=T_c, P_critical=P_c,
+    )
+
+    # Reference: ideal-gas critical pressure ratio for methane (k ~ 1.31).
+    # The real-gas isentropic expansion finds the sonic point on the real-gas
+    # isentrope, which for supercritical methane sits noticeably above
+    # the ideal-gas ratio (Z != 1, the gas is denser and slower-speed-
+    # of-sound than ideal).  Allow up to 25% departure from the ideal-
+    # gas reference.
+    k_ig          = AS.cpmass() / AS.cvmass()
+    crit_ratio    = (2.0 / (k_ig + 1.0)) ** (k_ig / (k_ig - 1.0))
+    P_throat_ref  = crit_ratio * P_in
+
+    try:
+        orf.dP_dT(fs)
+    except ChokedFlowError as e:
+        print(f"[orifice-choke] ChokedFlowError raised: "
+              f"mdot_choked = {e.mdot_choked:.4f} kg/s")
+        print(f"[orifice-choke] throat: P = {e.P_throat/1e6:.4f} MPa "
+              f"(ideal-gas ref = {P_throat_ref/1e6:.4f} MPa), "
+              f"T = {e.T_throat:.4f} K")
+        # Throat pressure within an order-of-magnitude band centred on
+        # the ideal-gas critical ratio.
+        assert abs(e.P_throat - P_throat_ref) / P_throat_ref < 0.25
+        # mdot_choked must be positive and not absurdly large.
+        assert 1.0 < e.mdot_choked < 100.0
+    else:
+        raise AssertionError(
+            "[orifice-choke] Expected ChokedFlowError, got subsonic solution."
+        )
+
+
 if __name__ == "__main__":
     _test_single_segment_forward()
     print()
     _test_parallel_two_branches()
     print()
     _test_mixing_junction()
+    print()
+    _test_orifice_subsonic()
+    print()
+    _test_orifice_choke()

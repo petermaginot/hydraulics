@@ -89,11 +89,11 @@ feedback in the denominator strengthens nonlinearly as the gas expands.
   inlet-property linearization.
 
 - **R1.5 [✅ DONE].** Real-gas choked-flow detection via `choked_mass_flux`
-  (Maytal 2006 isentropic march with mixture-safe (P,T)+entropy-root EOS
+  isentropic march with mixture-safe (P,T)+entropy-root EOS
   updates). Both `compressible_K` and `compressible_changing_area_K` now
   carry a cheap ideal-gas `G_max` pre-screen; above the threshold the
-  Maytal march runs, and a dedicated `ChokedFlowError(RuntimeError)` is
-  raised when `mdot > mdot_choked`. `_NoChokeBracketError` (sentinel) is
+  march runs, and a dedicated `ChokedFlowError(RuntimeError)` is raised when 
+  `mdot > mdot_choked`. `_NoChokeBracketError` (sentinel) is
   raised when the grid scan finds no Mach=1 — caught and treated as "not
   choked" by the pre-screens; genuine CoolProp / numerical failures
   propagate. Substantially addresses item 5 (the denominator singularity

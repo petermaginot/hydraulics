@@ -169,7 +169,7 @@ All five take a `FlowState` as their first argument; `mdot`, `A`, and the phase-
 
   **Adaptive fallback:** after computing the linearized `dP`, if `|dP|/P_in > dPmax` (default 5%) or the compressibility denominator `< 0.5` (indicating near-sonic conditions where the linearization breaks down), the function automatically delegates to `compressible_changing_area_K` with `A_out = fs.A`. This makes `Valve.dP_dT` and `Bend.dP_dT` regime-aware without any API change. Pass a larger `dPmax` to force the fast path, or smaller to be more conservative.
 
-- **`choked_mass_flux(fs, A_throat, A_outlet=None, n_grid=40)`** — real-gas choked mass flow through a throat of area `A_throat`, using the Maytal isentropic march (Cryogenics 46(1):21-29, 2006). The stagnation enthalpy reference is built from `fs.h_stagnation = h_static + 0.5·v_in²`, so the choked mass flow correctly grows when the inlet carries non-trivial kinetic energy. Used internally by `compressible_K` and `compressible_changing_area_K` as a real-gas choke pre-screen; on choke they raise `ChokedFlowError` carrying `mdot_choked` and the (recovered) outlet state.
+- **`choked_mass_flux(fs, A_throat, A_outlet=None, n_grid=40)`** — real-gas choked mass flow through a throat of area `A_throat`, using the an isentropic expansion. The stagnation enthalpy reference is built from `fs.h_stagnation = h_static + 0.5·v_in²`, so the choked mass flow correctly grows when the inlet carries non-trivial kinetic energy. Used internally by `compressible_K` and `compressible_changing_area_K` as a real-gas choke pre-screen; on choke they raise `ChokedFlowError` carrying `mdot_choked` and the (recovered) outlet state.
 
 ### Helpers
 

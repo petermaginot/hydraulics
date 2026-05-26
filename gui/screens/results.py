@@ -3,6 +3,7 @@
 import traceback
 
 import CoolProp.CoolProp as CP
+import compressible_flow
 import gui.dialogs as dialogs
 import pyqtgraph as pg
 from PySide6.QtCore import Qt, Signal
@@ -128,14 +129,16 @@ class ResultsScreen(QWidget):
                     flow_rate = s.flow_rate,
                 )
             else:
-                # dP_dT mutates the AbstractState in-place, so re-anchor to
-                # the user-supplied inlet conditions before every run.
+                # dP_dT mutates the AbstractState (and the FlowState it
+                # wraps) in-place, so re-anchor to the user-supplied inlet
+                # conditions and build a fresh FlowState before every run.
                 s.fluid.update(CP.PT_INPUTS, s.P_inlet_Pa, s.T_inlet_K)
-                raw = s.segment.dP_dT(
-                    abstract_state = s.fluid,
-                    flow_rate      = s.flow_rate,
-                    isothermal     = s.isothermal,
+                mdot = compressible_flow._resolve_mdot(s.flow_rate, s.fluid)
+                fs = compressible_flow.FlowState(
+                    s.fluid, mdot=mdot,
+                    A=s.segment.inlet_area_si, z=0.0,
                 )
+                raw = s.segment.dP_dT(fs, isothermal=s.isothermal)
                 results = [
                     {"distance_m": d, "P_Pa": P, "T_K": T, "v_ms": v}
                     for (d, P, T, v) in raw

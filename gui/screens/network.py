@@ -31,6 +31,7 @@ import gui._compat   # noqa: F401  -- must import before NodeGraphQt
 import math
 import os
 import traceback
+import warnings
 
 from PySide6.QtCore import Qt, Signal
 from PySide6.QtWidgets import (
@@ -63,7 +64,7 @@ from gui.screens.segment import _LabeledField
 import fluids.fittings
 from incompressible import (
     Incompressible_Fluid, Line_Segment, Bend, Contraction_Expansion, Valve,
-    CheckValve,
+    CheckValve, Orifice,
 )
 from network import Network
 
@@ -236,6 +237,7 @@ class NetworkScreen(QWidget):
     VALVE_CLS            = Valve
     CHECKVALVE_CLS       = CheckValve
     CONTRACTION_EXP_CLS  = Contraction_Expansion
+    ORIFICE_CLS          = Orifice
     NETWORK_CLS          = Network
     DISPLAY_FLOW_UNITS   = U.FLOW_RATE_INCOMPRESSIBLE
     DISPLAY_FLOW_DEFAULT = "BBL/D"
@@ -371,6 +373,7 @@ class NetworkScreen(QWidget):
             "P_str":     "",   "P_unit":    "psi",
             "Q_str":     "",   "Q_unit":    self.DISPLAY_FLOW_DEFAULT,
             "elev_str":  "0",  "elev_unit": "ft",
+            "D_str":     "",   "D_unit":    "inch",
         }
         spec.update(self._default_source_sink_extra())
         return spec
@@ -380,6 +383,7 @@ class NetworkScreen(QWidget):
         return {
             "type":      "junction",
             "elev_str":  "0",  "elev_unit": "ft",
+            "D_str":     "",   "D_unit":    "inch",
         }
 
     @staticmethod
@@ -400,13 +404,18 @@ class NetworkScreen(QWidget):
     @staticmethod
     def _default_fitting_fields():
         return {
-            "type":          "fitting",
-            "fitting_type":  "bend",
-            "Di_str":        "4.026",  "Di_unit":    "inch",
-            "angle_str":     "90",
-            "bend_dias_str": "1.5",
-            "Di_US_str":     "4.026",  "Di_US_unit": "inch",
-            "Di_DS_str":     "3.0",    "Di_DS_unit": "inch",
+            "type":             "fitting",
+            "fitting_type":     "bend",
+            "Di_str":           "4.026",  "Di_unit":    "inch",
+            "angle_str":        "90",
+            "bend_dias_str":    "1.5",
+            "Di_US_str":        "4.026",  "Di_US_unit": "inch",
+            "Di_DS_str":        "3.0",    "Di_DS_unit": "inch",
+            # Orifice plate.  Cd_override blank => use RHG correlation.
+            "orif_Di_str":      "4.026",  "orif_Di_unit": "inch",
+            "orif_Do_str":      "2.0",    "orif_Do_unit": "inch",
+            "orif_taps":        "corner",
+            "orif_Cd_override_str": "",
         }
 
     @staticmethod
@@ -492,6 +501,12 @@ class NetworkScreen(QWidget):
             "",  self.DISPLAY_FLOW_UNITS, self.DISPLAY_FLOW_DEFAULT,
         )
         self.ss_elev = _LabeledField("0", U.LENGTH,             "ft")
+        self.ss_D    = _LabeledField("",  U.DIAMETER,            "inch")
+        self.ss_D.edit.setToolTip(
+            "Cross-section diameter at the source/sink.  The specified "
+            "(P, T) is interpreted as the static state at this area.  "
+            "Leave blank to default to the connected component's diameter."
+        )
         self.ss_apply = QPushButton("Apply")
         self.ss_apply.clicked.connect(self._apply_source_sink_edits)
 
@@ -513,6 +528,7 @@ class NetworkScreen(QWidget):
         # Subclass hook: lets CompressibleNetworkScreen add a T row here.
         self._add_extra_source_sink_rows(form)
         form.addRow("Elevation:",  self.ss_elev.widget())
+        form.addRow("Diameter:",   self.ss_D.widget())
 
         hint = QLabel(
             "Specify P OR Q_ext (never both) — the solver derives the "
@@ -533,12 +549,20 @@ class NetworkScreen(QWidget):
     def _build_junction_editor(self):
         self.j_name  = QLineEdit()
         self.j_elev  = _LabeledField("0", U.LENGTH, "ft")
+        self.j_D     = _LabeledField("",  U.DIAMETER, "inch")
+        self.j_D.edit.setToolTip(
+            "Cross-section diameter at the junction.  The junction's "
+            "solved (P, T) is interpreted as the static state at this "
+            "area.  Leave blank to default to the first connected "
+            "component's diameter."
+        )
         self.j_apply = QPushButton("Apply")
         self.j_apply.clicked.connect(self._apply_junction_edits)
 
         form = QFormLayout()
         form.addRow("Name:",       self.j_name)
         form.addRow("Elevation:",  self.j_elev.widget())
+        form.addRow("Diameter:",   self.j_D.widget())
 
         hint = QLabel(
             "Interior splitter / merger.  No boundary condition: the "
@@ -628,7 +652,9 @@ class NetworkScreen(QWidget):
     def _build_fitting_editor(self):
         self.fit_name = QLineEdit()
         self.fit_type_combo = QComboBox()
-        self.fit_type_combo.addItems(["Bend", "Sudden Contraction/Expansion"])
+        self.fit_type_combo.addItems(
+            ["Bend", "Sudden Contraction/Expansion", "Orifice plate"]
+        )
         self.fit_type_combo.currentIndexChanged.connect(self._on_fitting_type_changed)
 
         # Bend sub-page
@@ -671,9 +697,45 @@ class NetworkScreen(QWidget):
         cv.addLayout(ce_form)
         cv.addWidget(ce_hint)
 
+        # Orifice plate sub-page
+        self.fit_orif_Di       = _LabeledField("4.026", U.DIAMETER, "inch")
+        self.fit_orif_Do       = _LabeledField("2.0",   U.DIAMETER, "inch")
+        self.fit_orif_taps     = QComboBox()
+        self.fit_orif_taps.addItems(["corner", "D and D/2", "flange"])
+        self.fit_orif_Cd       = QLineEdit("")
+        self.fit_orif_Cd.setPlaceholderText("blank = use RHG correlation")
+        self.fit_orif_beta_lbl = QLabel("β = -")
+        self.fit_orif_beta_lbl.setStyleSheet("color: #555;")
+        orif_form = QFormLayout()
+        orif_form.addRow("Pipe ID (Di):",   self.fit_orif_Di.widget())
+        orif_form.addRow("Bore (Do):",      self.fit_orif_Do.widget())
+        orif_form.addRow("",                self.fit_orif_beta_lbl)
+        orif_form.addRow("Taps:",           self.fit_orif_taps)
+        orif_form.addRow("Cd override:",    self.fit_orif_Cd)
+        orif_hint = QLabel(
+            "Square-edged concentric orifice plate.  "
+            "Cd is computed via ISO 5167-2 (Reader-Harris-Gallagher) when "
+            "the override is blank.  RHG valid range: β = Do/Di in "
+            "[0.10, 0.75]."
+        )
+        orif_hint.setWordWrap(True)
+        orif_hint.setStyleSheet("color: #777; font-style: italic;")
+        orif_page = QWidget()
+        ov = QVBoxLayout(orif_page)
+        ov.setContentsMargins(0, 0, 0, 0)
+        ov.addLayout(orif_form)
+        ov.addWidget(orif_hint)
+
+        # Live beta readout: recompute whenever Di or Do edit text changes.
+        self.fit_orif_Di.edit.textChanged.connect(self._update_orifice_beta_label)
+        self.fit_orif_Do.edit.textChanged.connect(self._update_orifice_beta_label)
+        self.fit_orif_Di.combo.currentTextChanged.connect(self._update_orifice_beta_label)
+        self.fit_orif_Do.combo.currentTextChanged.connect(self._update_orifice_beta_label)
+
         self.fit_input_stack = QStackedWidget()
         self.fit_input_stack.addWidget(bend_page)   # index 0
         self.fit_input_stack.addWidget(ce_page)     # index 1
+        self.fit_input_stack.addWidget(orif_page)   # index 2
 
         self.fit_apply = QPushButton("Apply")
         self.fit_apply.clicked.connect(self._apply_fitting_edits)
@@ -1118,6 +1180,8 @@ class NetworkScreen(QWidget):
             )
             self.ss_elev.edit.setText(spec.get("elev_str", "0"))
             self.ss_elev.combo.setCurrentText(spec.get("elev_unit", "ft"))
+            self.ss_D.edit.setText(spec.get("D_str", ""))
+            self.ss_D.combo.setCurrentText(spec.get("D_unit", "inch"))
             # Subclass hook: populate any extra widgets (e.g. T for compressible).
             self._sync_source_sink_extra(spec)
             self._update_PQ_exclusivity()
@@ -1127,6 +1191,8 @@ class NetworkScreen(QWidget):
             self.j_name.setText(n.name())
             self.j_elev.edit.setText(spec.get("elev_str", "0"))
             self.j_elev.combo.setCurrentText(spec.get("elev_unit", "ft"))
+            self.j_D.edit.setText(spec.get("D_str", ""))
+            self.j_D.combo.setCurrentText(spec.get("D_unit", "inch"))
         elif t == "pipe":
             self.editor_stack.setCurrentIndex(3)
             self.editor_box.setTitle(f"Selected node: {n.name()}  [Pipe Segment]")
@@ -1137,7 +1203,8 @@ class NetworkScreen(QWidget):
             self.editor_box.setTitle(f"Selected node: {n.name()}  [Fitting]")
             self.fit_name.setText(n.name())
             ft  = spec.get("fitting_type", "bend")
-            idx = 0 if ft == "bend" else 1
+            _FT = ["bend", "contraction_expansion", "orifice"]
+            idx = _FT.index(ft) if ft in _FT else 0
             self.fit_type_combo.setCurrentIndex(idx)
             self.fit_input_stack.setCurrentIndex(idx)
             self.fit_bend_Di.edit.setText(spec.get("Di_str", "4.026"))
@@ -1148,6 +1215,13 @@ class NetworkScreen(QWidget):
             self.fit_ce_Di_US.combo.setCurrentText(spec.get("Di_US_unit", "inch"))
             self.fit_ce_Di_DS.edit.setText(spec.get("Di_DS_str", "3.0"))
             self.fit_ce_Di_DS.combo.setCurrentText(spec.get("Di_DS_unit", "inch"))
+            self.fit_orif_Di.edit.setText(spec.get("orif_Di_str", "4.026"))
+            self.fit_orif_Di.combo.setCurrentText(spec.get("orif_Di_unit", "inch"))
+            self.fit_orif_Do.edit.setText(spec.get("orif_Do_str", "2.0"))
+            self.fit_orif_Do.combo.setCurrentText(spec.get("orif_Do_unit", "inch"))
+            self.fit_orif_taps.setCurrentText(spec.get("orif_taps", "corner"))
+            self.fit_orif_Cd.setText(spec.get("orif_Cd_override_str", ""))
+            self._update_orifice_beta_label()
         elif t == "valve":
             self.editor_stack.setCurrentIndex(5)
             self.editor_box.setTitle(f"Selected node: {n.name()}  [Valve]")
@@ -1315,6 +1389,8 @@ class NetworkScreen(QWidget):
             "Q_unit":    self.ss_Q.combo.currentText(),
             "elev_str":  self.ss_elev.edit.text().strip() or "0",
             "elev_unit": self.ss_elev.combo.currentText(),
+            "D_str":     self.ss_D.edit.text().strip(),
+            "D_unit":    self.ss_D.combo.currentText(),
         }
         # Subclass hook: mutate spec to include extra fields (e.g. T).
         self._apply_source_sink_extra(spec)
@@ -1332,6 +1408,8 @@ class NetworkScreen(QWidget):
             "type":      "junction",
             "elev_str":  self.j_elev.edit.text().strip() or "0",
             "elev_unit": self.j_elev.combo.currentText(),
+            "D_str":     self.j_D.edit.text().strip(),
+            "D_unit":    self.j_D.combo.currentText(),
         }
         self.editor_box.setTitle(f"Selected node: {n.name()}  [Junction]")
 
@@ -1364,6 +1442,33 @@ class NetworkScreen(QWidget):
     def _on_fitting_type_changed(self, index):
         self.fit_input_stack.setCurrentIndex(index)
 
+    def _update_orifice_beta_label(self, *_):
+        """Recompute the read-only β = Do/Di label as the user types.
+
+        Both diameters are converted to a common unit (metres) so the
+        ratio survives unit mismatches in the dropdowns.  Outside the RHG
+        valid band [0.10, 0.75] the label colour goes amber.
+        """
+        try:
+            Di = float(self.fit_orif_Di.edit.text().strip())
+            Do = float(self.fit_orif_Do.edit.text().strip())
+            Di_m = ureg.Quantity(Di, U.to_pint(
+                self.fit_orif_Di.combo.currentText())).to("m").magnitude
+            Do_m = ureg.Quantity(Do, U.to_pint(
+                self.fit_orif_Do.combo.currentText())).to("m").magnitude
+            if Di_m <= 0.0:
+                raise ValueError
+            beta = Do_m / Di_m
+        except (ValueError, AttributeError):
+            self.fit_orif_beta_lbl.setText("β = -")
+            self.fit_orif_beta_lbl.setStyleSheet("color: #555;")
+            return
+        if 0.10 <= beta <= 0.75:
+            self.fit_orif_beta_lbl.setStyleSheet("color: #555;")
+        else:
+            self.fit_orif_beta_lbl.setStyleSheet("color: #b07000;")
+        self.fit_orif_beta_lbl.setText(f"β = {beta:.4f}")
+
     def _on_valve_type_changed(self, index):
         self.valve_input_stack.setCurrentIndex(index)
 
@@ -1381,18 +1486,25 @@ class NetworkScreen(QWidget):
         new_name = self.fit_name.text().strip()
         if new_name and new_name != n.name():
             n.set_name(new_name)
-        ft = "bend" if self.fit_type_combo.currentIndex() == 0 else "contraction_expansion"
+        _FT = ["bend", "contraction_expansion", "orifice"]
+        ft = _FT[self.fit_type_combo.currentIndex()]
         self.node_specs[n.id] = {
-            "type":          "fitting",
-            "fitting_type":  ft,
-            "Di_str":        self.fit_bend_Di.edit.text().strip(),
-            "Di_unit":       self.fit_bend_Di.combo.currentText(),
-            "angle_str":     self.fit_bend_angle.text().strip(),
-            "bend_dias_str": self.fit_bend_dias.text().strip(),
-            "Di_US_str":     self.fit_ce_Di_US.edit.text().strip(),
-            "Di_US_unit":    self.fit_ce_Di_US.combo.currentText(),
-            "Di_DS_str":     self.fit_ce_Di_DS.edit.text().strip(),
-            "Di_DS_unit":    self.fit_ce_Di_DS.combo.currentText(),
+            "type":                  "fitting",
+            "fitting_type":          ft,
+            "Di_str":                self.fit_bend_Di.edit.text().strip(),
+            "Di_unit":               self.fit_bend_Di.combo.currentText(),
+            "angle_str":             self.fit_bend_angle.text().strip(),
+            "bend_dias_str":         self.fit_bend_dias.text().strip(),
+            "Di_US_str":             self.fit_ce_Di_US.edit.text().strip(),
+            "Di_US_unit":            self.fit_ce_Di_US.combo.currentText(),
+            "Di_DS_str":             self.fit_ce_Di_DS.edit.text().strip(),
+            "Di_DS_unit":            self.fit_ce_Di_DS.combo.currentText(),
+            "orif_Di_str":           self.fit_orif_Di.edit.text().strip(),
+            "orif_Di_unit":          self.fit_orif_Di.combo.currentText(),
+            "orif_Do_str":           self.fit_orif_Do.edit.text().strip(),
+            "orif_Do_unit":          self.fit_orif_Do.combo.currentText(),
+            "orif_taps":             self.fit_orif_taps.currentText(),
+            "orif_Cd_override_str":  self.fit_orif_Cd.text().strip(),
         }
         self.editor_box.setTitle(f"Selected node: {n.name()}  [Fitting]")
 
@@ -1635,9 +1747,14 @@ class NetworkScreen(QWidget):
         self._solve_btn.setEnabled(False)
         try:
             try:
-                fluid  = self._build_fluid()
-                net    = self._build_network()
-                result = self._solve_network(net, fluid)
+                # Capture any UserWarnings the solver emits (e.g. node /
+                # segment elevation mismatches) so we can surface them in
+                # the GUI rather than letting them disappear into stderr.
+                with warnings.catch_warnings(record=True) as caught:
+                    warnings.simplefilter("always")
+                    fluid  = self._build_fluid()
+                    net    = self._build_network()
+                    result = self._solve_network(net, fluid)
             except Exception as e:
                 dialogs.critical(
                     self, "Solve failed",
@@ -1645,6 +1762,9 @@ class NetworkScreen(QWidget):
                 )
                 return
             self._render_results(net, result)
+            if caught:
+                msg = "\n\n".join(str(w.message) for w in caught)
+                dialogs.warning(self, "Solve warnings", msg)
         finally:
             self._solve_btn.setEnabled(True)
 
@@ -1928,6 +2048,13 @@ class NetworkScreen(QWidget):
         kwargs["elevation"] = ureg.Quantity(
             float(elev_str), U.to_pint(spec.get("elev_unit", "ft")),
         )
+        # Optional node diameter for Source/Sink and Junction.  Blank
+        # means "let the solver default from connected components".
+        D_str = spec.get("D_str", "").strip()
+        if D_str and t in ("source_sink", "junction"):
+            kwargs["diameter"] = ureg.Quantity(
+                float(D_str), U.to_pint(spec.get("D_unit", "inch")),
+            )
         # Subclass hook: e.g. compressible adds T to source/sink boundaries.
         kwargs.update(self._extra_kwargs_for_boundary(spec, node_name))
         return kwargs
@@ -2036,6 +2163,34 @@ class NetworkScreen(QWidget):
                 Di=Di_q,
                 ang_deg=float(angle_str),
                 bend_dias=float(bend_dias_str),
+                name=node.name(),
+            )
+        elif ft == "orifice":
+            Di_str = spec.get("orif_Di_str", "").strip()
+            Do_str = spec.get("orif_Do_str", "").strip()
+            if not Di_str or not Do_str:
+                raise ValueError(
+                    f"Fitting '{node.name()}': orifice pipe ID and bore are required."
+                )
+            Di_q = ureg.Quantity(float(Di_str),
+                                 U.to_pint(spec.get("orif_Di_unit", "inch")))
+            Do_q = ureg.Quantity(float(Do_str),
+                                 U.to_pint(spec.get("orif_Do_unit", "inch")))
+            cd_str = spec.get("orif_Cd_override_str", "").strip()
+            if cd_str:
+                try:
+                    Cd_override = float(cd_str)
+                except ValueError:
+                    raise ValueError(
+                        f"Fitting '{node.name()}': Cd override must be a number."
+                    )
+            else:
+                Cd_override = None
+            return self.ORIFICE_CLS(
+                Di=Di_q,
+                Do=Do_q,
+                taps=spec.get("orif_taps", "corner"),
+                Cd_override=Cd_override,
                 name=node.name(),
             )
         else:

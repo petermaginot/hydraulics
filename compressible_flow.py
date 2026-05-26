@@ -102,6 +102,7 @@ import numpy as np
 from fluids.friction import friction_factor as fluids_friction_factor
 from fluids.core import Reynolds as fluids_Reynolds
 import fluids.fittings
+import fluids.flow_meter
 import CoolProp.CoolProp as CP
 from CoolProp.CoolProp import AbstractState
 import composition
@@ -111,6 +112,7 @@ from component_classes import (
     Base_Contraction_Expansion,
     Base_Valve,
     Base_CheckValve,
+    Base_Orifice,
     downsample_profile,
     ureg,
 )
@@ -607,6 +609,41 @@ class Contraction_Expansion(Base_Contraction_Expansion):
         compressible_changing_area_K(fs, A_DS, K)
 
 
+# ---------------------------------------------------------------------------
+# Orifice -- compressible child class
+# ---------------------------------------------------------------------------
+
+class Orifice(Base_Orifice):
+    """Square-edged concentric orifice plate, compressible (gas) flow.
+
+    Inherits geometry storage and validation from Base_Orifice.  Delegates
+    all physics to compressible_orifice().
+
+    Constructor arguments are identical to Base_Orifice:
+        Di          : pint Quantity or float (m if float).  Pipe inner diameter.
+        Do          : pint Quantity or float (m if float).  Orifice bore diameter.
+        taps        : str.  Tap type: 'corner', 'D and D/2', or 'flange'.
+        Cd_override : float or None.  Fixed Cd; bypasses the RHG correlation.
+    """
+
+    def dP_dT(self, fs):
+        """Outlet conditions for a compressible fluid passing through the orifice.
+
+        Absorbs any inlet-area discontinuity isentropically, then delegates
+        to compressible_orifice().  fs.A is unchanged on return.
+
+        Args:
+            fs : FlowState at the upstream connection (static).  fs.AS must
+                 be at the inlet (P, T); mutated in place to outlet state.
+
+        Returns:
+            None.  fs is mutated in place.
+        """
+        A_pipe = math.pi * self.Di_si ** 2 / 4.0
+        _area_match(fs, A_pipe)
+        compressible_orifice(fs, self.Di_si, self.Do_si, self.taps, self.Cd_override)
+
+
 # downsample_profile is defined in component_classes and imported above.
 
 # ---------------------------------------------------------------------------
@@ -961,7 +998,7 @@ def _ideal_gas_G_max(AS):
 
     No EOS update: uses ideal-gas Cp/Cv (or real-gas Cp as fallback) and
     molar mass only. Used as a cheap pre-screen to avoid the rigorous
-    Maytal march on the common (subsonic-by-a-lot) path.
+    check on the common (subsonic-by-a-lot) path.
 
         G_id = P0 * sqrt(gamma / (R_s * T0))
                * (2/(gamma+1))^((gamma+1)/(2*(gamma-1)))
@@ -989,12 +1026,17 @@ def _ideal_gas_G_max(AS):
 
 
 def choked_mass_flux(fs, A_throat, A_outlet=None, n_grid=40):
-    """Real-gas choked mass flow through a throat of area A_throat.
+    """Calcualtes Real-gas choked mass flow through a throat of area A_throat
+    by isentropically reducing pressure until the calculated flow state velocity
+    at the throat area equals the speed of sound at the throat conditions. 
+    CoolProp's Helmholz equation of state (HEOS) model doesn't handle pressure + 
+    specific entropy as inputs for mixtures, so this function runs a solver
+    that varies the temperature to find isentropic roots.
 
-    Uses the Maytal isentropic march (Cryogenics 46(1): 21-29, 2006) with
-    (P, T) + entropy-root EOS updates so it is safe for HEOS mixtures
-    (CoolProp's PSmass_INPUTS is unreliable for multicomponent fluids).
-    The throat state is located where u = sqrt(2*(h0 - h)) equals the
+    Energy balance: Process is adiabatic so stagnation enthalpy is conserved
+    Stagnation enthalpy = h0 = h_in+v_in^2/2 =  h_out+v_out^2/2
+
+    The throat state is located where v = sqrt(2*(h0 - h)) equals the
     local speed of sound a along the constant-s isentrope from the inlet
     stagnation state.
 
@@ -1009,10 +1051,7 @@ def choked_mass_flux(fs, A_throat, A_outlet=None, n_grid=40):
                      is mutated in place during the march and left at the
                      component outlet state on return. The stagnation
                      reference enthalpy h0 = fs.h_stagnation = h_static +
-                     0.5 * v_in**2 is built from the static state plus
-                     fs.v -- this is the bit that was previously broken
-                     when callers passed AS at static but the function
-                     read AS.hmass() as if it were stagnation.
+                     0.5 * v_in**2 is built from the static state plus fs.v
         A_throat   : float, throat area [m^2].
         A_outlet   : float or None, component outlet area [m^2]. If None
                      or equal to A_throat, no post-throat recovery is
@@ -1044,10 +1083,7 @@ def choked_mass_flux(fs, A_throat, A_outlet=None, n_grid=40):
 
     P_in = AS.p()
     T_in = AS.T()
-    # True stagnation enthalpy: h_static + v_in**2/2.  The previous
-    # implementation took AS.hmass() directly and labeled it h0, which
-    # silently treated the static state as stagnation -- the cross-
-    # cutting bug fix is this single line.
+    # True stagnation enthalpy: h_static + v_in**2/2. 
     h0 = fs.h_stagnation
     s0 = AS.smass()         # entropy unchanged by KE: static == stagnation
     # Aliases preserved for the inner closures below.
@@ -1055,7 +1091,7 @@ def choked_mass_flux(fs, A_throat, A_outlet=None, n_grid=40):
     T0 = T_in
 
     def state_at_P(P, T_seed):
-        """Advance AS to (P, T_on_isentrope), return (h, rho, u, a, T).
+        """Advance AS to (P, T_on_isentrope), return (h, rho, v, a, T).
 
         T_hi is fixed at T0 (isentropic expansion from stagnation can only
         cool the gas, so T0 is always a safe upper bound for s(P, T) = s0).
@@ -1072,7 +1108,7 @@ def choked_mass_flux(fs, A_throat, A_outlet=None, n_grid=40):
         )
         h   = AS.hmass()
         rho = AS.rhomass()
-        u   = math.sqrt(max(0.0, 2.0 * (h0 - h)))
+        v   = math.sqrt(max(0.0, 2.0 * (h0 - h)))
 
         # Analytic speed of sound. CoolProp issue #1836 returns 0 inside
         # the two-phase dome on some HEOS backends; fall back to a
@@ -1099,7 +1135,7 @@ def choked_mass_flux(fs, A_throat, A_outlet=None, n_grid=40):
                 T_cricondentherm, P_cricondenbar, T_critical, P_critical,
             )
             a = math.sqrt(2.0 * dP / max(rho_p - rho_m, 1e-30))
-        return h, rho, u, a, T
+        return h, rho, v, a, T
 
     # Coarse log-spaced grid: choke usually lands at P/P0 in [0.3, 0.6],
     # but can dip below 0.3 for high-gamma fluids or near-critical inlets.
@@ -1111,8 +1147,8 @@ def choked_mass_flux(fs, A_throat, A_outlet=None, n_grid=40):
     P_bracket_lo, P_bracket_hi = None, None
     T_seed_at_lo = T0
     for P in P_grid:
-        _, _, u, a, T_seed = state_at_P(P, T_seed)
-        f = u - a
+        _, _, v, a, T_seed = state_at_P(P, T_seed)
+        f = v - a
         if f_prev is not None and f_prev * f < 0:
             P_bracket_lo = P
             P_bracket_hi = P_prev
@@ -1126,21 +1162,21 @@ def choked_mass_flux(fs, A_throat, A_outlet=None, n_grid=40):
             f"P in [{0.05*P0:.4g}, {0.99*P0:.4g}] Pa at this stagnation state."
         )
 
-    # Brent on (u - a) over the bracket. Inner T-root-solve uses T0 as
+    # Brent on (v - a) over the bracket. Inner T-root-solve uses T0 as
     # the upper bracket (state_at_P enforces this); we only need to
     # forward a warm T_seed for the lower-bracket initialization.
     T_seed_holder = [T_seed_at_lo]
 
     def f_root(P):
-        _, _, u, a, T = state_at_P(P, T_seed_holder[0])
+        _, _, v, a, T = state_at_P(P, T_seed_holder[0])
         T_seed_holder[0] = T
-        return u - a
+        return v - a
 
     P_star = brentq(
         f_root, P_bracket_lo, P_bracket_hi,
         xtol=max(1.0, 1e-4 * P0), rtol=1e-6,
     )
-    h_star, rho_star, u_star, a_star, T_star = state_at_P(P_star, T_seed_holder[0])
+    h_star, rho_star, v_star, a_star, T_star = state_at_P(P_star, T_seed_holder[0])
     mdot_choked = rho_star * a_star * A_throat
 
     # Default: no post-throat recovery. AS left at throat state.
@@ -1158,7 +1194,7 @@ def choked_mass_flux(fs, A_throat, A_outlet=None, n_grid=40):
         v_out = mdot_choked / (rho * A_outlet)
         return h + 0.5 * v_out * v_out - h0
 
-    # At P = P_star: v_out < u_star (A_outlet > A_throat, rho similar) so
+    # At P = P_star: v_out < v_star (A_outlet > A_throat, rho similar) so
     # residual is negative. At P -> P0: rho -> rho0, v_out -> small,
     # h -> h0 so residual -> 0 from above. Bracket [P_star, ~0.999*P0].
     P_hi_recov = 0.999 * P0
@@ -1177,6 +1213,163 @@ def choked_mass_flux(fs, A_throat, A_outlet=None, n_grid=40):
     _, _, _, _, T_out = state_at_P(P_out, T_star)
     return mdot_choked, P_star, T_star, rho_star, P_out, T_out
 
+def compressible_orifice(fs, Di, Do, taps, Cd_override=None):
+    """Outlet conditions for a compressible fluid passing through a square-edged
+    concentric orifice plate. 
+
+    Assumes fs.A already equals the pipe area (math.pi * Di**2 / 4).  Callers
+    that cannot guarantee this should call _area_match(fs, A_pipe) first (the
+    Orifice.dP_dT wrapper does exactly that).
+
+    Algorithm (layered solve):
+      1. Throat-area choke pre-screen: cheap ideal-gas G_max bound at the
+         effective throat (A_eff = Cd * A_bore); if exceeded, run the
+         rigorous choked_mass_flux() and raise
+         ChokedFlowError when mdot >= mdot_choked.  Mirrors the gate used
+         by compressible_changing_area_K / compressible_K.
+      2. Python fluids library's ISO 5167 differential_pressure_meter_solver gives a fast tap-pressure
+         estimate from (P_in, mdot) for the subsonic path.
+      3. Small-dP (< 5 % of P_in): ISO 5167 result is used directly.
+      4. Large-dP / supercritical: fluids library's ideal-gas expansibility biases the
+         result; replace with the real-gas throat state from
+         compressible_changing_area_K(fs, A_eff, K=0).
+      5. fluids.dP_orifice converts the tap dP to permanent (non-recoverable) dP.
+      6. Newton on T to enforce stagnation-enthalpy conservation.
+
+    Args:
+        fs          : FlowState at the upstream pipe connection (static, mutated
+                      in place).  fs.AS must be at (P_in, T_in); fs.A must equal
+                      the upstream pipe area.
+        Di          : float, pipe inner diameter [m].
+        Do          : float, orifice bore diameter [m].
+        taps        : str, tap type passed to the ISO 5167 / RHG correlations
+                      ('corner', 'D and D/2', or 'flange').
+        Cd_override : float or None.  When given, used as the discharge
+                      coefficient directly, bypassing the RHG correlation.
+
+    Returns:
+        None.  fs is mutated in place (fs.AS advanced to outlet static state,
+        fs.A unchanged).
+
+    Raises:
+        ChokedFlowError : when fs.mdot >= the choked mass flow rate.
+    """
+    _LARGE_DP_FRAC = 0.05       # >5% dP triggers the rigorous isentropic expansion path
+    _T_ITER_MAX    = 8          # Newton iterations on outlet T
+    _T_ABS_TOL     = 1.0        # J/kg
+    _T_REL_TOL     = 1.0e-9
+
+    A_pipe = math.pi * Di ** 2 / 4.0
+    A_bore = math.pi * Do ** 2 / 4.0
+
+    P_in    = fs.P
+    T_in    = fs.T
+    rho_in  = fs.rho
+    v_in    = fs.v
+    h_static_in   = fs.AS.hmass()
+    h_stagnation  = h_static_in + 0.5 * v_in ** 2
+
+    try:
+        mu = fs.AS.viscosity()
+    except (ValueError, RuntimeError):
+        mu = viscosity_LGE(T_in, fs.AS.molar_mass(), rho_in)
+
+    try:
+        k_iso = fs.AS.cpmass() / fs.AS.cvmass()
+    except (ValueError, RuntimeError):
+        k_iso = 1.3   # plausible default for hydrocarbon mixtures
+
+    if Cd_override is not None:
+        Cd = Cd_override
+    else:
+        Cd = fluids.flow_meter.C_Reader_Harris_Gallagher(
+            D=Di, Do=Do, rho=rho_in, mu=mu, m=fs.mdot, taps=taps,
+        )
+
+    A_eff = Cd * A_bore
+
+    # ---- 1. Choke pre-screen at the orifice throat (vena contracta).
+    # Mirrors compressible_changing_area_K: cheap ideal-gas G_max bound at
+    # the effective throat area, then escalate to the rigorous real-gas
+    # isentropic expansion if the bound is exceeded.  The ISO tap-pressure / ideal
+    # critical-ratio comparison used previously compared two pressures at
+    # different stations (tap vs. throat) and missed choke for real gases
+    # whenever tap-side recovery kept P_2_tap above the throat critical
+    # ratio.
+    if fs.mdot > 0.5 * _ideal_gas_G_max(fs.AS) * A_eff:
+        try:
+            mdot_choked_real, P_t, T_t, rho_t, P_o, T_o = choked_mass_flux(
+                fs, A_eff, A_outlet=A_pipe,
+            )
+        except _NoChokeBracketError:
+            _safe_flowstate_update_PT(fs, P_in, T_in)
+        else:
+            if fs.mdot >= mdot_choked_real:
+                fs.A = A_pipe
+                raise ChokedFlowError(
+                    mdot_choked_real, P_t, T_t, rho_t, P_o, T_o,
+                )
+            _safe_flowstate_update_PT(fs, P_in, T_in)
+
+    # ---- 2. ISO 5167 cheap initial guess for the tap pressure (subsonic).
+    # The solver brentq's over P2 in (0.5*P1, P1); if the requested
+    # mdot is already past its bracket, it raises NotBoundedError (which
+    # inherits from Exception, not ValueError).  Catch broadly and fall
+    # through to the large-dP branch below.
+    try:
+        P_2_tap_iso = fluids.flow_meter.differential_pressure_meter_solver(
+            D=Di, rho=rho_in, mu=mu, k=k_iso, D2=Do,
+            P1=P_in, m=fs.mdot,
+            meter_type="ISO 5167 orifice", taps=taps,
+            C_specified=Cd,
+        )
+    except Exception:
+        P_2_tap_iso = None   # ISO solver hit its own bracket limit
+
+    # ---- 3 & 4. Select the tap pressure source by dP magnitude.
+    dP_iso_est = (P_in - P_2_tap_iso) if P_2_tap_iso is not None else P_in
+    if (P_2_tap_iso is not None
+            and dP_iso_est < _LARGE_DP_FRAC * P_in):
+        # Small-dP regime: ISO 5167 is accurate enough.
+        P_2_tap = P_2_tap_iso
+    else:
+        # Large-dP / supercritical regime: get the real-gas throat
+        # state via the isentropic march that backs
+        # compressible_changing_area_K(K=0).  Internally pre-screens
+        # for choke via choked_mass_flux; if it raises, propagate.
+        try:
+            compressible_changing_area_K(fs, A_eff, K=0.0)
+        except ChokedFlowError:
+            fs.A = A_pipe
+            raise
+        P_2_tap = float(fs.AS.p())
+        _safe_flowstate_update_PT(fs, P_in, T_in)
+        fs.A = A_pipe
+
+    # ---- 5. Permanent dP (non-recoverable) from the standard formula.
+    dP_perm  = fluids.flow_meter.dP_orifice(
+        D=Di, Do=Do, P1=P_in, P2=P_2_tap, C=Cd,
+    )
+    walked_P = P_in - dP_perm
+
+    # ---- 6. Adiabatic energy balance: stagnation enthalpy conserved.
+    # v_out is recomputed each iteration from the current rho_out so the
+    # residual is on full h_stagnation. Phase-hinted PT updates keep this robust for
+    # mixtures and supercritical fluids.
+    T_out = T_in
+    for _ in range(_T_ITER_MAX):
+        _safe_flowstate_update_PT(fs, walked_P, T_out)
+        v_out  = fs.v
+        h_calc = fs.AS.hmass() + 0.5 * v_out ** 2
+        err    = h_calc - h_stagnation
+        if abs(err) <= max(_T_ABS_TOL, _T_REL_TOL * abs(h_stagnation)):
+            return
+        cp = fs.AS.cpmass()
+        if cp <= 0.0:
+            break
+        T_out -= err / cp
+    # Fell out without strict convergence -- leave AS at the last
+    # update (PT_INPUTS already applied inside the loop).
 
 def compressible_changing_area(fs, A_out):
     """Isentropic pressure and temperature for an ideal gas passing through
@@ -1391,8 +1584,7 @@ def compressible_changing_area_K(fs, A_out, K=0.0):
     # ------------------------------------------------------------------
     # Choked-flow pre-screen.  Ideal-gas G_max is a computationally cheap analytical
     # upper bound on the real-gas choked flux at this stagnation state,
-    # so anything below ~50% of it cannot be choked and we skip the
-    # ~50-200 ms Maytal march entirely.  Above the threshold, run the
+    # so anything below ~50% of it cannot be choked.  Above the threshold, run the
     # rigorous real-gas march at A_throat = min(A_in, A_out): on choke,
     # raise ChokedFlowError with AS already at the (recovered) outlet
     # state; otherwise restore AS to inlet and continue to the subsonic
@@ -1405,7 +1597,7 @@ def compressible_changing_area_K(fs, A_out, K=0.0):
                 fs, A_throat_pre, A_outlet=A_out,
             )
         except _NoChokeBracketError:
-            # Maytal grid scan found no Mach=1 bracket -- treat as not
+            # Grid scan found no Mach=1 bracket -- treat as not
             # choked.  AS may have wandered along the isentrope during
             # the scan; restore to inlet.  Real CoolProp / numerical
             # failures propagate (the bare RuntimeError catch would
@@ -1587,7 +1779,7 @@ def compressible_K(fs, K, dPmax=0.05):
 
     #Check if calculated dP is greater than maximum or if near choked conditions (denominator < 0.5) If it is, switch to a more rigorous method.
     # The fallback path (compressible_changing_area_K) runs its own choke
-    # pre-screen, so we do NOT run one here -- otherwise the Maytal march
+    # pre-screen, so we do NOT run one here -- otherwise the computationally intensive isentropic choke finding function
     # would execute twice for the same inlet state.
     if (abs(dP) / P_in > dPmax) or (denominator < 0.5):
         compressible_changing_area_K(fs, A_out=flow_area, K=K)
@@ -1597,7 +1789,7 @@ def compressible_K(fs, K, dPmax=0.05):
         # ------------------------------------------------------------------
         # Choked-flow pre-screen (fast-path branch only).  Cheap ideal-gas
         # G_max is an upper bound on the real-gas value; mdot below ~50% of
-        # it cannot be choked, so we skip the ~50-200 ms Maytal march.  For
+        # it cannot be choked, so we skip the ~50-200 ms isentropic iteration.  For
         # a constant-area fitting the throat equals the outlet, so no
         # post-throat recovery is needed and AS lands at the throat ==
         # outlet state on a choke.
@@ -1614,7 +1806,7 @@ def compressible_K(fs, K, dPmax=0.05):
                     fs, flow_area, A_outlet=flow_area,
                 )
             except _NoChokeBracketError:
-                # Maytal march found no Mach=1 bracket in the accessible
+                # Iteration found no Mach=1 bracket in the accessible
                 # isentrope -- treat as not choked.  AS may have wandered
                 # along the isentrope during the scan; restore to inlet.
                 _safe_flowstate_update_PT(fs, P_in, T_in)

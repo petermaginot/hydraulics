@@ -11,6 +11,25 @@ Import this module exactly once, before importing NodeGraphQt.
 import sys
 import types
 
+from PySide6.QtCore import QtMsgType, qInstallMessageHandler
+
+
+def _qt_message_handler(msg_type, context, message):
+    # NodeGraphQt 0.6.44 uses QMouseEvent.pos() which Qt 6 deprecated in
+    # favour of QMouseEvent.position().  The method still works; suppress the
+    # noise until NodeGraphQt is updated upstream.
+    if "QMouseEvent.pos() const" in message and "deprecated" in message:
+        return
+    if msg_type == QtMsgType.QtWarningMsg:
+        print(f"Qt warning: {message}", file=sys.stderr)
+    elif msg_type == QtMsgType.QtCriticalMsg:
+        print(f"Qt critical: {message}", file=sys.stderr)
+    elif msg_type == QtMsgType.QtFatalMsg:
+        print(f"Qt fatal: {message}", file=sys.stderr)
+
+
+qInstallMessageHandler(_qt_message_handler)
+
 
 def _install_distutils_shim():
     if "distutils.version" in sys.modules:
