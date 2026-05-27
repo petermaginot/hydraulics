@@ -948,9 +948,18 @@ class Base_Valve:
              Must be positive.
         Kv : float, optional.  Metric flow coefficient [m^3/h/bar^0.5].
              Must be positive.
+        minimum_diameter : pint Quantity or float (m if float), optional.
+             Geometric minimum flow cross-section inside the trim (seat
+             diameter for globe, port for ball, etc.).  Sharpens the
+             compressible-flow choke check by giving the real throat area
+             rather than the pipe area.  Geometric only -- does not capture
+             pressure-recovery (F_L) effects, so valves with strong recovery
+             may choke earlier than this predicts.  None preserves the
+             legacy loose pipe-area check.
     """
 
-    def __init__(self, Di, K=None, name=None, Cv=None, Kv=None):
+    def __init__(self, Di, K=None, name=None, Cv=None, Kv=None,
+                 minimum_diameter=None):
         self.name  = name
         self.Di_si = _to_si(Di, "m")
 
@@ -984,6 +993,48 @@ class Base_Valve:
                 f"{self.__class__.__name__}: K must be >= 0."
             )
 
+        self.D_min_si = _to_si(minimum_diameter, "m") if minimum_diameter is not None else None
+        if self.D_min_si is not None:
+            if self.D_min_si <= 0.0:
+                raise ValueError(
+                    f"{self.__class__.__name__}: minimum_diameter must be positive."
+                )
+            if self.D_min_si > self.Di_si:
+                raise ValueError(
+                    f"{self.__class__.__name__}: minimum_diameter "
+                    f"({self.D_min_si:.4g} m) cannot exceed pipe Di "
+                    f"({self.Di_si:.4g} m)."
+                )
+
+        # Effective discharge coefficient implied by (K, D_min, Di).  From
+        # dP = K*rho*v_pipe^2/2 and mdot = Cd*A_min*sqrt(2*rho*dP):
+        #     Cd_eff = (Di/D_min)^2 / sqrt(K)
+        # Useful only as an input-sanity diagnostic; the actual choke check
+        # uses A_throat directly and does not consume Cd_eff.
+        self.Cd_eff = None
+        if self.D_min_si is not None and self.K > 0.0:
+            self.Cd_eff = (self.Di_si / self.D_min_si) ** 2 / math.sqrt(self.K)
+            if self.Cd_eff > 1.05:
+                warnings.warn(
+                    f"{self.__class__.__name__}: implied Cd_eff="
+                    f"{self.Cd_eff:.3f} > 1.05 from (K={self.K:.3g}, "
+                    f"Di={self.Di_si:.4g} m, D_min={self.D_min_si:.4g} m).  "
+                    f"minimum_diameter is likely too small for the specified K.",
+                    UserWarning,
+                    stacklevel=2,
+                )
+            elif self.Cd_eff < 0.3:
+                warnings.warn(
+                    f"{self.__class__.__name__}: implied Cd_eff="
+                    f"{self.Cd_eff:.3f} < 0.3 from (K={self.K:.3g}, "
+                    f"Di={self.Di_si:.4g} m, D_min={self.D_min_si:.4g} m).  "
+                    f"K seems high for the specified minimum_diameter; the "
+                    f"trim may have significant downstream pressure recovery "
+                    f"(F_L < 1) that this geometric check cannot model.",
+                    UserWarning,
+                    stacklevel=2,
+                )
+
     def __repr__(self):
         Di_q = ureg.Quantity(self.Di_si, "m")
         extra = ""
@@ -991,6 +1042,9 @@ class Base_Valve:
             extra = f", Cv={self.Cv:.3f}"
         elif self.Kv is not None:
             extra = f", Kv={self.Kv:.3f}"
+        if self.D_min_si is not None:
+            Dmin_q = ureg.Quantity(self.D_min_si, "m")
+            extra += f", D_min={Dmin_q.to('inch'):.4f~P}"
         return (
             f"{self.__class__.__name__}("
             f"Di={Di_q.to('inch'):.4f~P}, "
@@ -1016,6 +1070,8 @@ class Base_Valve:
             d["Cv"] = self.Cv
         if self.Kv is not None:
             d["Kv"] = self.Kv
+        if self.D_min_si is not None:
+            d["D_min_m"] = float(self.D_min_si)
         return d
 
     @classmethod
@@ -1025,13 +1081,17 @@ class Base_Valve:
                 f"{cls.__name__}.from_dict: expected kind='valve', "
                 f"got {payload.get('kind')!r}."
             )
+        kwargs = {
+            "Di":   payload["Di_m"],
+            "name": payload.get("name"),
+        }
+        if "D_min_m" in payload:
+            kwargs["minimum_diameter"] = payload["D_min_m"]
         if "Cv" in payload:
-            return cls(Di=payload["Di_m"], Cv=payload["Cv"],
-                       name=payload.get("name"))
+            return cls(Cv=payload["Cv"], **kwargs)
         if "Kv" in payload:
-            return cls(Di=payload["Di_m"], Kv=payload["Kv"],
-                       name=payload.get("name"))
-        return cls(Di=payload["Di_m"], K=payload["K"], name=payload.get("name"))
+            return cls(Kv=payload["Kv"], **kwargs)
+        return cls(K=payload["K"], **kwargs)
 
 
 # ---------------------------------------------------------------------------
@@ -1050,11 +1110,16 @@ class Base_CheckValve:
         Di : pint Quantity or float (m if float).  Pipe inner diameter used
              as the velocity-head reference for dP.  Must be positive.
         K  : float.  Forward-flow resistance coefficient.  Must be >= 0.
+        minimum_diameter : pint Quantity or float (m if float), optional.
+             Geometric minimum flow cross-section inside the trim.  See
+             Base_Valve docstring for details and caveats.  Used only on
+             the forward-flow path; the sealing-K reverse-flow shadow
+             ignores it.
     """
 
     check_valve = True
 
-    def __init__(self, Di, K, name=None):
+    def __init__(self, Di, K, name=None, minimum_diameter=None):
         self.name  = name
         self.Di_si = _to_si(Di, "m")
         self.K     = float(K)
@@ -1068,12 +1133,54 @@ class Base_CheckValve:
                 f"{self.__class__.__name__}: K must be >= 0."
             )
 
+        self.D_min_si = _to_si(minimum_diameter, "m") if minimum_diameter is not None else None
+        if self.D_min_si is not None:
+            if self.D_min_si <= 0.0:
+                raise ValueError(
+                    f"{self.__class__.__name__}: minimum_diameter must be positive."
+                )
+            if self.D_min_si > self.Di_si:
+                raise ValueError(
+                    f"{self.__class__.__name__}: minimum_diameter "
+                    f"({self.D_min_si:.4g} m) cannot exceed pipe Di "
+                    f"({self.Di_si:.4g} m)."
+                )
+
+        # See Base_Valve for the derivation of Cd_eff.
+        self.Cd_eff = None
+        if self.D_min_si is not None and self.K > 0.0:
+            self.Cd_eff = (self.Di_si / self.D_min_si) ** 2 / math.sqrt(self.K)
+            if self.Cd_eff > 1.05:
+                warnings.warn(
+                    f"{self.__class__.__name__}: implied Cd_eff="
+                    f"{self.Cd_eff:.3f} > 1.05 from (K={self.K:.3g}, "
+                    f"Di={self.Di_si:.4g} m, D_min={self.D_min_si:.4g} m).  "
+                    f"minimum_diameter is likely too small for the specified K.",
+                    UserWarning,
+                    stacklevel=2,
+                )
+            elif self.Cd_eff < 0.3:
+                warnings.warn(
+                    f"{self.__class__.__name__}: implied Cd_eff="
+                    f"{self.Cd_eff:.3f} < 0.3 from (K={self.K:.3g}, "
+                    f"Di={self.Di_si:.4g} m, D_min={self.D_min_si:.4g} m).  "
+                    f"K seems high for the specified minimum_diameter; the "
+                    f"trim may have significant downstream pressure recovery "
+                    f"(F_L < 1) that this geometric check cannot model.",
+                    UserWarning,
+                    stacklevel=2,
+                )
+
     def __repr__(self):
         Di_q = ureg.Quantity(self.Di_si, "m")
+        extra = ""
+        if self.D_min_si is not None:
+            Dmin_q = ureg.Quantity(self.D_min_si, "m")
+            extra = f", D_min={Dmin_q.to('inch'):.4f~P}"
         return (
             f"{self.__class__.__name__}("
             f"Di={Di_q.to('inch'):.4f~P}, "
-            f"K_fwd={self.K:.4f})"
+            f"K_fwd={self.K:.4f}{extra})"
         )
 
     @property
@@ -1085,12 +1192,15 @@ class Base_CheckValve:
         return math.pi * self.Di_si ** 2 / 4.0
 
     def to_dict(self):
-        return {
+        d = {
             "kind": "check_valve",
             "name": self.name,
             "Di_m": float(self.Di_si),
             "K":    float(self.K),
         }
+        if self.D_min_si is not None:
+            d["D_min_m"] = float(self.D_min_si)
+        return d
 
     @classmethod
     def from_dict(cls, payload):
@@ -1099,7 +1209,14 @@ class Base_CheckValve:
                 f"{cls.__name__}.from_dict: expected kind='check_valve', "
                 f"got {payload.get('kind')!r}."
             )
-        return cls(Di=payload["Di_m"], K=payload["K"], name=payload.get("name"))
+        kwargs = {
+            "Di":   payload["Di_m"],
+            "K":    payload["K"],
+            "name": payload.get("name"),
+        }
+        if "D_min_m" in payload:
+            kwargs["minimum_diameter"] = payload["D_min_m"]
+        return cls(**kwargs)
 
 
 # ---------------------------------------------------------------------------

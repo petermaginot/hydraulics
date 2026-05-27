@@ -97,14 +97,31 @@ feedback in the denominator strengthens nonlinearly as the gas expands.
   raised when the grid scan finds no Mach=1 — caught and treated as "not
   choked" by the pre-screens; genuine CoolProp / numerical failures
   propagate. Substantially addresses item 5 (the denominator singularity
-  is now caught before being evaluated). **Stage-1 caveat (open)**: the
-  pre-screen uses `A_throat = flow_area = pipe area`, so for a valve
-  whose physical throat is much smaller, the check is loose — see R2.
+  is now caught before being evaluated). **Stage-1 caveat closed** by R2
+  below: `Valve` / `CheckValve` now accept `minimum_diameter` and route
+  it to `compressible_K(A_throat=...)`, which screens the trim throat
+  with recovery to the body area.
 
-- **R2 [medium].** Add an internal-throat / vena-contracta choke check. If
-  the user supplies x_T (or any equivalent geometric handle on internal area
-  ratio), test choke at the throat rather than the body outlet.  Required
-  to close the Stage-1 caveat in R1.5.
+- **R2 [✅ DONE for geometric throat; F_L recovery still open].** Added
+  `minimum_diameter` (geometric throat) on `Base_Valve` / `Base_CheckValve`.
+  When supplied, it flows through `Valve.dP_dT` / `CheckValve.dP_dT`
+  into `compressible_K` as a new `A_throat=` kwarg.  The throat-area
+  choke pre-screen is hoisted above the dP linearization so it fires
+  regardless of whether the fast (linearized) or slow
+  (`compressible_changing_area_K`) branch runs; `A_outlet` is set to
+  the body area so post-throat recovery is modelled.  At construction,
+  the implied `Cd_eff = (Di/D_min)^2 / sqrt(K)` is computed and a
+  `UserWarning` fires if it falls outside [0.3, 1.05] (impossible
+  throat at high end, F_L < 1 territory at low end).  Covered by
+  `test_valve_minimum_diameter_choke` in
+  [textbook_test_functions.py](textbook_test_functions.py): for a
+  methane-rich mixture at 20 bar / 300 K with `D_pipe = 2"`,
+  `D_min = 1"`, `K = 20`, `mdot = 4.5 kg/s`, the `minimum_diameter`-aware
+  valve raises `ChokedFlowError` at the trim (~1.94 kg/s clamp) while
+  the legacy pipe-area-only screen lets the flow pass silently.  **Open
+  follow-on**: the geometric throat alone cannot model strong
+  downstream pressure recovery (low `F_L`).  R3 (ISA-75.01 / IEC-60534
+  with explicit `x_T` or `F_L`) remains the next refinement.
 
 - **R3 [larger].** Switch the valve component to an ISA-75.01 / IEC-60534-2-1
   sizing model parameterized by Cv (or Kv) and x_T, with explicit choked-flow
@@ -299,8 +316,52 @@ the ODE becomes stiff.
 
 ### Recommendations (ordered by value / effort)
 
-- **R7 [cheap, high value].** Predictive Fanno-choke diagnostic at slice
-  inlet. Turns "failed to converge" hours into seconds-level diagnosis.
+- **R7 [✅ DONE].** Predictive ideal-gas choke diagnostic at
+  `Line_Segment.dP_dT` entry. Two branches selected by the
+  `isothermal` kwarg:
+
+  - *Adiabatic:* closed-form Fanno `fLmax/D` ("Fluid Mechanics for
+    Chemical Engineers, 2nd ed" §8.4.1 eq. 8.30, outlet `M=1`,
+    Darcy convention):
+
+        fLmax/D = (1 - M^2)/(k*M^2)
+                + (k+1)/(2k) * ln[(k+1)*M^2 / (2 + (k-1)*M^2)]
+
+    compared against the cumulative geometric integral
+    `Σ f_i · dL_i / D_h_i` along the profile.
+
+  - *Isothermal:* simplified long-pipeline form (§8.4.2 eqs. 8.31-8.33,
+    kinetic-energy term dropped per the textbook's "long pipeline"
+    assumption). Integrating `P·dP` at constant `T` with ideal-gas
+    `ρ` and allowing for varying `D` and `A`:
+
+        P1^2 - P2^2 = mdot^2 · (R_univ T / M_molar)
+                      · Σ f_i · dL_i / (D_h_i · A_i^2)
+
+    so a real `P2` requires `Σ f·dL/(D·A^2) < P1^2 · M / (mdot^2 RT)`.
+
+  Both branches integrate along the profile, so stepped/tapered
+  geometries are handled exactly under their respective ideal-gas
+  assumptions. Inlet `ρ`/`μ` and constant `mdot` keep the per-slice
+  Reynolds computation to a single `4·mdot/(π·D·μ)` evaluation; one
+  `fluids.friction.friction_factor` call per profile slice — orders of
+  magnitude lighter than a single `compressible_pipe_segment`
+  invocation.
+
+  Failure mode is `warnings.warn(UserWarning)`, never an exception:
+  real-gas behavior near the critical point or under strong heat
+  transfer can shift the actual choke point. Wrapped in a swallowing
+  `try/except` so the diagnostic can't block real evaluation. Skip
+  outside `0.01 < Ma_in < 0.98` (stagnant — no choke risk worth
+  warning; or already in the reactive `compressible_pipe_segment`
+  gate's territory). Helper lives at `_line_segment_choke_diagnostic`
+  in [compressible_flow.py](compressible_flow.py), called once at the
+  top of `Line_Segment.dP_dT` after `_area_match` and before the slice
+  loop. Covered by `test_line_segment_choke_diagnostic` in
+  [textbook_test_functions.py](textbook_test_functions.py):
+  methane-rich mix at 5 bar / 300 K, 1" Sch 40, `Ma_in≈0.2` — the
+  diagnostic fires on a 200 m segment (both adiabatic and isothermal)
+  and stays silent on a 5 m segment.
 - **R8 [cheap, high value].** Add Ma-change splitter metric (item 10). One
   extra divide per slice. Catches the dP/dL+energy blind spot.
 - **R9 [medium, broad win].** Upgrade integrator to RK2 / midpoint. Doubles
@@ -327,8 +388,11 @@ the ODE becomes stiff.
   all. In both cases the cheap predictive check (closed-form Fanno choke
   length; sigma = (P_1 - P_v)/dP) is far more actionable than waiting for
   the numerics to fail.  *Status: real-gas choked-flow detection for
-  fittings is implemented via `choked_mass_flux` (R1.5); predictive
-  Fanno-choke detection for pipe segments (R7) is still open.*
+  fittings is implemented via `choked_mass_flux` (R1.5); internal-throat
+  (vena contracta) choke check on valves is now wired through the new
+  `minimum_diameter` parameter (R2); predictive ideal-gas
+  Fanno / isothermal choke diagnostic for line segments now warns at
+  `Line_Segment.dP_dT` entry (R7).*
 
 - **The network walk is the natural enforcement point for both
   cavitation checks and the negative-pressure sanity floor.** Absolute

@@ -1,6 +1,6 @@
 
 References/
-___pycache___/
-gui/___pycache___/
-gui/screens/___pycache___/
-network_results_example/
+__pycache__/
+gui/__pycache__
+gui/screens/__pycache__/
+Derivation_images/Textbook_images/

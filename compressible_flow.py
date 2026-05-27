@@ -250,6 +250,117 @@ def _area_match(fs, A_target, tol=1e-6):
         compressible_changing_area_K(fs, A_target, K=0.0)
 
 
+def _line_segment_choke_diagnostic(fs, profile, roughness, isothermal, mu, name):
+    """Cheap ideal-gas predictive choke check at the start of
+    Line_Segment.dP_dT.  Emits a UserWarning if the segment is predicted
+    to choke before reaching its outlet; never raises.
+
+    Adiabatic branch: ideal-gas Fanno closed-form ("Fluid
+    Mechanics for Chemical Engineers, 2nd ed" by Noel de Nevers §8.4.1 eq. 8.30) at outlet
+    Mach=1, in Darcy convention:
+
+        fLmax/D = (1 - M^2)/(k*M^2)
+                + (k+1)/(2k) * ln[(k+1)*M^2 / (2 + (k-1)*M^2)]
+
+    compared against the cumulative geometric integral
+    Σ f_i * dL_i / D_h_i along the profile.
+
+    Isothermal branch: simplified long-pipeline form ("Fluid Mechanics
+    for Chemical Engineers, 2nd ed" by Noel de Nevers §8.4.2 eq. 8.33, kinetic-energy
+    term dropped per the textbook's "long pipeline" assumption).
+    Integrating P*dP at constant T and ideal-gas rho gives
+
+        P1^2 - P2^2 = mdot^2 * (R_univ T / M_molar)
+                      * Σ f_i * dL_i / (D_h_i * A_i^2)
+
+    so a real P2 requires cum_fL_over_DA2 < P1^2 * M_molar /
+    (mdot^2 * R_univ * T).
+
+    Best-effort: any internal failure is swallowed (the diagnostic must
+    never block a real evaluation).
+    """
+    try:
+        Ma_in = fs.Ma
+        # Skip stagnant or already-choked: the existing reactive gate
+        # in compressible_pipe_segment handles Ma >= 0.98 with a clear
+        # RuntimeError; stagnant flow has no choke risk worth warning.
+        if Ma_in <= 0.01 or Ma_in >= 0.98:
+            return
+
+        AS    = fs.AS
+        P_in  = AS.p()
+        T_in  = AS.T()
+        rho_in = AS.rhomass()
+        mdot  = fs.mdot
+        M_molar = AS.molar_mass()
+
+        # Ideal-gas gamma (mirror _ideal_gas_G_max): use Cp0 when
+        # available, fall back to real-gas Cp*M for HEOS mixtures.
+        R_univ = 8.31446261815324
+        try:
+            cp0 = AS.cp0molar()
+        except (ValueError, RuntimeError):
+            cp0 = AS.cpmass() * M_molar
+        k = cp0 / (cp0 - R_univ)   # ideal-gas Cp/Cv
+
+        # Viscosity: prefer caller's kwarg if supplied (matches
+        # compressible_pipe_segment's contract), else CoolProp/LGE.
+        mu_in = mu if mu is not None else _viscosity_or_LGE(AS, T_in, rho_in)
+
+        # Cumulative geometric integrals along the profile.  Inlet
+        # rho/mu held constant for the Re computation -- Re_i depends
+        # only on D_h_i since mdot is constant.
+        cum_fL_over_D    = 0.0
+        cum_fL_over_DA2  = 0.0
+        for i in range(len(profile) - 1):
+            dist_in,  _e_in,  D_h_in,  area_in  = profile[i]
+            dist_out, _e_out, _D_h_out, _a_out  = profile[i + 1]
+            dL_i = dist_out - dist_in
+            if dL_i <= 0.0 or D_h_in <= 0.0 or area_in <= 0.0:
+                continue
+            v_i  = mdot / (rho_in * area_in)
+            Re_i = fluids_Reynolds(V=v_i, D=D_h_in, rho=rho_in, mu=mu_in)
+            f_i  = fluids_friction_factor(Re=Re_i, eD=roughness / D_h_in)
+            cum_fL_over_D   += f_i * dL_i / D_h_in
+            cum_fL_over_DA2 += f_i * dL_i / (D_h_in * area_in * area_in)
+
+        if isothermal:
+            threshold = (P_in * P_in * M_molar
+                         / (mdot * mdot * R_univ * T_in))   # [m^-5]
+            if cum_fL_over_DA2 >= threshold:
+                warnings.warn(
+                    f"Line_Segment {name!r}: simplified isothermal "
+                    f"pipeline equation predicts no real outlet pressure "
+                    f"(cumulative f*dL/(D*A^2) = {cum_fL_over_DA2:.4g} m^-5 "
+                    f">= inlet-conditions limit {threshold:.4g} m^-5 at "
+                    f"P_in={P_in:.4g} Pa, T={T_in:.4g} K, mdot={mdot:.4g} "
+                    f"kg/s).  Real-gas behavior may differ; if integration "
+                    f"fails, isothermal-flow choking is the likely cause.",
+                    UserWarning, stacklevel=3,
+                )
+        else:
+            fLmax_over_D = (
+                (1.0 - Ma_in * Ma_in) / (k * Ma_in * Ma_in)
+                + (k + 1.0) / (2.0 * k)
+                  * math.log((k + 1.0) * Ma_in * Ma_in
+                             / (2.0 + (k - 1.0) * Ma_in * Ma_in))
+            )
+            if cum_fL_over_D >= fLmax_over_D:
+                warnings.warn(
+                    f"Line_Segment {name!r}: ideal-gas Fanno flow "
+                    f"predicts choke before segment end (cumulative "
+                    f"f*dL/D = {cum_fL_over_D:.4g} >= inlet-Mach limit "
+                    f"{fLmax_over_D:.4g} at Ma_in={Ma_in:.4f}, "
+                    f"gamma={k:.4f}).  Real-gas behavior may differ; "
+                    f"if integration fails, adiabatic-flow choking is "
+                    f"the likely cause.",
+                    UserWarning, stacklevel=3,
+                )
+    except (ValueError, RuntimeError, ZeroDivisionError, OverflowError):
+        # Diagnostic only -- never block the real evaluation.
+        pass
+
+
 class Line_Segment(Base_Line_Segment):
     """Pipe segment with compressible-flow pressure and temperature calculation.
 
@@ -334,6 +445,12 @@ class Line_Segment(Base_Line_Segment):
         P0   = fs.AS.p()
         T0   = fs.AS.T()
         mdot = fs.mdot
+
+        # Cheap ideal-gas predictive choke check.  Warns (does not raise)
+        # if the segment is predicted to choke before its outlet.
+        _line_segment_choke_diagnostic(
+            fs, self.profile, self.roughness_si, isothermal, mu, self.name,
+        )
 
         total_length  = self.total_length_m
         q_per_length  = q_wall / total_length if total_length > 0.0 else 0.0
@@ -428,10 +545,7 @@ class Bend(Base_Bend):
 
         rho_in = fs.rho
         if mu is None:
-            try:
-                mu = fs.AS.viscosity()
-            except Exception:
-                mu = viscosity_LGE(fs.T, fs.AS.molar_mass() * 1000.0, rho_in)
+            mu = _viscosity_or_LGE(fs.AS, fs.T, rho_in)
 
         Re = fluids_Reynolds(V=fs.v, D=Di, rho=rho_in, mu=mu)
         K  = fluids.fittings.bend_rounded(
@@ -464,6 +578,11 @@ class Valve(Base_Valve):
         to compressible_K() using the instance's K-factor.  fs.A is unchanged
         on return.
 
+        If the instance carries a ``minimum_diameter`` (set at construction),
+        the implied throat area is passed to compressible_K() as the
+        choke-detection throat with recovery to the body area, so internal
+        choking is caught even when the body outlet is comfortably subsonic.
+
         Args:
             fs : FlowState at the upstream connection (static).  fs.AS must
                  be at the inlet (P, T); mutated in place to outlet state.
@@ -474,7 +593,9 @@ class Valve(Base_Valve):
         Di = self.Di_si
         A  = math.pi * Di ** 2 / 4.0
         _area_match(fs, A)
-        compressible_K(fs, self.K)
+        A_throat = (math.pi * self.D_min_si ** 2 / 4.0
+                    if self.D_min_si is not None else None)
+        compressible_K(fs, self.K, A_throat=A_throat)
 
 
 # When network._reversed_component substitutes K = _SEALING_K (~ 1e9) on a
@@ -555,7 +676,9 @@ class CheckValve(Base_CheckValve):
         Di = self.Di_si
         A  = math.pi * Di ** 2 / 4.0
         _area_match(fs, A)
-        compressible_K(fs, self.K)
+        A_throat = (math.pi * self.D_min_si ** 2 / 4.0
+                    if self.D_min_si is not None else None)
+        compressible_K(fs, self.K, A_throat=A_throat)
 
 
 class Contraction_Expansion(Base_Contraction_Expansion):
@@ -761,6 +884,18 @@ def viscosity_LGE(T, mol_wt, density):
     mu = k * math.exp(x * density ** y)/10000.0
 
     return ureg.Quantity(mu, "cP").to("Pa*s").magnitude
+
+
+def _viscosity_or_LGE(AS, T, rho):
+    """CoolProp viscosity if available, else Lee-Gonzalez-Eakin fallback.
+
+    Centralizes the kg/mol -> kg/kmol unit conversion that viscosity_LGE
+    requires (CoolProp's molar_mass() returns kg/mol; LGE wants kg/kmol).
+    """
+    try:
+        return AS.viscosity()
+    except Exception:
+        return viscosity_LGE(T, AS.molar_mass() * 1000.0, rho)
 
 
 # CoolProp integer phase codes returned by AbstractState.phase().
@@ -1213,6 +1348,58 @@ def choked_mass_flux(fs, A_throat, A_outlet=None, n_grid=40):
     _, _, _, _, T_out = state_at_P(P_out, T_star)
     return mdot_choked, P_star, T_star, rho_star, P_out, T_out
 
+
+def _choke_pre_screen(fs, A_throat, A_outlet, A_on_choke=None):
+    """Pre-screen for choked flow at A_throat and raise ChokedFlowError if so.
+
+    Two-stage gate used by compressible_K, compressible_changing_area_K, and
+    compressible_orifice:
+      1. Cheap ideal-gas G_max bound at A_throat -- no-op when fs.mdot is
+         below ~50% of it (cannot be choked at this stagnation state).
+      2. Above the bound, run the rigorous real-gas choked_mass_flux march.
+         On a real choke, fs.AS is left at the recovered outlet state, fs.A
+         is set to A_on_choke (if given), and ChokedFlowError is raised.
+         Otherwise fs.AS (which the march mutated) is restored to inlet so
+         the caller's subsonic solve can proceed.
+
+    _NoChokeBracketError is swallowed (treated as "not choked here"); real
+    CoolProp / numerical failures propagate.
+
+    Args:
+        fs         : FlowState at the inlet (static).  Mutated in place.
+        A_throat   : float, throat area for the choke check [m^2].
+        A_outlet   : float, area for post-throat isentropic recovery [m^2].
+                     Pass A_throat itself when there is no recovery
+                     (constant-area fitting).
+        A_on_choke : float or None.  When given, fs.A is set to this value
+                     immediately before ChokedFlowError is raised.  Use it
+                     when the caller's geometry frame differs from the
+                     inlet frame (e.g. orifice / changing-area: outlet =
+                     pipe area, not throat).
+    """
+    if fs.mdot <= 0.5 * _ideal_gas_G_max(fs.AS) * A_throat:
+        return
+
+    P_in = fs.AS.p()
+    T_in = fs.AS.T()
+    try:
+        mdot_choked, P_t, T_t, rho_t, P_o, T_o = choked_mass_flux(
+            fs, A_throat, A_outlet=A_outlet,
+        )
+    except _NoChokeBracketError:
+        # Grid scan found no Mach=1 bracket -- not choked.  AS may have
+        # wandered along the isentrope during the scan; restore to inlet.
+        _safe_flowstate_update_PT(fs, P_in, T_in)
+        return
+
+    if fs.mdot > mdot_choked:
+        if A_on_choke is not None:
+            fs.A = A_on_choke
+        raise ChokedFlowError(mdot_choked, P_t, T_t, rho_t, P_o, T_o)
+    # Not choked: the march moved AS; restore to inlet for caller's solve.
+    _safe_flowstate_update_PT(fs, P_in, T_in)
+
+
 def compressible_orifice(fs, Di, Do, taps, Cd_override=None):
     """Outlet conditions for a compressible fluid passing through a square-edged
     concentric orifice plate. 
@@ -1269,10 +1456,7 @@ def compressible_orifice(fs, Di, Do, taps, Cd_override=None):
     h_static_in   = fs.AS.hmass()
     h_stagnation  = h_static_in + 0.5 * v_in ** 2
 
-    try:
-        mu = fs.AS.viscosity()
-    except (ValueError, RuntimeError):
-        mu = viscosity_LGE(T_in, fs.AS.molar_mass(), rho_in)
+    mu = _viscosity_or_LGE(fs.AS, T_in, rho_in)
 
     try:
         k_iso = fs.AS.cpmass() / fs.AS.cvmass()
@@ -1289,27 +1473,12 @@ def compressible_orifice(fs, Di, Do, taps, Cd_override=None):
     A_eff = Cd * A_bore
 
     # ---- 1. Choke pre-screen at the orifice throat (vena contracta).
-    # Mirrors compressible_changing_area_K: cheap ideal-gas G_max bound at
-    # the effective throat area, then escalate to the rigorous real-gas
-    # isentropic expansion if the bound is exceeded.  The ISO tap-pressure / ideal
-    # critical-ratio comparison used previously compared two pressures at
-    # different stations (tap vs. throat) and missed choke for real gases
-    # whenever tap-side recovery kept P_2_tap above the throat critical
-    # ratio.
-    if fs.mdot > 0.5 * _ideal_gas_G_max(fs.AS) * A_eff:
-        try:
-            mdot_choked_real, P_t, T_t, rho_t, P_o, T_o = choked_mass_flux(
-                fs, A_eff, A_outlet=A_pipe,
-            )
-        except _NoChokeBracketError:
-            _safe_flowstate_update_PT(fs, P_in, T_in)
-        else:
-            if fs.mdot >= mdot_choked_real:
-                fs.A = A_pipe
-                raise ChokedFlowError(
-                    mdot_choked_real, P_t, T_t, rho_t, P_o, T_o,
-                )
-            _safe_flowstate_update_PT(fs, P_in, T_in)
+    # A_throat = A_eff = Cd * A_bore; recovery is back to pipe area.
+    # The ISO tap-pressure / ideal critical-ratio comparison used previously
+    # compared two pressures at different stations (tap vs. throat) and
+    # missed choke for real gases whenever tap-side recovery kept P_2_tap
+    # above the throat critical ratio.
+    _choke_pre_screen(fs, A_eff, A_pipe, A_on_choke=A_pipe)
 
     # ---- 2. ISO 5167 cheap initial guess for the tap pressure (subsonic).
     # The solver brentq's over P2 in (0.5*P1, P1); if the requested
@@ -1581,37 +1750,11 @@ def compressible_changing_area_K(fs, A_out, K=0.0):
             f"(got {Ma_in:.6f}).  Supersonic area changes are not supported."
         )
 
-    # ------------------------------------------------------------------
-    # Choked-flow pre-screen.  Ideal-gas G_max is a computationally cheap analytical
-    # upper bound on the real-gas choked flux at this stagnation state,
-    # so anything below ~50% of it cannot be choked.  Above the threshold, run the
-    # rigorous real-gas march at A_throat = min(A_in, A_out): on choke,
-    # raise ChokedFlowError with AS already at the (recovered) outlet
-    # state; otherwise restore AS to inlet and continue to the subsonic
+    # Choked-flow pre-screen at A_throat = min(A_in, A_out), with recovery
+    # to A_out.  On choke, fs.A is updated to A_out and ChokedFlowError
+    # is raised; otherwise AS is restored to inlet for the subsonic Newton
     # solve below.
-    # ------------------------------------------------------------------
-    A_throat_pre = min(A_in, A_out)
-    if mdot > 0.5 * _ideal_gas_G_max(AS) * A_throat_pre:
-        try:
-            mdot_choked, P_t, T_t, rho_t, P_o, T_o = choked_mass_flux(
-                fs, A_throat_pre, A_outlet=A_out,
-            )
-        except _NoChokeBracketError:
-            # Grid scan found no Mach=1 bracket -- treat as not
-            # choked.  AS may have wandered along the isentrope during
-            # the scan; restore to inlet.  Real CoolProp / numerical
-            # failures propagate (the bare RuntimeError catch would
-            # have swallowed those too).
-            _safe_flowstate_update_PT(fs, P_in, T_in)
-        else:
-            if mdot > mdot_choked:
-                # AS already at outlet state; sync fs.A to the throat-area
-                # frame the recovery returned (A_outlet == A_out).
-                fs.A = A_out
-                raise ChokedFlowError(mdot_choked, P_t, T_t, rho_t, P_o, T_o)
-            # Not choked: AS was moved by the march; restore to inlet for
-            # the subsonic Newton solve below.
-            _safe_flowstate_update_PT(fs, P_in, T_in)
+    _choke_pre_screen(fs, min(A_in, A_out), A_out, A_on_choke=A_out)
 
     H_total = H_in + 0.5 * v_in**2    # stagnation enthalpy [J/kg], conserved as no work or heat input is assumed
     e_loss  = 0.5 * K * v_in**2       # mechanical energy dissipated per unit mass [J/kg]
@@ -1696,7 +1839,7 @@ def compressible_changing_area_K(fs, A_out, K=0.0):
     fs.A = A_out
 
 
-def compressible_K(fs, K, dPmax=0.05):
+def compressible_K(fs, K, dPmax=0.05, A_throat=None):
     """Outlet conditions for a compressible fluid passing through a fitting
     with a known loss coefficient K and no area change.
 
@@ -1723,13 +1866,20 @@ def compressible_K(fs, K, dPmax=0.05):
     are unchanged (constant-area, adiabatic, point fitting).
 
     Args:
-        fs    : FlowState at the inlet (static).  fs.AS, fs.mdot, fs.A are
-                read as the inlet state; on return fs.AS is at the outlet
-                state.
-        K     : float, loss coefficient referenced to inlet velocity
-                head (dimensionless, >= 0).
-        dPmax : Maximum relative dP (|dP|/P_in) before switching to the
-                rigorous compressible_changing_area_K solver.
+        fs       : FlowState at the inlet (static).  fs.AS, fs.mdot, fs.A are
+                   read as the inlet state; on return fs.AS is at the outlet
+                   state.
+        K        : float, loss coefficient referenced to inlet velocity
+                   head (dimensionless, >= 0).
+        dPmax    : Maximum relative dP (|dP|/P_in) before switching to the
+                   rigorous compressible_changing_area_K solver.
+        A_throat : float, optional.  Internal throat area [m^2] for the
+                   choke-flow pre-screen (e.g. valve seat or trim area).
+                   When smaller than fs.A, this is passed to choked_mass_flux
+                   as the choke throat while fs.A is used as the recovery
+                   outlet area, so internal choking is detected even when the
+                   body outlet (fs.A) is comfortably subsonic.  Default None
+                   = use fs.A for both (legacy pipe-area-only check).
 
     Returns:
         None.  fs is mutated in place.
@@ -1767,6 +1917,16 @@ def compressible_K(fs, K, dPmax=0.05):
             f"Reduce flow rate or check geometry."
         )
 
+    # Internal-throat choke pre-screen, hoisted above the dP linearization
+    # so it fires regardless of whether the fast (linearized) or slow
+    # (compressible_changing_area_K) branch is taken below.  The inner
+    # screens of those branches use the body area and would miss internal
+    # choking when A_throat < flow_area; this one closes that gap.
+    throat_screened = False
+    if A_throat is not None and 0.0 < A_throat < flow_area:
+        _choke_pre_screen(fs, A_throat, flow_area)
+        throat_screened = True
+
     # Partial derivatives at inlet conditions
     drhodP_H = AS.first_partial_deriv(CP.iDmass, CP.iP,     CP.iHmass)  # (drho/dP)_H
     drhodH_P = AS.first_partial_deriv(CP.iDmass, CP.iHmass, CP.iP)      # (drho/dH)_P
@@ -1786,34 +1946,11 @@ def compressible_K(fs, K, dPmax=0.05):
 
     else: #small dP, not near choked
 
-        # ------------------------------------------------------------------
-        # Choked-flow pre-screen (fast-path branch only).  Cheap ideal-gas
-        # G_max is an upper bound on the real-gas value; mdot below ~50% of
-        # it cannot be choked, so we skip the ~50-200 ms isentropic iteration.  For
-        # a constant-area fitting the throat equals the outlet, so no
-        # post-throat recovery is needed and AS lands at the throat ==
-        # outlet state on a choke.
-        #
-        # Stage-1 caveat: A_throat = flow_area = pipe area, so for a valve
-        # or bend whose physical throat is smaller than the pipe this
-        # over-estimates mdot_choked.  Document upstream (Layer-3 IEC
-        # ControlValve class is the rigorous path); for now the caller gets
-        # a conservatively-loose clamp.
-        # ------------------------------------------------------------------
-        if mdot > 0.5 * _ideal_gas_G_max(AS) * flow_area:
-            try:
-                mdot_choked, P_t, T_t, rho_t, P_o, T_o = choked_mass_flux(
-                    fs, flow_area, A_outlet=flow_area,
-                )
-            except _NoChokeBracketError:
-                # Iteration found no Mach=1 bracket in the accessible
-                # isentrope -- treat as not choked.  AS may have wandered
-                # along the isentrope during the scan; restore to inlet.
-                _safe_flowstate_update_PT(fs, P_in, T_in)
-            else:
-                if mdot > mdot_choked:
-                    raise ChokedFlowError(mdot_choked, P_t, T_t, rho_t, P_o, T_o)
-                _safe_flowstate_update_PT(fs, P_in, T_in)
+        # Body-area choke pre-screen (fast-path only).  Skip if the
+        # hoisted A_throat screen above already covered a smaller area --
+        # that's strictly more restrictive than this one.
+        if not throat_screened:
+            _choke_pre_screen(fs, flow_area, flow_area)
 
         P_out  = P_in + dP
 
@@ -1961,13 +2098,9 @@ def compressible_pipe_segment(
     # own inlet rather than reuse the parent slice's inlet viscosity.
     mu_user = mu
     if mu is None:
-        try:
-            mu = AS.viscosity()   # Pa*s
-        except Exception:
-            # Fall back to Lee-Gonzalez-Eakin if the EOS (e.g. Peng-Robinson)
-            # does not support viscosity.  LGE is for hydrocarbon gases only;
-            # supply mu explicitly for other fluids.
-            mu = viscosity_LGE(T_in, AS.molar_mass() * 1000.0, rho_in)
+        # LGE fallback (inside _viscosity_or_LGE) is hydrocarbon-only; supply
+        # mu explicitly for other fluids whose EOS lacks viscosity (e.g. PR).
+        mu = _viscosity_or_LGE(AS, T_in, rho_in)
     H_in = AS.hmass()   # J/kg
     a   = AS.speed_sound()   # m/s  (isentropic speed of sound)
     v_in  = mdot / (rho_in * flow_area)   # m/s
@@ -2067,13 +2200,7 @@ def compressible_pipe_segment(
 
             # Recompute dP/dL at the trial outlet using the same derivation as
             # at the inlet (second splitter metric).
-            if mu_user is not None:
-                mu_out = mu_user
-            else:
-                try:
-                    mu_out = AS.viscosity()
-                except Exception:
-                    mu_out = viscosity_LGE(T_out, AS.molar_mass() * 1000.0, rho_out_trial)
+            mu_out = mu_user if mu_user is not None else _viscosity_or_LGE(AS, T_out, rho_out_trial)
             Re_out      = fluids_Reynolds(V=v_out_trial, D=D_h, rho=rho_out_trial, mu=mu_out)
             f_darcy_out = fluids_friction_factor(Re=Re_out, eD=roughness / D_h)
             A_out = AS.first_partial_deriv(CP.iDmass, CP.iP,     CP.iHmass)
@@ -2189,13 +2316,7 @@ def compressible_pipe_segment(
             # assumption), so dP/dL change is the only convergence metric.
             rho_out_trial = AS.rhomass()
             v_out_trial   = mdot / (flow_area * rho_out_trial)
-            if mu_user is not None:
-                mu_out = mu_user
-            else:
-                try:
-                    mu_out = AS.viscosity()
-                except Exception:
-                    mu_out = viscosity_LGE(T_out, AS.molar_mass() * 1000.0, rho_out_trial)
+            mu_out = mu_user if mu_user is not None else _viscosity_or_LGE(AS, T_out, rho_out_trial)
             Re_out       = fluids_Reynolds(V=v_out_trial, D=D_h, rho=rho_out_trial, mu=mu_out)
             f_darcy_out  = fluids_friction_factor(Re=Re_out, eD=roughness / D_h)
             drhodP_T_out = AS.first_partial_deriv(CP.iDmass, CP.iP, CP.iT)
