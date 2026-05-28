@@ -123,9 +123,53 @@ feedback in the denominator strengthens nonlinearly as the gas expands.
   downstream pressure recovery (low `F_L`).  R3 (ISA-75.01 / IEC-60534
   with explicit `x_T` or `F_L`) remains the next refinement.
 
+- **R2.5 [partial — `compressible_dA` landed].** New
+  [`compressible_dA(fs, A_throat, K, A2, P2)`](compressible_flow.py) — a
+  single-entry-point constriction solver that splits the process into an
+  isentropic acceleration from inlet to throat (`compressible_changing_area_K(K=0)`)
+  followed by a K-dissipative recovery from throat to outlet area
+  (`compressible_changing_area_K(e_loss=0.5·K·v_in²)`). The entropy balance on
+  the recovery step uses the throat-to-outlet average temperature rather than
+  the inlet-to-outlet average, which is more faithful to real geometry since
+  most of the entropy generation lives in the post-vena-contracta turbulence.
+  Two operating modes:
+
+    - *Mode 1 — dictate `mdot`, solve for `P2`.* Mirrors the existing `dP_dT`
+      calling convention.
+    - *Mode 2 — dictate `P2`, solve for `mdot`.* Was previously a known gap
+      (not yet on this list); now implemented. Runs `choked_mass_flux` to
+      bound the answer, computes `P2_choked` via the same two-stage march,
+      then either clamps to `mdot_choked` with adiabatic expansion to `P2`
+      (`adiabatic_expansion_solver` helper) when `P2 < P2_choked`, or runs a
+      1-D `brentq` on `mdot` for the subsonic case. Supersonic outlets on the
+      choked branch raise `RuntimeError` (the same supersonic guard already
+      present in `compressible_changing_area_K`).
+
+  Substantially mitigates items 1, 3, 4 from §1 for any caller that switches
+  from `compressible_K` to `compressible_dA` — properties are taken at the
+  *throat*, not the inlet, for the dissipative leg, and the recovery step
+  uses the rigorous coupled (P, T) solve. Covered by `test_compressible_dA`
+  in [examples.py](examples.py).
+
+  **Open follow-ons:**
+
+    - **R2.6.** Switch `Valve.dP_dT` and `Orifice.dP_dT` from
+      `compressible_K` / `compressible_orifice` to `compressible_dA` so the
+      production paths get the throat-then-recovery split for free. The
+      Orifice currently delegates to `compressible_orifice` (ISO 5167 +
+      isenthalpic outlet); the two physics models differ by several percent
+      in the validation test, so picking one consciously is part of this
+      step. Needs an `.K` property on `Base_Orifice` derived from `Cd`.
+    - **R2.7.** Wire Mode 2 (dictate `P2`, solve `mdot`) into the
+      compressible network solver as an option for components whose
+      controlling boundary condition is downstream pressure (e.g. relief
+      valves discharging to a fixed header pressure).
+
 - **R3 [larger].** Switch the valve component to an ISA-75.01 / IEC-60534-2-1
   sizing model parameterized by Cv (or Kv) and x_T, with explicit choked-flow
   branch. Cv / Kv are already accepted per recent commits; the data is there.
+  `compressible_dA`'s two-stage structure is the natural place to host the
+  expansion-factor `Y` correction once `x_T` is wired in.
 
 - **R3.5 [follow-on to R1.5].** Have `compressible_network.walk_edge`
   catch `ChokedFlowError` specifically and consume `mdot_choked` from the

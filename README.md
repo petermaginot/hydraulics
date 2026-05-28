@@ -171,6 +171,19 @@ All five take a `FlowState` as their first argument; `mdot`, `A`, and the phase-
 
 - **`choked_mass_flux(fs, A_throat, A_outlet=None, n_grid=40)`** — real-gas choked mass flow through a throat of area `A_throat`, using the an isentropic expansion. The stagnation enthalpy reference is built from `fs.h_stagnation = h_static + 0.5·v_in²`, so the choked mass flow correctly grows when the inlet carries non-trivial kinetic energy. Used internally by `compressible_K` and `compressible_changing_area_K` as a real-gas choke pre-screen; on choke they raise `ChokedFlowError` carrying `mdot_choked` and the (recovered) outlet state.
 
+- **`compressible_dA(fs, A_throat, K=0.0, A2=None, P2=None)`** — single-entry-point constriction solver (valve, orifice, restriction). Splits the process into two physically distinct stages: an *isentropic* acceleration from inlet to the throat / vena contracta (`compressible_changing_area_K(K=0)`), then a *K-dissipative* recovery from throat to outlet area `A2` (`compressible_changing_area_K(e_loss=0.5·K·v_in²)`). The entropy balance on the recovery step uses the throat-to-outlet average temperature, which better matches real geometry (most of the entropy generation lives in the post-vena-contracta turbulence) than averaging inlet to outlet.
+
+  Two operating modes selected by whether `P2` is passed:
+
+  - **Mode 1 — dictate `mdot`, solve for outlet `P`.** Mirrors the existing `dP_dT` calling convention; runs the two `compressible_changing_area_K` calls in sequence and leaves `fs` at the outlet static state with `fs.A == A2`.
+  - **Mode 2 — dictate `P2`, solve for `mdot`.** Runs `choked_mass_flux` to bound the answer, marches the choked-throat state to `A2` with the K-recovery to compute `P2_choked`, then branches:
+    - If `P2 < P2_choked`: flow is choked. `mdot` is clamped to `mdot_choked` and the outlet state is found by adiabatic expansion from the throat to the user-supplied `P2` (stagnation enthalpy conserved). Supersonic outlets raise `RuntimeError`.
+    - Otherwise: subsonic. A 1-D `scipy.optimize.brentq` on `mdot` drives the two-stage march's outlet pressure to `P2`. Bracket is `[~0, 0.95·mdot_choked]` with automatic retreat if the kernel's ideal-gas initial-guess generator fails near the real-gas choke.
+
+  Input validation enforces `K ≥ 0`, `0 < A_throat ≤ fs.A`, and `P2 < fs.P` when supplied. Covered by `test_compressible_dA` in [examples.py](examples.py).
+
+- **`adiabatic_expansion_solver(fs, P2, T_ITER_MAX=8, H_ABS_TOL=1.0, H_REL_TOL=1.0e-9)`** — small Newton helper that expands `fs.AS` adiabatically to a target pressure `P2` at the current `fs.A`, iterating `T_out` until stagnation-enthalpy conservation `H(P2, T_out) + 0.5·v_out² = fs.h_stagnation` is satisfied. Used by `compressible_dA`'s choked branch to find the outlet temperature when `mdot` is clamped to `mdot_choked`.
+
 ### Helpers
 
 - **`_safe_flowstate_update_PT(fs, P, T)`** — thin wrapper around `_safe_update_PT` that pulls the cached phase-envelope limits off `fs`. Used inside every physics function that needs to step `fs.AS` to a new `(P, T)` while respecting the supercritical phase hint.
@@ -242,7 +255,9 @@ End-to-end examples that check the program's calculations against textbook probl
 File for containing utility functions.
 
 ## To do's
--Add orifice plates
+-Add orifice plates (`Orifice` class exists; rebuild its `dP_dT` on top of `compressible_dA` for the throat-then-K-recovery split, and expose a `.K` property derived from `Cd`)
+-Switch `Valve.dP_dT` to `compressible_dA` so the throat / K-recovery split replaces the inlet-linearized `compressible_K` path for high-dP service
+-Wire the downstream-pressure-dictated mode of `compressible_dA` into the network solver (today only the flow-rate-dictated path is exercised)
 -Handle flow choking due to pipe area, friction, or heat transfer on pipe segments
 -Handle cavitation checks for incompressible fluids (need to add fluid vapor pressure as property)
 -Add heat transfer calculation to pipe segments

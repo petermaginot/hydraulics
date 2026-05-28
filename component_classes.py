@@ -954,8 +954,7 @@ class Base_Valve:
              compressible-flow choke check by giving the real throat area
              rather than the pipe area.  Geometric only -- does not capture
              pressure-recovery (F_L) effects, so valves with strong recovery
-             may choke earlier than this predicts.  None preserves the
-             legacy loose pipe-area check.
+             may choke earlier than this predicts.  None uses a pipe-area check.
     """
 
     def __init__(self, Di, K=None, name=None, Cv=None, Kv=None,

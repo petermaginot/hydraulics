@@ -1073,6 +1073,14 @@ class _NoChokeBracketError(RuntimeError):
     pass
 
 
+# Tolerance band around Ma=1 for treating an inlet flow state as "exactly
+# choked".  Chained area-change solves can drift the throat Ma a few Newton
+# tolerances above or below 1.0; this constant lets compressible_changing_area
+# and compressible_changing_area_K accept a sonic-throat inlet for the
+# downstream subsonic-recovery solve.
+_MA_SONIC_TOL = 1.0e-6
+
+
 def _T_at_P_along_isentrope(
     AS, P, s_target, T_seed, T_lo, T_hi,
     T_cricondentherm=None, P_cricondenbar=None,
@@ -1380,6 +1388,16 @@ def _choke_pre_screen(fs, A_throat, A_outlet, A_on_choke=None):
     if fs.mdot <= 0.5 * _ideal_gas_G_max(fs.AS) * A_throat:
         return
 
+    # Sonic-inlet expansion shortcut: when fs is already at (or numerically
+    # past) Ma=1 at the inlet area and the requested throat is no smaller
+    # than the inlet, the caller is asking for a subsonic recovery from a
+    # choked-throat starting state.  The rigorous march below would either
+    # oscillate or spuriously raise (fs.mdot is essentially equal to
+    # mdot_choked at this state); skip it and let the caller's subsonic
+    # solve proceed.
+    if fs.Ma >= 1.0 - _MA_SONIC_TOL and A_throat >= fs.A * (1.0 - 1e-12):
+        return
+
     P_in = fs.AS.p()
     T_in = fs.AS.T()
     try:
@@ -1526,6 +1544,7 @@ def compressible_orifice(fs, Di, Do, taps, Cd_override=None):
     # residual is on full h_stagnation. Phase-hinted PT updates keep this robust for
     # mixtures and supercritical fluids.
     T_out = T_in
+
     for _ in range(_T_ITER_MAX):
         _safe_flowstate_update_PT(fs, walked_P, T_out)
         v_out  = fs.v
@@ -1594,11 +1613,18 @@ def compressible_changing_area(fs, A_out):
     T_in  = AS.T()
     Ma_in = fs.Ma
 
-    if not (0.0 < Ma_in < 1.0):
+    if not (0.0 < Ma_in <= 1.0 + _MA_SONIC_TOL):
         raise ValueError(
-            f"compressible_changing_area: inlet Mach number must be in (0, 1) for "
-            f"subsonic flow (got {Ma_in:.6f}).  Supersonic area changes are not supported."
+            f"compressible_changing_area: inlet Mach number must satisfy "
+            f"0 < Ma_in <= 1 (got {Ma_in:.6f}).  Supersonic area changes "
+            f"are not supported."
         )
+
+    # Clamp a sonic (or marginally-supersonic by numerical noise) inlet a hair
+    # below 1.0 so the isentropic area-Mach algebra below stays on the
+    # subsonic branch.  The brentq search is also restricted to (0, 1), so the
+    # returned root is the subsonic recovery.
+    Ma_in = min(Ma_in, 1.0 - 1e-12)
 
     # ------------------------------------------------------------------
     # Obtain gamma from CoolProp at inlet conditions.
@@ -1674,9 +1700,12 @@ def compressible_changing_area(fs, A_out):
     return (P_out, T_out)
 
 
-def compressible_changing_area_K(fs, A_out, K=0.0):
+def compressible_changing_area_K(fs, A_out, K=0.0, e_loss=None):
     """Outlet pressure and temperature for a compressible fluid passing through
     an area change with a known loss coefficient K applied to inlet velocity.
+    Alternatively, e_loss, the mechanical energy loss per unit mass, can be supplied
+    in lieu of K for computing the entropy change. If e_loss is supplied, K is ignored.
+    If e_loss or K are supplied as zero, the process is evaluated as isentropic.
 
     Mutates fs in place: fs.AS goes to the outlet static state and fs.A
     becomes A_out.  fs.z is unchanged (area-change fittings are point
@@ -1688,9 +1717,10 @@ def compressible_changing_area_K(fs, A_out, K=0.0):
              H(P_out, T_out) + v_out^2/2 = H_in + v_in^2/2
 
       2. Entropy generation from the irreversible loss:
-             S(P_out, T_out) - S_in = K * v_in^2 / (2 * T_avg)
-         where T_avg = (T_in + T_out) / 2 and the mechanical energy dissipated
-         per unit mass is e_loss = K * v_in^2 / 2.
+             S(P_out, T_out) - S_in = e_loss / (T_avg)
+         where T_avg = (T_in + T_out) / 2.  e_loss [J/kg] is either supplied
+         directly by the caller or, if e_loss is None, computed from K as
+         e_loss = 0.5 * K * v_in^2.
 
     Mass continuity is satisfied implicitly: v_out = mdot / (rho_out * A_out).
 
@@ -1711,6 +1741,7 @@ def compressible_changing_area_K(fs, A_out, K=0.0):
         K     : float, loss coefficient referenced to inlet velocity
                 head (dimensionless, >= 0).  Default 0 (isentropic area
                 change with the real-gas EOS); used by _area_match.
+        e_loss: float, mechanical energy lost per unit mass in J/kg
 
     Returns:
         None.  fs is mutated in place.
@@ -1731,6 +1762,10 @@ def compressible_changing_area_K(fs, A_out, K=0.0):
         raise ValueError(
             f"compressible_changing_area_K: K must be non-negative (got {K})."
         )
+    if e_loss is not None and e_loss < 0.0:
+        raise ValueError(
+            f"compressible_changing_area_K: e_loss must be non-negative (got {e_loss})."
+        )
 
     AS    = fs.AS
     mdot  = fs.mdot
@@ -1744,10 +1779,11 @@ def compressible_changing_area_K(fs, A_out, K=0.0):
     v_in   = fs.v
     Ma_in  = fs.Ma
 
-    if not (0.0 < Ma_in < 1.0):
+    if not (0.0 < Ma_in <= 1.0 + _MA_SONIC_TOL):
         raise ValueError(
-            f"compressible_changing_area_K: inlet Mach number must be between 0 and 1. "
-            f"(got {Ma_in:.6f}).  Supersonic area changes are not supported."
+            f"compressible_changing_area_K: inlet Mach number must satisfy "
+            f"0 < Ma_in <= 1 (got {Ma_in:.6f}).  Supersonic area changes "
+            f"are not supported."
         )
 
     # Choked-flow pre-screen at A_throat = min(A_in, A_out), with recovery
@@ -1757,7 +1793,8 @@ def compressible_changing_area_K(fs, A_out, K=0.0):
     _choke_pre_screen(fs, min(A_in, A_out), A_out, A_on_choke=A_out)
 
     H_total = H_in + 0.5 * v_in**2    # stagnation enthalpy [J/kg], conserved as no work or heat input is assumed
-    e_loss  = 0.5 * K * v_in**2       # mechanical energy dissipated per unit mass [J/kg]
+    if e_loss is None:
+        e_loss  = 0.5 * K * v_in**2       # mechanical energy dissipated per unit mass [J/kg]
     Cp_in   = AS.cpmass()             # cached for initial-guess T correction
 
     # Residual scaling: r_energy is in J/kg (~v_in^2 magnitude), r_entropy is in
@@ -1821,8 +1858,8 @@ def compressible_changing_area_K(fs, A_out, K=0.0):
     # compressible_changing_area does not mutate fs (no AS update), so fs is
     # still at inlet conditions and the cached Cp_in is valid.
     P0, T0 = compressible_changing_area(fs, A_out)
-    P0 += -0.5 * K * rho_in * v_in**2
-    T0 += 0.5 * K * v_in**2 / Cp_in
+    P0 += -e_loss * rho_in
+    T0 += e_loss / Cp_in
 
     sol = root(residuals, [P0, T0], jac=jacobian, method="hybr")
 
@@ -1830,6 +1867,7 @@ def compressible_changing_area_K(fs, A_out, K=0.0):
         raise RuntimeError(
             f"compressible_changing_area_K: root solver did not converge "
             f"(P_in={P_in:.4g} Pa, T_in={T_in:.4g} K, K={K:.4g}, "
+            f"e_loss={e_loss:.4g} J/kg, "
             f"A_in={A_in:.4g} m^2, A_out={A_out:.4g} m^2).  "
             f"Solver message: {sol.message}"
         )
@@ -1837,6 +1875,24 @@ def compressible_changing_area_K(fs, A_out, K=0.0):
     P_out, T_out = sol.x
     _safe_flowstate_update_PT(fs, P_out, T_out)
     fs.A = A_out
+
+    # The subsonic initial guess from compressible_changing_area keeps hybr on
+    # the subsonic branch in normal use, but for unusual K / e_loss combinations
+    # the solver can in principle settle on the supersonic root.  Reject that
+    # here -- only the subsonic recovery is physically meaningful for our use.
+    rho_out = AS.rhomass()
+    v_out   = mdot / (rho_out * A_out)
+    try:
+        a_out = AS.speed_sound()
+    except (ValueError, RuntimeError):
+        a_out = 0.0
+    if a_out > 0.0 and v_out / a_out > 1.0 + _MA_SONIC_TOL:
+        raise RuntimeError(
+            f"compressible_changing_area_K: Newton converged to a supersonic "
+            f"outlet (Ma_out={v_out / a_out:.4f}); the subsonic root was not "
+            f"found.  (P_in={P_in:.4g} Pa, T_in={T_in:.4g} K, "
+            f"A_in={A_in:.4g} m^2, A_out={A_out:.4g} m^2, K={K:.4g})."
+        )
 
 
 def compressible_K(fs, K, dPmax=0.05, A_throat=None):
@@ -1879,7 +1935,7 @@ def compressible_K(fs, K, dPmax=0.05, A_throat=None):
                    as the choke throat while fs.A is used as the recovery
                    outlet area, so internal choking is detected even when the
                    body outlet (fs.A) is comfortably subsonic.  Default None
-                   = use fs.A for both (legacy pipe-area-only check).
+                   = use fs.A for both (pipe-area-only check).
 
     Returns:
         None.  fs is mutated in place.
@@ -2376,3 +2432,258 @@ def compressible_pipe_segment(
     # In the recursive-split path each child slice advances its own dz/2, so
     # the parent's bookkeeping does not double-count.
     fs.z += dz
+
+
+def compressible_dA(fs, A_throat, K = 0.0, A2 = None, P2 = None):
+    """
+    Models a compressible fitting/component with a constriction (valve, orifice). 
+    State 1 is the inlet conditions (pressure, temperature, area)
+    State th is at the throat/vena cava condition
+    State 2 is the outlet condition
+        -----------------
+                |
+    --> 1       th       2
+                |
+        -----------------
+    There are two operating modes, dictated by whether P2 is passed or not. For both modes, the
+    fluid is assumed to accelerate isentropically from State 1 to the throat state. From the throat state to State 2, the
+    passed K value is used to perform an entropy balance to find the outlet condition (unless flow is choked, as discussed below).
+    For most constrictions, most of the friction energy loss occus on the downstream side of the constriction. Using the average
+    of the throat conditions and the downstream conditions for calculating the entropy change of the process therefore
+    gives us a better estimate of the real process than using the inlet and outlet conditions for this calculation.
+
+    Mode 1 - Dictate mass flow, solve for downstream pressure P2
+    If no P2 value is passed, the function operates to calculate the downstream pressure and update the flowstate
+    to this pressure. Two conservation equations are satisfied, stagnation enthalpy (energy) and entropy. 
+    The function first performs a choke check - if the given mass flow rate fs.mdot is greater than the choked 
+    flow rate, the function raises an error.
+
+    If no choking occurs, the fluid is assumed to isentropically accelerate to the throat condition, also satisfying
+    an energy balance (adiabadic, no elevation change - no change in stagnation enthalpy):
+
+        H_th + 0.5*v_th^2 = H1 + 0.5*v1^2
+        S_th = S1
+
+    From the throat condition to the outlet condition, the change in entropy is given by:
+
+        S2 = S1 + 0.5 * (1/T) * K * v1**2
+
+    where K is given at inlet conditions and the temperature is the average of the throat temperature and the outlet temperature
+
+    And again, energy is conserved from the inlet conditions:
+        H2 + 0.5 * v2^2 = H1 + 0.5 * v1^2
+
+    Mode 2 - Dictate downstream pressure P2, solve for mass flow
+    If P2 is passed, the function operates to calculate the mass flow rate that satisfies the given pressure change.
+    First, the function performs a choked flow check to estimate the choked flow rate and choked throat pressure at the inlet condition
+    and establish an upper limit for the solver. 
+    
+    An energy and entropy balance at choked conditions is then performed to solve for the downstream pressure that would be expected at
+    choked flow, P2_choked. If P2_choked is greater than the P2 value passed to the function, then this means that flow is choked. 
+    Another energy balance is performed to solve for the actual outlet temperature. 
+
+    If the choked P2 is less than the P2 passed to the function, the flow is not choked. Entropy accounting calculates outlet entropy
+    that should be expected and the solver iterates the temperature until the outlet T2, P2 combo gives the required outlet entropy.
+
+        S2 = S1 + 0.5 * (1/T) * K * v1**2
+
+
+    """
+    # ---- Input validation
+    if K < 0.0:
+        raise ValueError(
+            f"compressible_dA: K must be non-negative (got {K})."
+        )
+    if A_throat <= 0.0 or A_throat > fs.A:
+        raise ValueError(
+            f"compressible_dA: A_throat must be in (0, fs.A]; "
+            f"got A_throat={A_throat:.4g} m^2, fs.A={fs.A:.4g} m^2."
+        )
+    if P2 is not None and P2 >= fs.P:
+        raise ValueError(
+            f"compressible_dA: P2 must be strictly less than the inlet pressure "
+            f"(got P2={P2:.4g} Pa, P_in={fs.P:.4g} Pa)."
+        )
+
+    # Record inlet state.
+    P1     = fs.P
+    T1     = fs.T
+    A1     = fs.A
+    rho_in = fs.rho
+    v1     = fs.mdot / (A1 * rho_in)
+
+    # If A2 is not passed, it is assumed to be equal to fs.A.
+    if A2 is None:
+        A2 = fs.A
+
+    if P2 is None:
+        # ---- Mode 1: dictate mdot, solve for outlet pressure.
+        # Mechanical energy loss from K at inlet velocity head.
+        e_loss = 0.5 * K * v1**2
+
+        # Isentropic acceleration to throat (kernel performs its own choke check).
+        compressible_changing_area_K(fs=fs, A_out=A_throat, K=0.0)
+
+        # Recovery to A2 with the K-derived dissipation.
+        compressible_changing_area_K(fs=fs, A_out=A2, e_loss=e_loss)
+        return
+
+    # ---- Mode 2: dictate P2, solve for mdot.
+    # Find the choked mass flow rate for the given upstream stagnation state.
+    # choked_mass_flux leaves fs.AS at the throat state when A_outlet is None.
+    mdot_choked, _P_choke, _T_choke, _, _, _ = choked_mass_flux(
+        fs=fs, A_throat=A_throat,
+    )
+
+    # March throat -> A2 with K-based dissipation to find the outlet pressure
+    # produced by the choked-flow scenario.  At this point fs.AS is at the
+    # throat (sonic) state; re-marching inlet -> throat at mdot_choked would
+    # be degenerate (the subsonic root collapses onto Ma=1), so we instead
+    # advance directly from the throat.  The K reference velocity is still
+    # the inlet velocity at the choked rate.
+    fs.mdot = mdot_choked
+    fs.A    = A_throat
+    v1_choked  = mdot_choked / (rho_in * A1)
+    e_loss_chk = 0.5 * K * v1_choked**2
+    compressible_changing_area_K(fs=fs, A_out=A2, e_loss=e_loss_chk)
+    P2_choked = fs.P
+
+    if P2 < P2_choked:
+        # ---- Choked branch: mdot is fixed at mdot_choked. The downstream
+        # state expands adiabatically (stagnation enthalpy conserved) to
+        # the user-supplied P2. fs is currently at the choked-recovery
+        # state, so adiabatic_expansion_solver's snapshot of fs.h_stagnation
+        # equals the inlet stagnation enthalpy (the entire path is adiabatic).
+        adiabatic_expansion_solver(fs=fs, P2=P2)
+
+        # Reject supersonic outlets -- physically requires a shock or further
+        # dissipation that this model does not capture. Mirrors the guard in
+        # compressible_changing_area_K.
+        try:
+            a_out = fs.AS.speed_sound()
+        except (ValueError, RuntimeError):
+            a_out = 0.0
+        if a_out > 0.0 and fs.v / a_out > 1.0 + _MA_SONIC_TOL:
+            raise RuntimeError(
+                f"compressible_dA: choked-branch adiabatic expansion to "
+                f"P2={P2:.4g} Pa produced a supersonic outlet "
+                f"(Ma_out={fs.v / a_out:.4f}) at A2={A2:.4g} m^2. "
+                f"P2 is below the post-throat free-expansion limit at this "
+                f"geometry; the result would require a shock or additional "
+                f"dissipation that this function does not model."
+            )
+        return
+
+    # ---- Non-choked branch: iterate mdot until the two-stage march reaches
+    # P2. K = 0 + non-choked is physically degenerate (no loss => P2 == P1
+    # in the subsonic limit), so reject it before entering brentq.
+    if K <= 0.0:
+        raise ValueError(
+            f"compressible_dA: non-choked solution with K=0 is degenerate "
+            f"(zero loss requires P2 == P_in for subsonic flow). "
+            f"P2={P2:.4g} Pa, P_in={P1:.4g} Pa, P2_choked={P2_choked:.4g} Pa."
+        )
+
+    from scipy.optimize import brentq
+
+    # Incompressible initial-guess for mdot:
+    #   dP = 0.5 * K * rho * v^2,  mdot = rho * A * v
+    #   => mdot = A1 * sqrt(2 * dP * rho_in / K)
+    mdot_guess = A1 * math.sqrt(2.0 * (P1 - P2) * rho_in / K)
+
+    def pressure_residual(mdot_trial):
+        # Restore inlet conditions; the kernels mutate fs in place.
+        _safe_flowstate_update_PT(fs, P1, T1)
+        fs.A    = A1
+        fs.mdot = mdot_trial
+        v1_t   = mdot_trial / (rho_in * A1)
+        e_loss = 0.5 * K * v1_t**2
+        compressible_changing_area_K(fs=fs, A_out=A_throat, K=0.0)
+        compressible_changing_area_K(fs=fs, A_out=A2, e_loss=e_loss)
+        return fs.P - P2
+
+    # Bracket: residual is monotonically decreasing in mdot (higher mdot
+    # => larger dP => lower P_out). At mdot ~ 0 the residual approaches
+    # P1 - P2 > 0; at mdot near mdot_choked the residual is P2_choked - P2 < 0
+    # (we already know P2 > P2_choked because we are in this branch).
+    #
+    # The kernel's internal initial-guess generator (compressible_changing_area)
+    # uses an ideal-gas area-Mach relation; near the real-gas choke this can
+    # fail to bracket a subsonic root because the ideal-gas A* drifts off the
+    # real-gas A*.  Start the upper bound back from mdot_choked and retreat
+    # if the kernel raises.
+    mdot_lo = max(1e-9 * mdot_choked, 1e-3 * mdot_guess)
+    mdot_hi = 0.95 * mdot_choked
+
+    def _safe_residual_at(mdot_try):
+        # Try evaluating the residual; if the kernel fails (RuntimeError from
+        # the ideal-gas initial guess, or ChokedFlowError from the pre-screen),
+        # retreat toward zero and retry until either the kernel succeeds or
+        # we exhaust the retreat budget.
+        for shrink in (1.0, 0.9, 0.8, 0.6, 0.4, 0.2):
+            mdot_t = mdot_try * shrink
+            if mdot_t <= mdot_lo:
+                break
+            try:
+                return mdot_t, pressure_residual(mdot_t)
+            except (ChokedFlowError, RuntimeError):
+                continue
+        raise RuntimeError(
+            f"compressible_dA: kernel failed at every retreated upper bracket "
+            f"between {mdot_lo:.4g} and {mdot_try:.4g} kg/s."
+        )
+
+    mdot_hi, r_hi = _safe_residual_at(mdot_hi)
+    r_lo = pressure_residual(mdot_lo)
+    if r_lo * r_hi > 0.0:
+        raise RuntimeError(
+            f"compressible_dA: failed to bracket the non-choked solution "
+            f"(residual at mdot_lo={mdot_lo:.4g}: {r_lo:.4g}; "
+            f"at mdot_hi={mdot_hi:.4g}: {r_hi:.4g}). "
+            f"P1={P1:.4g} Pa, P2={P2:.4g} Pa, P2_choked={P2_choked:.4g} Pa, "
+            f"K={K:.4g}."
+        )
+
+    mdot_solution = brentq(
+        pressure_residual,
+        mdot_lo, mdot_hi,
+        xtol=max(1e-6 * mdot_choked, 1e-9),
+        rtol=1e-6,
+        maxiter=50,
+    )
+
+    # brentq leaves fs at the state of its last function eval, which is not
+    # necessarily the converged root. One extra eval guarantees fs is at the
+    # outlet state corresponding to mdot_solution.
+    pressure_residual(mdot_solution)
+
+
+def adiabatic_expansion_solver(fs, P2, T_ITER_MAX = 8, H_ABS_TOL = 1.0, H_REL_TOL = 1.0e-9):
+    """
+    Perform an adiabadic expansion to P2 at area fs.A with stagnation enthalpy conserved. Iterate the outlet temperature until the energy conservation is satisfied.
+    
+    v_out is recomputed each iteration from the current rho_out so the
+    residual is on full h_stagnation. 
+    Args:
+    fs      :FlowState at the inlet (static). fs.AS is mutated
+    P2      :float, target pressure (Pa)
+    T_ITER_MAX  : Maximum number of Newton solver iterations
+    H_ABS_TOL   : Minimum absolute stagnation enthalpy error since last solve step before solver returns
+    H_REL_TOL   : Minimum relative stagnation enthalpy error since last solve step before solver returns
+    """
+    # Adiabatic: stagnation enthalpy is invariant along the process, so the
+    # snapshot taken at entry is the correct target for every Newton step.
+    h_stagnation = fs.h_stagnation
+    T_out = fs.T
+    for _ in range(T_ITER_MAX):
+        _safe_flowstate_update_PT(fs, P2, T_out)
+        v_out  = fs.v
+        h_calc = fs.AS.hmass() + 0.5 * v_out ** 2
+        err    = h_calc - h_stagnation
+        if abs(err) <= max(H_ABS_TOL, H_REL_TOL * abs(h_stagnation)):
+            return
+        cp = fs.AS.cpmass()
+        if cp <= 0.0:
+            break
+        T_out -= err / cp
+    #NOTE if not converged, should we warn?

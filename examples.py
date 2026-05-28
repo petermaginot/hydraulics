@@ -16,6 +16,7 @@ from compressible_flow import (
     _resolve_mdot,
     _safe_update_PT,
     compressible_pipe_segment,
+    compressible_dA,
 )
 from incompressible import (
     Bend as Incompressible_Bend,
@@ -505,8 +506,6 @@ def trying_orifices():
         print(f'{mdot}, {orifice_P}, {valve_P}')
 
 
-
-
 def test_contraction_expansion():
     import fluids
     OD = 60.32
@@ -521,6 +520,202 @@ def test_contraction_expansion():
         Kexp = fluids.fittings.diffuser_sharp(Di1=ID_min, Di2=ID)
         print(f'WT:{i},K contraction: {Kcont}, K expansion: {Kexp}')
 
+def test_compressible_dA():
+    from compressible_flow import compressible_changing_area_K, choked_mass_flux
+    import fluids.fittings
+    import fluids.flow_meter
+    import numpy as np
+    csv_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "example_composition.csv")
+    P_in = ureg.Quantity(100, "psi").to("Pa").magnitude
+    P_out_test = ureg.Quantity(50, "psi").to("Pa").magnitude
+    T_in = ureg.Quantity(150, "degF").to("degK").magnitude
+    
+    AS = composition.define_composition_from_csv(csv_path)
+    phase_limits = _build_phase_limits(AS)
+    T_cricondentherm, P_cricondenbar, T_critical, P_critical = phase_limits
+
+    valve_Cv = 1.76
+    orifice_Cd = 0.62
+
+    ID = ureg.Quantity(1.939, "inch")
+    D_orifice_trim = ureg.Quantity(0.25, "inch")
+    ID_si             = ID.to("m").magnitude
+    D_orifice_trim_si = D_orifice_trim.to("m").magnitude
+    A_pipe = math.pi * ID_si ** 2 / 4
+
+    _safe_update_PT(AS, P_in, T_in, *phase_limits)
+
+    mdot = _resolve_mdot(flow_rate = ureg.Quantity(0.07, "mmscf/day"), abstract_state=AS)
+
+
+
+    fs = FlowState(
+        AS=AS, mdot=mdot, A=A_pipe, z=0.0,
+        T_cricondentherm=T_cricondentherm, P_cricondenbar=P_cricondenbar,
+        T_critical=T_critical, P_critical=P_critical,
+    )
+
+    valve = Compressible_Valve(Di=ID, Cv=valve_Cv) #100% open 2" D4 with 1" trim
+
+    orifice = Compressible_Orifice(Di = ID, Do = D_orifice_trim)
+    #find equivalent discharge coefficient for this valve
+    Cd_valve = fluids.flow_meter.K_to_discharge_coefficient(ID_si, D_orifice_trim_si, valve.K)
+
+    #choked flow rate through valve
+    A_throat_valve = Cd_valve * math.pi * D_orifice_trim_si ** 2 / 4
+
+    valve_choked_rate = choked_mass_flux(fs, A_throat_valve, A_outlet=A_pipe)
+    _safe_update_PT(AS, P_in, T_in, *phase_limits) #return to initial conditions
+    orifice_choked_rate = choked_mass_flux(fs, orifice_Cd*orifice.Do_si**2/4*math.pi, A_outlet=A_pipe)
+    _safe_update_PT(AS, P_in, T_in, *phase_limits) #return to initial conditions
+
+    #Compare results of compressible_dA to the valve and orifice dP_dT functions. Might be slightly different due to the differences in how entropy is accounted for 
+    # (dP_dT functions currently used average of inlet/outlet temperature for calculating entropy. compressible_dA function uses average of throat/outlet temperature)
+    #Orifice first.
+    print(f'mdot = {mdot}')
+
+    valve.dP_dT(fs)
+
+    print(f'dP_dT function results')
+    print(f'Valve outlet pressure: {fs.P}, pressure ratio = {fs.P/P_in}, temperature: {fs.T}')
+    _safe_update_PT(AS, P_in, T_in, *phase_limits) #return to initial conditions
+
+    orifice.dP_dT(fs)
+
+    print(f'orifice outlet pressure: {fs.P}, pressure ratio = {fs.P/P_in}, temperature: {fs.T}')
+    _safe_update_PT(AS, P_in, T_in, *phase_limits) #return to initial conditions
+
+    print(f'compressible_dA function results')
+
+    fs.mdot = mdot
+    compressible_dA(fs, A_throat_valve, K = valve.K, A2 = None, P2 = None)
+    P2_valve_mode1 = fs.P
+    print(f'Valve outlet pressure: {fs.P}, pressure ratio = {fs.P/P_in}, temperature: {fs.T}')
+    _safe_update_PT(AS, P_in, T_in, *phase_limits) #return to initial conditions
+
+    # NOTE: Orifice should expose a .K property derived from Cd; for now compute it inline.
+    K_orifice = fluids.flow_meter.discharge_coefficient_to_K(ID_si, D_orifice_trim_si, orifice_Cd)
+    A_throat_orifice = orifice_Cd * math.pi * D_orifice_trim_si ** 2 / 4
+
+    fs.mdot = mdot
+    compressible_dA(fs, A_throat_orifice, K = K_orifice, A2 = None, P2 = None)
+    P2_orifice_mode1 = fs.P
+    print(f'orifice outlet pressure: {fs.P}, pressure ratio = {fs.P/P_in}, temperature: {fs.T}')
+    _safe_update_PT(AS, P_in, T_in, *phase_limits) #return to initial conditions
+
+    # -------------------------------------------------------------------
+    # Mode 2 round-trip: feed the Mode 1 P_out back as P2, verify the
+    # solver recovers the same mdot (within tight tolerance) and lands at
+    # the same outlet pressure.
+    # -------------------------------------------------------------------
+    print('\nMode 2 round-trip (dictate P2, solve mdot)')
+
+    fs.mdot = mdot   # seed; only enters via h_stagnation in choked_mass_flux.
+    compressible_dA(fs, A_throat_valve, K=valve.K, A2=None, P2=P2_valve_mode1)
+    mdot_valve_recovered = fs.mdot
+    P_valve_recovered    = fs.P
+    rel_mdot_err_valve = abs(mdot_valve_recovered - mdot) / mdot
+    print(f'  Valve   : mdot_in={mdot:.6g}, mdot_out={mdot_valve_recovered:.6g}, '
+          f'rel err={rel_mdot_err_valve:.2e}, P_out={P_valve_recovered:.6g} '
+          f'(target {P2_valve_mode1:.6g})')
+    assert rel_mdot_err_valve < 5e-3, (
+        f"Mode 2 valve round-trip: mdot drift {rel_mdot_err_valve:.2%} exceeds 0.5%"
+    )
+    assert abs(P_valve_recovered - P2_valve_mode1) < 100.0, (
+        f"Mode 2 valve round-trip: P_out drift {abs(P_valve_recovered - P2_valve_mode1):.4g} Pa "
+        f"exceeds 100 Pa"
+    )
+    _safe_update_PT(AS, P_in, T_in, *phase_limits)
+
+    fs.mdot = mdot
+    compressible_dA(fs, A_throat_orifice, K=K_orifice, A2=None, P2=P2_orifice_mode1)
+    mdot_orifice_recovered = fs.mdot
+    P_orifice_recovered    = fs.P
+    rel_mdot_err_orifice = abs(mdot_orifice_recovered - mdot) / mdot
+    print(f'  Orifice : mdot_in={mdot:.6g}, mdot_out={mdot_orifice_recovered:.6g}, '
+          f'rel err={rel_mdot_err_orifice:.2e}, P_out={P_orifice_recovered:.6g} '
+          f'(target {P2_orifice_mode1:.6g})')
+    assert rel_mdot_err_orifice < 5e-3, (
+        f"Mode 2 orifice round-trip: mdot drift {rel_mdot_err_orifice:.2%} exceeds 0.5%"
+    )
+    assert abs(P_orifice_recovered - P2_orifice_mode1) < 100.0, (
+        f"Mode 2 orifice round-trip: P_out drift "
+        f"{abs(P_orifice_recovered - P2_orifice_mode1):.4g} Pa exceeds 100 Pa"
+    )
+    _safe_update_PT(AS, P_in, T_in, *phase_limits)
+
+    # -------------------------------------------------------------------
+    # Mode 2 choked branch: pick a P2 well below P2_choked. Solver should
+    # clamp mdot to the choked value and the outlet stagnation enthalpy
+    # should match the inlet.
+    # -------------------------------------------------------------------
+    print('\nMode 2 choked branch (P2 << P2_choked)')
+    h_in_static = AS.hmass()
+    # Capture stagnation enthalpy at the *Mode 1* mdot (small v_in => h0 ~ h_static).
+    v_in_seed   = mdot / (AS.rhomass() * A_pipe)
+    h0_inlet    = h_in_static + 0.5 * v_in_seed**2
+
+    fs.mdot = mdot
+    P2_low = 0.2 * P_in
+    compressible_dA(fs, A_throat_valve, K=valve.K, A2=None, P2=P2_low)
+    mdot_choked_solved = fs.mdot
+    v_out_chk = fs.v
+    h_out_chk = fs.AS.hmass()
+    h0_out    = h_out_chk + 0.5 * v_out_chk**2
+
+    # Independent choked-rate reference from choked_mass_flux at the inlet
+    # stagnation state for comparison.
+    _safe_update_PT(AS, P_in, T_in, *phase_limits)
+    fs.A    = A_pipe
+    fs.mdot = mdot
+    mdot_ref, *_ = choked_mass_flux(fs, A_throat_valve)
+    rel_mdot_choked_err = abs(mdot_choked_solved - mdot_ref) / mdot_ref
+    h0_rel_err = abs(h0_out - h0_inlet) / max(abs(h0_inlet), 1.0)
+    print(f'  mdot_choked solved={mdot_choked_solved:.6g}, reference={mdot_ref:.6g}, '
+          f'rel err={rel_mdot_choked_err:.2e}')
+    print(f'  h0 drift: inlet={h0_inlet:.6g}, outlet={h0_out:.6g}, '
+          f'rel err={h0_rel_err:.2e}')
+    assert rel_mdot_choked_err < 1e-2, (
+        f"Mode 2 choked branch: mdot mismatch {rel_mdot_choked_err:.2%} exceeds 1%"
+    )
+    assert h0_rel_err < 1e-4, (
+        f"Mode 2 choked branch: stagnation enthalpy drift {h0_rel_err:.2%} exceeds 0.01%"
+    )
+    _safe_update_PT(AS, P_in, T_in, *phase_limits)
+
+    # -------------------------------------------------------------------
+    # Input validation guards.
+    # -------------------------------------------------------------------
+    print('\nInput validation')
+    fs.mdot = mdot
+    fs.A    = A_pipe
+    for label, kwargs, expected_substr in [
+        ("P2 >= P_in", dict(A_throat=A_throat_valve, K=valve.K, A2=A_pipe, P2=P_in + 1.0),
+         "P2 must be strictly less than"),
+        ("K < 0",     dict(A_throat=A_throat_valve, K=-1.0, A2=A_pipe, P2=None),
+         "K must be non-negative"),
+        ("A_throat > fs.A", dict(A_throat=A_pipe * 2.0, K=valve.K, A2=A_pipe, P2=None),
+         "A_throat must be in"),
+    ]:
+        _safe_update_PT(AS, P_in, T_in, *phase_limits)
+        fs.A = A_pipe
+        try:
+            compressible_dA(fs, **kwargs)
+        except ValueError as e:
+            assert expected_substr in str(e), (
+                f"Validation case {label!r} raised ValueError but message "
+                f"missing {expected_substr!r}: {e}"
+            )
+            print(f'  {label}: ValueError raised correctly')
+        else:
+            raise AssertionError(
+                f"Validation case {label!r} did not raise ValueError"
+            )
+
+
+
+
+
 if __name__ == "__main__":
     
     # test_compressible_fittings()
@@ -532,4 +727,5 @@ if __name__ == "__main__":
     #test_K()
     # test_contraction_expansion()
     # pseudo_orifice()
-    trying_orifices()
+    # trying_orifices()
+    test_compressible_dA()

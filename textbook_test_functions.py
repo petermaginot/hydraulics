@@ -889,7 +889,7 @@ def test_valve_minimum_diameter_choke():
     globe-valve-like K=5, and an internal throat half the pipe diameter
     (A_throat = A_pipe/4).  Picks mdot in the band where:
         mdot_choked_at_pipe_area  > mdot  > mdot_choked_at_throat_area
-    so the legacy pipe-area screen (Valve without minimum_diameter)
+    so the pipe-area screen (Valve without minimum_diameter)
     silently passes, but the throat-area screen (Valve with
     minimum_diameter) raises ChokedFlowError.  This is the gap that
     improvements.md R1.5 / R2 flagged and that minimum_diameter closes.
