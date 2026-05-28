@@ -506,6 +506,139 @@ class Line_Segment(Base_Line_Segment):
             print(f" "*len(msg), end="\r")
         return profile_points
 
+    def dmdot_dT(
+        self,
+        fs,
+        P2,
+        isothermal=False,
+        q_wall=0.0,
+        mu=None,
+        energy_tol=10.0,
+        dPdL_rel_tol=0.05,
+        max_split_depth=8,
+        verbose=False,
+    ):
+        """Inverse of dP_dT: solve for the mass flow rate that produces
+        outlet pressure P2 along the segment.
+
+        Wraps the entire dP_dT slice loop in a forward closure and drives
+        mdot via _solve_mdot_for_outlet_P.  The choke bound is the
+        ideal-gas sonic mass flux at the smallest profile area --
+        deliberately loose; the helper's retreat loop handles real-gas
+        drift and the Fanno-style choke that friction induces well below
+        the isentropic isentropic bound.
+
+        The forward closure restores fs.AS, fs.A, and fs.z to the inlet
+        state on each call so the slice loop sees the same starting
+        conditions every iteration.  Heat input q_wall and integrator
+        tolerances are forwarded verbatim to the inner dP_dT.
+
+        Args:
+            fs : FlowState at the segment inlet (static).  fs.AS must be
+                 at the inlet (P, T); fs.mdot is consulted only as an
+                 optional seed and is overwritten.  Mutated in place to
+                 the outlet state on return.
+            P2 : float, target outlet pressure [Pa].
+            isothermal, q_wall, mu, energy_tol, dPdL_rel_tol,
+            max_split_depth, verbose : forwarded to self.dP_dT.
+
+        Returns:
+            profile_points : list, same format as Line_Segment.dP_dT --
+            inlet through outlet (distance, P, T, v) tuples taken from
+            the final converged solve.
+
+        Raises:
+            ValueError      : if the profile has fewer than two points,
+                              or P2 >= inlet pressure.
+            ChokedFlowError : if P2 is below the segment's choke limit.
+        """
+        if len(self.profile) < 2:
+            raise ValueError(
+                "Line_Segment.dmdot_dT: profile must have at least two points."
+            )
+
+        A_inlet = self.profile[0][3]
+        _area_match(fs, A_inlet)
+
+        if P2 >= fs.P:
+            raise ValueError(
+                f"Line_Segment.dmdot_dT: P2 must be strictly less than the "
+                f"inlet pressure (got P2={P2:.4g} Pa, P_in={fs.P:.4g} Pa)."
+            )
+
+        # Snapshot the inlet state so the forward closure can restore it
+        # on every brentq evaluation.
+        P0 = fs.P
+        T0 = fs.T
+        A0 = fs.A
+        z0 = fs.z
+
+        # Crude upper bound: ideal-gas isentropic sonic mass flux at the
+        # smallest profile area.  True Fanno choke under friction is
+        # lower; the helper's retreat handles the gap.
+        G_max = _ideal_gas_G_max(fs.AS)
+        A_min = min(p[3] for p in self.profile)
+        mdot_choked = G_max * A_min
+
+        # Seed: 10% of the loose upper bound.  Only used to floor mdot_lo.
+        mdot_guess = 0.1 * mdot_choked
+
+        # Mutable container so the closure can publish the final
+        # profile_points list out to the caller.
+        last_profile_points = [None]
+
+        def forward_at_mdot(mdot_trial):
+            _safe_flowstate_update_PT(fs, P0, T0)
+            fs.A    = A0
+            fs.z    = z0
+            fs.mdot = mdot_trial
+            last_profile_points[0] = self.dP_dT(
+                fs,
+                isothermal=isothermal,
+                q_wall=q_wall,
+                mu=mu,
+                energy_tol=energy_tol,
+                dPdL_rel_tol=dPdL_rel_tol,
+                max_split_depth=max_split_depth,
+                verbose=verbose,
+            )
+
+        # Suppress the per-iteration ideal-gas choke diagnostic emitted
+        # by dP_dT.  The diagnostic is a forward-direction informational
+        # tool; under the inverse solve it fires on every brentq
+        # iteration with slightly different cumulative integrals (which
+        # defeats Python's default dedupe).  The reactive choke
+        # detection inside compressible_pipe_segment still fires
+        # normally.
+        try:
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore", UserWarning)
+                _solve_mdot_for_outlet_P(
+                    fs, P2,
+                    forward_at_mdot=forward_at_mdot,
+                    mdot_choked=mdot_choked,
+                    mdot_guess=mdot_guess,
+                    caller_name="Line_Segment.dmdot_dT",
+                )
+        except RuntimeError as exc:
+            # Bracket failure -- the requested P2 is below what the segment
+            # can deliver subsonically (Fanno-style choke at the constriction
+            # point).  Surface as ChokedFlowError with the real-gas choke
+            # bound at A_min for the network solver to clamp against.
+            _safe_flowstate_update_PT(fs, P0, T0)
+            fs.A = A0
+            fs.z = z0
+            try:
+                choke = choked_mass_flux(fs=fs, A_throat=A_min)
+                raise ChokedFlowError(*choke) from exc
+            except _NoChokeBracketError:
+                # Real-gas choke estimator couldn't bracket either --
+                # propagate the original failure rather than fabricate
+                # a structured payload.
+                raise exc
+
+        return last_profile_points[0]
+
 
 class Bend(Base_Bend):
     """Rounded pipe bend fitting with compressible pressure/temperature
@@ -557,6 +690,105 @@ class Bend(Base_Bend):
 
         compressible_K(fs, K)
 
+    def dmdot_dT(self, fs, P2):
+        """Inverse of dP_dT: solve for the mass flow rate that produces
+        outlet pressure P2 through the bend.
+
+        K depends on Reynolds number which depends on mdot, so a
+        K <-> mdot fixed-point loop wraps the per-iteration brentq
+        inversion: pick K at the current mdot seed, drive
+        `_solve_mdot_for_outlet_P` with a `compressible_K(fs, K)` forward
+        closure, then re-evaluate K at the converged mdot and repeat
+        until self-consistent.  Re enters bend_rounded only logarithmically,
+        so 2-3 outer iterations typically suffice.
+
+        Args:
+            fs : FlowState at the upstream connection (static).  fs.AS
+                 must be at the inlet (P, T); fs.mdot is consulted only
+                 as an optional seed and is overwritten.  Mutated in
+                 place.
+            P2 : float, target outlet pressure [Pa].
+            mu : float or None, viscosity [Pa*s].  If None (default),
+                 CoolProp / LGE is used at each K evaluation.
+
+        Returns:
+            None.  fs is mutated in place.
+
+        Raises:
+            ValueError      : if P2 >= inlet pressure.
+            ChokedFlowError : if P2 is below the bend's choke limit.
+        """
+        Di = self.Di_si
+        A  = math.pi * Di ** 2 / 4.0
+        _area_match(fs, A)
+
+        if P2 >= fs.P:
+            raise ValueError(
+                f"Bend.dmdot_dT: P2 must be strictly less than the inlet "
+                f"pressure (got P2={P2:.4g} Pa, P_in={fs.P:.4g} Pa)."
+            )
+
+        P1     = fs.P
+        T1     = fs.T
+        rho_in = fs.rho
+        mu     = _viscosity_or_LGE(fs.AS, T1, rho_in)
+
+        # Choke bound at the (constant) pipe area.  choked_mass_flux
+        # mutates fs to the sonic throat state; restore inlet.
+        choke = choked_mass_flux(fs=fs, A_throat=A)
+        mdot_choked = choke[0]
+        _safe_flowstate_update_PT(fs, P1, T1)
+        fs.A = A
+
+        # Seed mdot for the first Re/K evaluation.
+        if fs.mdot > 0.0:
+            mdot_seed = fs.mdot
+        else:
+            # Rough incompressible guess assuming K ~ 0.3 (typical bend);
+            # any positive value works since K is re-fit on each pass.
+            mdot_seed = A * math.sqrt(2.0 * (P1 - P2) * rho_in / 0.3)
+
+        _MDOT_REL_TOL = 1.0e-4
+        for _ in range(8):
+            Re = fluids_Reynolds(
+                V=mdot_seed / (rho_in * A), D=Di, rho=rho_in, mu=mu,
+            )
+            K = fluids.fittings.bend_rounded(
+                Di=Di, bend_diameters=self.bend_dias,
+                angle=self.ang_deg, Re=Re,
+            )
+
+            def forward_at_mdot(mdot_trial, K=K):
+                _safe_flowstate_update_PT(fs, P1, T1)
+                fs.A    = A
+                fs.mdot = mdot_trial
+                compressible_K(fs, K)
+
+            mdot_guess = A * math.sqrt(2.0 * (P1 - P2) * rho_in / max(K, 1e-6))
+
+            try:
+                mdot_new = _solve_mdot_for_outlet_P(
+                    fs, P2,
+                    forward_at_mdot=forward_at_mdot,
+                    mdot_choked=mdot_choked,
+                    mdot_guess=mdot_guess,
+                    caller_name="Bend.dmdot_dT",
+                )
+            except RuntimeError as exc:
+                raise ChokedFlowError(*choke) from exc
+
+            if abs(mdot_new - mdot_seed) <= _MDOT_REL_TOL * max(mdot_new, 1e-30):
+                return
+            mdot_seed = mdot_new
+
+        warnings.warn(
+            f"Bend.dmdot_dT: K <-> mdot fixed point did not converge within "
+            f"8 iterations (last mdot={mdot_seed:.4g} kg/s, target "
+            f"P2={P2:.4g} Pa, inlet P1={P1:.4g} Pa).  Result reflects the "
+            f"final iterate.",
+            UserWarning,
+        )
+
 
 class Valve(Base_Valve):
     """Valve fitting with compressible pressure/temperature calculation.
@@ -574,14 +806,21 @@ class Valve(Base_Valve):
     def dP_dT(self, fs):
         """Outlet conditions for a compressible fluid passing through the valve.
 
-        Absorbs any inlet-area discontinuity isentropically, then delegates
-        to compressible_K() using the instance's K-factor.  fs.A is unchanged
-        on return.
+        Absorbs any inlet-area discontinuity isentropically, then dispatches
+        on whether the valve carries a geometric constriction:
 
-        If the instance carries a ``minimum_diameter`` (set at construction),
-        the implied throat area is passed to compressible_K() as the
-        choke-detection throat with recovery to the body area, so internal
-        choking is caught even when the body outlet is comfortably subsonic.
+          * No constriction (``minimum_diameter`` is None or equal to ``Di``):
+            delegates to compressible_changing_area_K() with A_out = A_pipe.
+            The K-loss is applied across the pipe-area control volume; the
+            entropy balance uses T_avg.
+          * Constriction (``minimum_diameter`` < ``Di``): delegates to
+            compressible_dA() with A_throat = pi*D_min^2/4 and A2 = A_pipe.
+            Internal acceleration to the throat is isentropic; the K-loss
+            recovery from throat to body uses the rigorous coupled (P, T)
+            solve.  Internal choking at the trim is caught even when the
+            body outlet is comfortably subsonic.
+
+        fs.A is the pipe area on return in both branches.
 
         Args:
             fs : FlowState at the upstream connection (static).  fs.AS must
@@ -590,12 +829,105 @@ class Valve(Base_Valve):
         Returns:
             None.  fs is mutated in place.
         """
-        Di = self.Di_si
-        A  = math.pi * Di ** 2 / 4.0
-        _area_match(fs, A)
-        A_throat = (math.pi * self.D_min_si ** 2 / 4.0
-                    if self.D_min_si is not None else None)
-        compressible_K(fs, self.K, A_throat=A_throat)
+        A_pipe = math.pi * self.Di_si ** 2 / 4.0
+        _area_match(fs, A_pipe)
+
+        if self.D_min_si is None or self.D_min_si >= self.Di_si:
+            compressible_changing_area_K(fs, A_pipe, K=self.K)
+        else:
+            A_throat = math.pi * self.D_min_si ** 2 / 4.0
+            compressible_dA(fs, A_throat, K=self.K, A2=A_pipe)
+
+    def dmdot_dT(self, fs, P2):
+        """Inverse of dP_dT: solve for the mass flow rate that produces
+        outlet pressure P2, then mutate fs to the outlet state.
+
+        Dispatches on the same constriction test as dP_dT:
+
+          * No constriction (``minimum_diameter`` is None or equal to ``Di``):
+            wraps compressible_changing_area_K(fs, A_pipe, K) in a forward
+            closure and drives it via _solve_mdot_for_outlet_P.  The choke
+            bound is the isentropic sonic mass flux at the pipe area; the
+            true Fanno choke under K-loss is lower, which the helper's
+            retreat loop discovers.
+          * Constriction (``minimum_diameter`` < ``Di``): forwards directly
+            to compressible_dA in Mode 2, which already implements the
+            throat-then-recovery inversion.
+
+        Args:
+            fs : FlowState at the upstream connection (static).  fs.AS
+                 must be at the inlet (P, T); fs.mdot is consulted only as
+                 an optional seed and is overwritten.  Mutated in place to
+                 the outlet state; fs.mdot holds the solved value on
+                 return.
+            P2 : float, target outlet pressure [Pa].
+
+        Returns:
+            None.  fs is mutated in place.
+
+        Raises:
+            ValueError      : if P2 >= inlet pressure, or if the no-constriction
+                              branch is called with K = 0 (lossless: P2 must
+                              equal P_in for subsonic flow).
+            ChokedFlowError : if P2 is below the component's choke limit
+                              (raised by compressible_dA on the constricted
+                              branch, or by this method on the no-constriction
+                              branch after a bracket failure).
+        """
+        A_pipe = math.pi * self.Di_si ** 2 / 4.0
+        _area_match(fs, A_pipe)
+
+        if P2 >= fs.P:
+            raise ValueError(
+                f"{type(self).__name__}.dmdot_dT: P2 must be strictly less than "
+                f"the inlet pressure (got P2={P2:.4g} Pa, P_in={fs.P:.4g} Pa)."
+            )
+
+        if self.D_min_si is not None and self.D_min_si < self.Di_si:
+            A_throat = math.pi * self.D_min_si ** 2 / 4.0
+            compressible_dA(fs, A_throat, K=self.K, A2=A_pipe, P2=P2)
+            return
+
+        if self.K <= 0.0:
+            raise ValueError(
+                f"{type(self).__name__}.dmdot_dT: cannot solve for mdot with "
+                f"K=0 (lossless valve has no P2 < P_in subsonic solution)."
+            )
+
+        P1     = fs.P
+        T1     = fs.T
+        A1     = fs.A
+        rho_in = fs.rho
+
+        # Choke bound at the pipe area.  choked_mass_flux mutates fs.AS to
+        # the throat (sonic) state; restore inlet for the forward closure.
+        choke = choked_mass_flux(fs=fs, A_throat=A1)
+        mdot_choked = choke[0]
+        _safe_flowstate_update_PT(fs, P1, T1)
+        fs.A = A1
+
+        mdot_guess = A1 * math.sqrt(2.0 * (P1 - P2) * rho_in / self.K)
+
+        def forward_at_mdot(mdot_trial):
+            _safe_flowstate_update_PT(fs, P1, T1)
+            fs.A    = A1
+            fs.mdot = mdot_trial
+            compressible_changing_area_K(fs=fs, A_out=A1, K=self.K)
+
+        try:
+            _solve_mdot_for_outlet_P(
+                fs, P2,
+                forward_at_mdot=forward_at_mdot,
+                mdot_choked=mdot_choked,
+                mdot_guess=mdot_guess,
+                caller_name=f"{type(self).__name__}.dmdot_dT",
+            )
+        except RuntimeError as exc:
+            # Bracket failure on a monotonically-decreasing residual means
+            # the component cannot subsonically attain P2 at this inlet
+            # state.  Surface as ChokedFlowError so the network solver can
+            # clamp mdot via the structured payload.
+            raise ChokedFlowError(*choke) from exc
 
 
 # When network._reversed_component substitutes K = _SEALING_K (~ 1e9) on a
@@ -639,13 +971,15 @@ def _sealed_outlet_PT(P_in, T_in):
 class CheckValve(Base_CheckValve):
     """Check valve with compressible pressure/temperature calculation.
 
-    Forward flow uses the K-factor stored on the instance and delegates to
-    compressible_K().  Reverse flow is handled upstream by
-    network._reversed_component, which returns a shallow copy with K replaced
-    by _SEALING_K (~ 1e9); dP_dT() detects that case (K >= _SEALED_K_THRESHOLD)
-    and short-circuits to a clamped sealed-state outlet instead of running
-    the inertial formula, which would otherwise produce an unphysical
-    negative P_out that crashes CoolProp.
+    Forward flow uses the K-factor stored on the instance and dispatches to
+    either compressible_changing_area_K() (no constriction) or
+    compressible_dA() (constriction at the trim), mirroring Valve.dP_dT.
+    Reverse flow is handled upstream by network._reversed_component, which
+    returns a shallow copy with K replaced by _SEALING_K (~ 1e9); dP_dT()
+    detects that case (K >= _SEALED_K_THRESHOLD) and short-circuits to a
+    clamped sealed-state outlet instead of running the forward-flow path,
+    which would otherwise produce an unphysical negative P_out that crashes
+    CoolProp.
 
     Constructor arguments are identical to Base_CheckValve:
         Di : pint Quantity or float (m if float).  Pipe inner diameter.
@@ -656,10 +990,21 @@ class CheckValve(Base_CheckValve):
         """Outlet conditions for a compressible fluid passing through the
         check valve.
 
+        Reverse flow (sealing K substituted by _reversed_component) is
+        short-circuited to a clamped sealed-state outlet, see module-level
+        _SEALED_* constants.
+
         Forward flow (physical K) absorbs any inlet-area discontinuity, then
-        delegates to compressible_K().  Reverse flow (sealing K substituted
-        by _reversed_component) is short-circuited to a clamped sealed-state
-        outlet, see module-level _SEALED_* constants.
+        dispatches on whether the check valve carries a geometric constriction:
+
+          * No constriction (``minimum_diameter`` is None or equal to ``Di``):
+            delegates to compressible_changing_area_K() with A_out = A_pipe.
+          * Constriction (``minimum_diameter`` < ``Di``): delegates to
+            compressible_dA() with A_throat = pi*D_min^2/4 and A2 = A_pipe.
+            Internal choking at the trim is caught even when the body outlet
+            is comfortably subsonic.
+
+        fs.A is the pipe area on return in the forward-flow branches.
 
         Args:
             fs : FlowState at the upstream connection (static).  fs.AS must
@@ -673,12 +1018,48 @@ class CheckValve(Base_CheckValve):
             _safe_flowstate_update_PT(fs, P_out, T_out)
             return
 
-        Di = self.Di_si
-        A  = math.pi * Di ** 2 / 4.0
-        _area_match(fs, A)
-        A_throat = (math.pi * self.D_min_si ** 2 / 4.0
-                    if self.D_min_si is not None else None)
-        compressible_K(fs, self.K, A_throat=A_throat)
+        A_pipe = math.pi * self.Di_si ** 2 / 4.0
+        _area_match(fs, A_pipe)
+
+        if self.D_min_si is None or self.D_min_si >= self.Di_si:
+            compressible_changing_area_K(fs, A_pipe, K=self.K)
+        else:
+            A_throat = math.pi * self.D_min_si ** 2 / 4.0
+            compressible_dA(fs, A_throat, K=self.K, A2=A_pipe)
+
+    def dmdot_dT(self, fs, P2):
+        """Inverse of dP_dT for the check valve: solve for the mass flow
+        rate that produces outlet pressure P2.
+
+        Mirrors Valve.dmdot_dT exactly on the forward-flow branches.  The
+        sealed-K short-circuit (used by network._reversed_component for
+        reverse flow) has no inverse -- a sealed valve passes no flow at
+        any P2 -- so this method raises ValueError when invoked on a
+        sealed shadow.  The network solver does not currently call
+        dmdot_dT on reversed shadows; the guard is defensive.
+
+        Args:
+            fs : FlowState at the upstream connection (static).  fs.AS
+                 must be at the inlet (P, T); fs.mdot is consulted only as
+                 an optional seed and is overwritten.  Mutated in place.
+            P2 : float, target outlet pressure [Pa].
+
+        Returns:
+            None.  fs is mutated in place.
+
+        Raises:
+            ValueError      : on a sealed-K shadow, or for the same
+                              conditions as Valve.dmdot_dT.
+            ChokedFlowError : if P2 is below the component's choke limit.
+        """
+        if self.K >= _SEALED_K_THRESHOLD:
+            raise ValueError(
+                "CheckValve.dmdot_dT: undefined for sealed check valve "
+                "(K >= _SEALED_K_THRESHOLD); reverse-flow handling is "
+                "governed at the network level."
+            )
+        # Forward-flow inversion is identical to Valve.dmdot_dT.
+        Valve.dmdot_dT(self, fs, P2)
 
 
 class Contraction_Expansion(Base_Contraction_Expansion):
@@ -731,6 +1112,106 @@ class Contraction_Expansion(Base_Contraction_Expansion):
 
         compressible_changing_area_K(fs, A_DS, K)
 
+    def dmdot_dT(self, fs, P2):
+        """Inverse of dP_dT: solve for the mass flow rate that produces
+        outlet pressure P2 across the area change.
+
+        K is computed from the diameter ratio only (no mdot dependence),
+        so this is a single brentq-on-mdot drive of
+        compressible_changing_area_K via _solve_mdot_for_outlet_P -- no
+        outer fixed-point loop is needed.  Choke is at the smaller of
+        the two areas (the throat of a contraction; the inlet of an
+        expansion).
+
+        Only the contraction direction (Di_US > Di_DS) is supported.
+        Expansions are deferred: for a sharp diffuser the kinetic-energy
+        recovery term in Bernoulli typically exceeds the K-loss term, so
+        P_out > P_in and the residual sign convention used by
+        _solve_mdot_for_outlet_P is reversed.  Equal-diameter is
+        degenerate (K=0, all mdot satisfy P2 = P_in).
+
+        Args:
+            fs : FlowState at the upstream connection (static).  fs.AS
+                 must be at the inlet (P, T); fs.mdot is consulted only
+                 as an optional seed and is overwritten.  Mutated in
+                 place to the outlet (A_DS, P2, T_out) state.
+            P2 : float, target outlet pressure [Pa].
+
+        Returns:
+            None.  fs is mutated in place.
+
+        Raises:
+            ValueError         : if P2 >= inlet pressure, or if
+                                 Di_US == Di_DS.
+            NotImplementedError: for the expansion direction (Di_US < Di_DS).
+            ChokedFlowError    : if P2 is below the throat choke limit.
+        """
+        Di_US = self.Di_US_si
+        Di_DS = self.Di_DS_si
+
+        if abs(Di_US - Di_DS) < 1e-12:
+            raise ValueError(
+                "Contraction_Expansion.dmdot_dT: equal-diameter case is "
+                "degenerate (K=0, no friction -- P_out always equals P_in)."
+            )
+        if Di_US < Di_DS:
+            raise NotImplementedError(
+                "Contraction_Expansion.dmdot_dT: expansion inversion is "
+                "not implemented.  For a sharp expansion the kinetic-recovery "
+                "term in Bernoulli usually exceeds the K-loss term (P_out > "
+                "P_in), reversing the residual sign convention used by the "
+                "shared mdot solver.  Wrap the expansion in a downstream "
+                "frictional component and invert that instead."
+            )
+
+        A_US = math.pi * Di_US ** 2 / 4.0
+        A_DS = math.pi * Di_DS ** 2 / 4.0
+        _area_match(fs, A_US)
+
+        if P2 >= fs.P:
+            raise ValueError(
+                f"Contraction_Expansion.dmdot_dT: P2 must be strictly less "
+                f"than the inlet pressure (got P2={P2:.4g} Pa, "
+                f"P_in={fs.P:.4g} Pa)."
+            )
+
+        if Di_US > Di_DS:
+            K_ds = fluids.fittings.contraction_sharp(Di1=Di_US, Di2=Di_DS)
+            K    = K_ds * (A_DS / A_US) ** 2
+        else:
+            K = fluids.fittings.diffuser_sharp(Di1=Di_US, Di2=Di_DS)
+
+        P1     = fs.P
+        T1     = fs.T
+        rho_in = fs.rho
+
+        # Choke is at the smaller area.  choked_mass_flux mutates fs to
+        # the sonic-throat state; restore inlet for the forward closure.
+        A_throat = min(A_US, A_DS)
+        choke = choked_mass_flux(fs=fs, A_throat=A_throat)
+        mdot_choked = choke[0]
+        _safe_flowstate_update_PT(fs, P1, T1)
+        fs.A = A_US
+
+        mdot_guess = A_US * math.sqrt(2.0 * (P1 - P2) * rho_in / max(K, 1e-6))
+
+        def forward_at_mdot(mdot_trial):
+            _safe_flowstate_update_PT(fs, P1, T1)
+            fs.A    = A_US
+            fs.mdot = mdot_trial
+            compressible_changing_area_K(fs, A_DS, K)
+
+        try:
+            _solve_mdot_for_outlet_P(
+                fs, P2,
+                forward_at_mdot=forward_at_mdot,
+                mdot_choked=mdot_choked,
+                mdot_guess=mdot_guess,
+                caller_name="Contraction_Expansion.dmdot_dT",
+            )
+        except RuntimeError as exc:
+            raise ChokedFlowError(*choke) from exc
+
 
 # ---------------------------------------------------------------------------
 # Orifice -- compressible child class
@@ -739,8 +1220,13 @@ class Contraction_Expansion(Base_Contraction_Expansion):
 class Orifice(Base_Orifice):
     """Square-edged concentric orifice plate, compressible (gas) flow.
 
-    Inherits geometry storage and validation from Base_Orifice.  Delegates
-    all physics to compressible_orifice().
+    Inherits geometry storage and validation from Base_Orifice.  Physics are
+    handled by compressible_dA: isentropic acceleration to the vena-contracta
+    throat (area = Cd * A_bore) followed by K-loss entropy recovery to the
+    downstream pipe area.  The discharge coefficient Cd is computed via the
+    ISO 5167-2 / Reader-Harris-Gallagher correlation or taken from
+    Cd_override; the K-factor is derived from Cd via
+    fluids.flow_meter.discharge_coefficient_to_K.
 
     Constructor arguments are identical to Base_Orifice:
         Di          : pint Quantity or float (m if float).  Pipe inner diameter.
@@ -750,10 +1236,13 @@ class Orifice(Base_Orifice):
     """
 
     def dP_dT(self, fs):
-        """Outlet conditions for a compressible fluid passing through the orifice.
+        """Advance fs to the orifice outlet state.
 
-        Absorbs any inlet-area discontinuity isentropically, then delegates
-        to compressible_orifice().  fs.A is unchanged on return.
+        Absorbs any inlet-area mismatch isentropically, resolves the
+        discharge coefficient at the current flow conditions, converts it to
+        a K-factor, then calls compressible_dA to perform the two-stage
+        (isentropic throat + K-loss recovery) solve.  fs.A is restored to
+        the pipe area on return.
 
         Args:
             fs : FlowState at the upstream connection (static).  fs.AS must
@@ -763,11 +1252,107 @@ class Orifice(Base_Orifice):
             None.  fs is mutated in place.
         """
         A_pipe = math.pi * self.Di_si ** 2 / 4.0
+        A_bore = math.pi * self.Do_si ** 2 / 4.0
         _area_match(fs, A_pipe)
-        compressible_orifice(fs, self.Di_si, self.Do_si, self.taps, self.Cd_override)
 
+        rho_in = fs.rho
+        mu = _viscosity_or_LGE(fs.AS, fs.T, rho_in)
 
-# downsample_profile is defined in component_classes and imported above.
+        if self.Cd_override is not None:
+            Cd = self.Cd_override
+        else:
+            Cd = fluids.flow_meter.C_Reader_Harris_Gallagher(
+                D=self.Di_si, Do=self.Do_si,
+                rho=rho_in, mu=mu, m=fs.mdot,
+                taps=self.taps,
+            )
+
+        K        = fluids.flow_meter.discharge_coefficient_to_K(D=self.Di_si, Do=self.Do_si, C=Cd)
+        A_throat = Cd * A_bore
+        compressible_dA(fs, A_throat, K=K, A2=A_pipe)
+
+    def dmdot_dT(self, fs, P2):
+        """Inverse of dP_dT: solve for the mass flow rate that produces
+        outlet pressure P2 across the orifice.
+
+        With ``Cd_override`` set, this is a single direct call to
+        compressible_dA in Mode 2.  With the RHG correlation in effect,
+        Cd depends on Reynolds number which depends on mdot, so a Cd
+        fixed-point loop wraps the dA call: seed mdot from fs.mdot (or
+        an incompressible-orifice estimate), evaluate Cd at that mdot,
+        invert dA at that K, repeat until mdot is self-consistent.  Cd
+        is weakly Re-sensitive so 2-3 iterations typically suffice.
+
+        Args:
+            fs : FlowState at the upstream connection (static).  fs.AS
+                 must be at the inlet (P, T); fs.mdot is consulted only
+                 as an optional seed and is overwritten.  Mutated in
+                 place to the outlet state.
+            P2 : float, target outlet pressure [Pa].
+
+        Returns:
+            None.  fs is mutated in place; fs.mdot holds the solved
+            value.
+
+        Raises:
+            ValueError      : if P2 >= inlet pressure.
+            ChokedFlowError : if P2 is below the orifice choke limit.
+        """
+        A_pipe = math.pi * self.Di_si ** 2 / 4.0
+        A_bore = math.pi * self.Do_si ** 2 / 4.0
+        _area_match(fs, A_pipe)
+
+        if P2 >= fs.P:
+            raise ValueError(
+                f"Orifice.dmdot_dT: P2 must be strictly less than the "
+                f"inlet pressure (got P2={P2:.4g} Pa, P_in={fs.P:.4g} Pa)."
+            )
+
+        P1, T1, A1 = fs.P, fs.T, fs.A
+        rho_in = fs.rho
+        mu     = _viscosity_or_LGE(fs.AS, T1, rho_in)
+
+        if self.Cd_override is not None:
+            Cd = self.Cd_override
+            K  = fluids.flow_meter.discharge_coefficient_to_K(
+                D=self.Di_si, Do=self.Do_si, C=Cd,
+            )
+            compressible_dA(fs, Cd * A_bore, K=K, A2=A_pipe, P2=P2)
+            return
+
+        # RHG fixed point on Cd <-> mdot.  Cd_iter typically settles in
+        # 2-3 passes; cap at 8 for pathological cases (warn if hit).
+        mdot_seed = fs.mdot if fs.mdot > 0.0 else (
+            # Incompressible orifice equation, Cd=0.6 placeholder.
+            0.6 * A_bore * math.sqrt(2.0 * rho_in * (P1 - P2))
+        )
+        _MDOT_REL_TOL = 1.0e-4
+        for _ in range(8):
+            Cd = fluids.flow_meter.C_Reader_Harris_Gallagher(
+                D=self.Di_si, Do=self.Do_si,
+                rho=rho_in, mu=mu, m=mdot_seed,
+                taps=self.taps,
+            )
+            K = fluids.flow_meter.discharge_coefficient_to_K(
+                D=self.Di_si, Do=self.Do_si, C=Cd,
+            )
+            # Restore inlet before each dA call (dA mutates fs in place).
+            _safe_flowstate_update_PT(fs, P1, T1)
+            fs.A    = A1
+            fs.mdot = mdot_seed
+            compressible_dA(fs, Cd * A_bore, K=K, A2=A_pipe, P2=P2)
+            mdot_new = fs.mdot
+            if abs(mdot_new - mdot_seed) <= _MDOT_REL_TOL * max(mdot_new, 1e-30):
+                return
+            mdot_seed = mdot_new
+        warnings.warn(
+            f"Orifice.dmdot_dT: Cd <-> mdot fixed point did not converge "
+            f"within 8 iterations (last mdot={mdot_seed:.4g} kg/s, "
+            f"target P2={P2:.4g} Pa, inlet P1={P1:.4g} Pa). "
+            f"Result reflects the final iterate.",
+            UserWarning,
+        )
+
 
 # ---------------------------------------------------------------------------
 # Flow-rate helper
@@ -1360,8 +1945,8 @@ def choked_mass_flux(fs, A_throat, A_outlet=None, n_grid=40):
 def _choke_pre_screen(fs, A_throat, A_outlet, A_on_choke=None):
     """Pre-screen for choked flow at A_throat and raise ChokedFlowError if so.
 
-    Two-stage gate used by compressible_K, compressible_changing_area_K, and
-    compressible_orifice:
+    Two-stage gate used by compressible_K, compressible_changing_area_K
+
       1. Cheap ideal-gas G_max bound at A_throat -- no-op when fs.mdot is
          below ~50% of it (cannot be choked at this stagnation state).
       2. Above the bound, run the rigorous real-gas choked_mass_flux march.
@@ -1417,147 +2002,6 @@ def _choke_pre_screen(fs, A_throat, A_outlet, A_on_choke=None):
     # Not choked: the march moved AS; restore to inlet for caller's solve.
     _safe_flowstate_update_PT(fs, P_in, T_in)
 
-
-def compressible_orifice(fs, Di, Do, taps, Cd_override=None):
-    """Outlet conditions for a compressible fluid passing through a square-edged
-    concentric orifice plate. 
-
-    Assumes fs.A already equals the pipe area (math.pi * Di**2 / 4).  Callers
-    that cannot guarantee this should call _area_match(fs, A_pipe) first (the
-    Orifice.dP_dT wrapper does exactly that).
-
-    Algorithm (layered solve):
-      1. Throat-area choke pre-screen: cheap ideal-gas G_max bound at the
-         effective throat (A_eff = Cd * A_bore); if exceeded, run the
-         rigorous choked_mass_flux() and raise
-         ChokedFlowError when mdot >= mdot_choked.  Mirrors the gate used
-         by compressible_changing_area_K / compressible_K.
-      2. Python fluids library's ISO 5167 differential_pressure_meter_solver gives a fast tap-pressure
-         estimate from (P_in, mdot) for the subsonic path.
-      3. Small-dP (< 5 % of P_in): ISO 5167 result is used directly.
-      4. Large-dP / supercritical: fluids library's ideal-gas expansibility biases the
-         result; replace with the real-gas throat state from
-         compressible_changing_area_K(fs, A_eff, K=0).
-      5. fluids.dP_orifice converts the tap dP to permanent (non-recoverable) dP.
-      6. Newton on T to enforce stagnation-enthalpy conservation.
-
-    Args:
-        fs          : FlowState at the upstream pipe connection (static, mutated
-                      in place).  fs.AS must be at (P_in, T_in); fs.A must equal
-                      the upstream pipe area.
-        Di          : float, pipe inner diameter [m].
-        Do          : float, orifice bore diameter [m].
-        taps        : str, tap type passed to the ISO 5167 / RHG correlations
-                      ('corner', 'D and D/2', or 'flange').
-        Cd_override : float or None.  When given, used as the discharge
-                      coefficient directly, bypassing the RHG correlation.
-
-    Returns:
-        None.  fs is mutated in place (fs.AS advanced to outlet static state,
-        fs.A unchanged).
-
-    Raises:
-        ChokedFlowError : when fs.mdot >= the choked mass flow rate.
-    """
-    _LARGE_DP_FRAC = 0.05       # >5% dP triggers the rigorous isentropic expansion path
-    _T_ITER_MAX    = 8          # Newton iterations on outlet T
-    _T_ABS_TOL     = 1.0        # J/kg
-    _T_REL_TOL     = 1.0e-9
-
-    A_pipe = math.pi * Di ** 2 / 4.0
-    A_bore = math.pi * Do ** 2 / 4.0
-
-    P_in    = fs.P
-    T_in    = fs.T
-    rho_in  = fs.rho
-    v_in    = fs.v
-    h_static_in   = fs.AS.hmass()
-    h_stagnation  = h_static_in + 0.5 * v_in ** 2
-
-    mu = _viscosity_or_LGE(fs.AS, T_in, rho_in)
-
-    try:
-        k_iso = fs.AS.cpmass() / fs.AS.cvmass()
-    except (ValueError, RuntimeError):
-        k_iso = 1.3   # plausible default for hydrocarbon mixtures
-
-    if Cd_override is not None:
-        Cd = Cd_override
-    else:
-        Cd = fluids.flow_meter.C_Reader_Harris_Gallagher(
-            D=Di, Do=Do, rho=rho_in, mu=mu, m=fs.mdot, taps=taps,
-        )
-
-    A_eff = Cd * A_bore
-
-    # ---- 1. Choke pre-screen at the orifice throat (vena contracta).
-    # A_throat = A_eff = Cd * A_bore; recovery is back to pipe area.
-    # The ISO tap-pressure / ideal critical-ratio comparison used previously
-    # compared two pressures at different stations (tap vs. throat) and
-    # missed choke for real gases whenever tap-side recovery kept P_2_tap
-    # above the throat critical ratio.
-    _choke_pre_screen(fs, A_eff, A_pipe, A_on_choke=A_pipe)
-
-    # ---- 2. ISO 5167 cheap initial guess for the tap pressure (subsonic).
-    # The solver brentq's over P2 in (0.5*P1, P1); if the requested
-    # mdot is already past its bracket, it raises NotBoundedError (which
-    # inherits from Exception, not ValueError).  Catch broadly and fall
-    # through to the large-dP branch below.
-    try:
-        P_2_tap_iso = fluids.flow_meter.differential_pressure_meter_solver(
-            D=Di, rho=rho_in, mu=mu, k=k_iso, D2=Do,
-            P1=P_in, m=fs.mdot,
-            meter_type="ISO 5167 orifice", taps=taps,
-            C_specified=Cd,
-        )
-    except Exception:
-        P_2_tap_iso = None   # ISO solver hit its own bracket limit
-
-    # ---- 3 & 4. Select the tap pressure source by dP magnitude.
-    dP_iso_est = (P_in - P_2_tap_iso) if P_2_tap_iso is not None else P_in
-    if (P_2_tap_iso is not None
-            and dP_iso_est < _LARGE_DP_FRAC * P_in):
-        # Small-dP regime: ISO 5167 is accurate enough.
-        P_2_tap = P_2_tap_iso
-    else:
-        # Large-dP / supercritical regime: get the real-gas throat
-        # state via the isentropic march that backs
-        # compressible_changing_area_K(K=0).  Internally pre-screens
-        # for choke via choked_mass_flux; if it raises, propagate.
-        try:
-            compressible_changing_area_K(fs, A_eff, K=0.0)
-        except ChokedFlowError:
-            fs.A = A_pipe
-            raise
-        P_2_tap = float(fs.AS.p())
-        _safe_flowstate_update_PT(fs, P_in, T_in)
-        fs.A = A_pipe
-
-    # ---- 5. Permanent dP (non-recoverable) from the standard formula.
-    dP_perm  = fluids.flow_meter.dP_orifice(
-        D=Di, Do=Do, P1=P_in, P2=P_2_tap, C=Cd,
-    )
-    walked_P = P_in - dP_perm
-
-    # ---- 6. Adiabatic energy balance: stagnation enthalpy conserved.
-    # v_out is recomputed each iteration from the current rho_out so the
-    # residual is on full h_stagnation. Phase-hinted PT updates keep this robust for
-    # mixtures and supercritical fluids.
-    T_out = T_in
-
-    for _ in range(_T_ITER_MAX):
-        _safe_flowstate_update_PT(fs, walked_P, T_out)
-        v_out  = fs.v
-        h_calc = fs.AS.hmass() + 0.5 * v_out ** 2
-        err    = h_calc - h_stagnation
-        if abs(err) <= max(_T_ABS_TOL, _T_REL_TOL * abs(h_stagnation)):
-            return
-        cp = fs.AS.cpmass()
-        if cp <= 0.0:
-            break
-        T_out -= err / cp
-    # Fell out without strict convergence -- leave AS at the last
-    # update (PT_INPUTS already applied inside the loop).
 
 def compressible_changing_area(fs, A_out):
     """Isentropic pressure and temperature for an ideal gas passing through
@@ -1914,8 +2358,8 @@ def compressible_K(fs, K, dPmax=0.05, A_throat=None):
     See the hand-derivation in /Derivation_images/dP_for_K
     Note that for the entropy accounting, no change in temperature is assumed across the fitting.
     The error introduced by this is probably less than the uncertainty of the K-factor correlation for scenarios with minor pressure
-    changes across the fitting. If a dramatic temperature or pressure change occurs over the fitting, this function will give
-    inaccurate results. You are better off with the compressible_changing_area_K function which uses the average temperature
+    changes across the fitting. If a dramatic temperature or pressure change occurs over the fitting, this method will give inaccurate results.
+    You are better off with the compressible_changing_area_K function which uses the average temperature
     in its entropy balance. That function is more rigorous but substantially more computationally intensive.
 
     Mutates fs in place: fs.AS to the outlet static state.  fs.A and fs.z
@@ -2434,6 +2878,132 @@ def compressible_pipe_segment(
     fs.z += dz
 
 
+def _solve_mdot_for_outlet_P(
+    fs, P2,
+    forward_at_mdot,
+    mdot_choked,
+    mdot_lo=None,
+    mdot_hi_frac=0.95,
+    mdot_guess=None,
+    xtol_factor=1e-6,
+    rtol=1e-6,
+    maxiter=50,
+    caller_name="_solve_mdot_for_outlet_P",
+):
+    """Brent's-method drive: iterate `mdot` until `forward_at_mdot(mdot)`
+    leaves `fs.P` equal to `P2` within tolerance.  Shared engine behind
+    Mode 2 of `compressible_dA` and the `dmdot_dT` methods on every
+    compressible component class.
+
+    The residual `fs.P - P2` is monotonically decreasing in mdot for any
+    K-based friction loss (higher mdot => larger dP => lower P_out), so a
+    single bracket on `[mdot_lo, mdot_hi]` is sufficient.  The upper
+    bracket is set just below `mdot_choked` and retreats toward zero on
+    kernel failure (the subsonic ideal-gas initial-guess generators
+    inside the area-change kernel can drift off the real-gas A* near the
+    choke and raise).
+
+    Args:
+        fs              : FlowState being driven.  `forward_at_mdot` is
+                          responsible for restoring `fs` to inlet on each
+                          call (brentq evaluates non-monotonically and
+                          out of order).
+        P2              : float, target outlet pressure [Pa].
+        forward_at_mdot : callable(mdot_trial: float) -> None.  Restores
+                          `fs` to inlet, sets `fs.mdot = mdot_trial`, and
+                          runs the forward physics; on return `fs.P` is
+                          the model-predicted outlet pressure at that
+                          mdot.
+        mdot_choked     : float, upper physical bound on subsonic mdot
+                          [kg/s].  Used to set the initial upper bracket.
+        mdot_lo         : float or None.  Lower bracket [kg/s].  Default
+                          `max(1e-9 * mdot_choked, 1e-3 * mdot_guess)`
+                          if `mdot_guess` is supplied, else
+                          `1e-9 * mdot_choked`.
+        mdot_hi_frac    : float.  Initial upper bracket as a fraction of
+                          mdot_choked.  Default 0.95.
+        mdot_guess      : float or None.  Incompressible initial estimate
+                          [kg/s]; used only to floor `mdot_lo`.
+        xtol_factor     : float.  brentq xtol = max(xtol_factor*mdot_choked, 1e-9).
+        rtol, maxiter   : forwarded to brentq.
+        caller_name     : str.  Used in diagnostic messages.
+
+    Returns:
+        float, the converged mdot.  `fs` is left at the outlet state
+        corresponding to that mdot (also stored on `fs.mdot`).
+
+    Raises:
+        RuntimeError : if the bracket cannot be established (kernel
+                       fails at every retreated upper bound), or if the
+                       residual has the same sign at both ends of the
+                       bracket.
+
+    Caller responsibilities:
+        - Pre-screen the choked branch (P2 < P2_choked) before calling;
+          this helper only handles the subsonic non-choked solution.
+        - Pre-screen the lossless / degenerate K = 0 case (the residual
+          is identically P1 - P2 for all mdot and has no root).
+    """
+    from scipy.optimize import brentq
+
+    if mdot_lo is None:
+        if mdot_guess is not None:
+            mdot_lo = max(1e-9 * mdot_choked, 1e-3 * mdot_guess)
+        else:
+            mdot_lo = 1e-9 * mdot_choked
+
+    def residual(mdot_trial):
+        forward_at_mdot(mdot_trial)
+        return fs.P - P2
+
+    mdot_hi = mdot_hi_frac * mdot_choked
+
+    def _safe_residual_at(mdot_try):
+        # If the kernel fails (ChokedFlowError from the pre-screen, a
+        # RuntimeError from the ideal-gas initial-guess generator near
+        # the real-gas choke, or a ValueError from CoolProp's internal
+        # Brent when constant-area K-loss inversion is pushed past the
+        # Fanno choke), retreat the upper bracket toward zero and retry
+        # until either the kernel succeeds or the retreat budget is
+        # exhausted.
+        for shrink in (1.0, 0.9, 0.8, 0.6, 0.4, 0.2):
+            mdot_t = mdot_try * shrink
+            if mdot_t <= mdot_lo:
+                break
+            try:
+                return mdot_t, residual(mdot_t)
+            except (ChokedFlowError, RuntimeError, ValueError):
+                continue
+        raise RuntimeError(
+            f"{caller_name}: kernel failed at every retreated upper bracket "
+            f"between {mdot_lo:.4g} and {mdot_try:.4g} kg/s."
+        )
+
+    mdot_hi, r_hi = _safe_residual_at(mdot_hi)
+    r_lo = residual(mdot_lo)
+    if r_lo * r_hi > 0.0:
+        raise RuntimeError(
+            f"{caller_name}: failed to bracket the non-choked solution "
+            f"(residual at mdot_lo={mdot_lo:.4g}: {r_lo:.4g}; "
+            f"at mdot_hi={mdot_hi:.4g}: {r_hi:.4g}). "
+            f"P2={P2:.4g} Pa, mdot_choked={mdot_choked:.4g} kg/s."
+        )
+
+    mdot_solution = brentq(
+        residual,
+        mdot_lo, mdot_hi,
+        xtol=max(xtol_factor * mdot_choked, 1e-9),
+        rtol=rtol,
+        maxiter=maxiter,
+    )
+
+    # brentq leaves fs at the state of its last function eval, which is
+    # not necessarily the converged root.  One extra eval guarantees fs
+    # is at the outlet state corresponding to mdot_solution.
+    residual(mdot_solution)
+    return mdot_solution
+
+
 def compressible_dA(fs, A_throat, K = 0.0, A2 = None, P2 = None):
     """
     Models a compressible fitting/component with a constriction (valve, orifice). 
@@ -2584,14 +3154,12 @@ def compressible_dA(fs, A_throat, K = 0.0, A2 = None, P2 = None):
             f"P2={P2:.4g} Pa, P_in={P1:.4g} Pa, P2_choked={P2_choked:.4g} Pa."
         )
 
-    from scipy.optimize import brentq
-
     # Incompressible initial-guess for mdot:
     #   dP = 0.5 * K * rho * v^2,  mdot = rho * A * v
     #   => mdot = A1 * sqrt(2 * dP * rho_in / K)
     mdot_guess = A1 * math.sqrt(2.0 * (P1 - P2) * rho_in / K)
 
-    def pressure_residual(mdot_trial):
+    def forward_at_mdot(mdot_trial):
         # Restore inlet conditions; the kernels mutate fs in place.
         _safe_flowstate_update_PT(fs, P1, T1)
         fs.A    = A1
@@ -2600,62 +3168,14 @@ def compressible_dA(fs, A_throat, K = 0.0, A2 = None, P2 = None):
         e_loss = 0.5 * K * v1_t**2
         compressible_changing_area_K(fs=fs, A_out=A_throat, K=0.0)
         compressible_changing_area_K(fs=fs, A_out=A2, e_loss=e_loss)
-        return fs.P - P2
 
-    # Bracket: residual is monotonically decreasing in mdot (higher mdot
-    # => larger dP => lower P_out). At mdot ~ 0 the residual approaches
-    # P1 - P2 > 0; at mdot near mdot_choked the residual is P2_choked - P2 < 0
-    # (we already know P2 > P2_choked because we are in this branch).
-    #
-    # The kernel's internal initial-guess generator (compressible_changing_area)
-    # uses an ideal-gas area-Mach relation; near the real-gas choke this can
-    # fail to bracket a subsonic root because the ideal-gas A* drifts off the
-    # real-gas A*.  Start the upper bound back from mdot_choked and retreat
-    # if the kernel raises.
-    mdot_lo = max(1e-9 * mdot_choked, 1e-3 * mdot_guess)
-    mdot_hi = 0.95 * mdot_choked
-
-    def _safe_residual_at(mdot_try):
-        # Try evaluating the residual; if the kernel fails (RuntimeError from
-        # the ideal-gas initial guess, or ChokedFlowError from the pre-screen),
-        # retreat toward zero and retry until either the kernel succeeds or
-        # we exhaust the retreat budget.
-        for shrink in (1.0, 0.9, 0.8, 0.6, 0.4, 0.2):
-            mdot_t = mdot_try * shrink
-            if mdot_t <= mdot_lo:
-                break
-            try:
-                return mdot_t, pressure_residual(mdot_t)
-            except (ChokedFlowError, RuntimeError):
-                continue
-        raise RuntimeError(
-            f"compressible_dA: kernel failed at every retreated upper bracket "
-            f"between {mdot_lo:.4g} and {mdot_try:.4g} kg/s."
-        )
-
-    mdot_hi, r_hi = _safe_residual_at(mdot_hi)
-    r_lo = pressure_residual(mdot_lo)
-    if r_lo * r_hi > 0.0:
-        raise RuntimeError(
-            f"compressible_dA: failed to bracket the non-choked solution "
-            f"(residual at mdot_lo={mdot_lo:.4g}: {r_lo:.4g}; "
-            f"at mdot_hi={mdot_hi:.4g}: {r_hi:.4g}). "
-            f"P1={P1:.4g} Pa, P2={P2:.4g} Pa, P2_choked={P2_choked:.4g} Pa, "
-            f"K={K:.4g}."
-        )
-
-    mdot_solution = brentq(
-        pressure_residual,
-        mdot_lo, mdot_hi,
-        xtol=max(1e-6 * mdot_choked, 1e-9),
-        rtol=1e-6,
-        maxiter=50,
+    _solve_mdot_for_outlet_P(
+        fs, P2,
+        forward_at_mdot=forward_at_mdot,
+        mdot_choked=mdot_choked,
+        mdot_guess=mdot_guess,
+        caller_name="compressible_dA",
     )
-
-    # brentq leaves fs at the state of its last function eval, which is not
-    # necessarily the converged root. One extra eval guarantees fs is at the
-    # outlet state corresponding to mdot_solution.
-    pressure_residual(mdot_solution)
 
 
 def adiabatic_expansion_solver(fs, P2, T_ITER_MAX = 8, H_ABS_TOL = 1.0, H_REL_TOL = 1.0e-9):

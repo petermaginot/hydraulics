@@ -153,17 +153,113 @@ feedback in the denominator strengthens nonlinearly as the gas expands.
 
   **Open follow-ons:**
 
-    - **R2.6.** Switch `Valve.dP_dT` and `Orifice.dP_dT` from
-      `compressible_K` / `compressible_orifice` to `compressible_dA` so the
-      production paths get the throat-then-recovery split for free. The
-      Orifice currently delegates to `compressible_orifice` (ISO 5167 +
-      isenthalpic outlet); the two physics models differ by several percent
-      in the validation test, so picking one consciously is part of this
-      step. Needs an `.K` property on `Base_Orifice` derived from `Cd`.
-    - **R2.7.** Wire Mode 2 (dictate `P2`, solve `mdot`) into the
-      compressible network solver as an option for components whose
-      controlling boundary condition is downstream pressure (e.g. relief
-      valves discharging to a fixed header pressure).
+    - **R2.6 [✅ DONE].** Switched `Valve.dP_dT` and `Orifice.dP_dT` off
+      `compressible_K` / `compressible_orifice` so the production paths
+      get the throat-then-recovery split for free.
+      **Orifice**: `Orifice.dP_dT` resolves Cd (RHG or `Cd_override`),
+      converts to K via `fluids.flow_meter.discharge_coefficient_to_K`, and
+      calls `compressible_dA(fs, Cd*A_bore, K=K, A2=A_pipe)`. `compressible_orifice`
+      is kept as a legacy function with a note. The K is flow-dependent (RHG
+      depends on Re), so it is computed at call time rather than as a static
+      property.
+      **Valve / CheckValve**: both `Valve.dP_dT` and the forward-flow
+      branch of `CheckValve.dP_dT` now dispatch on whether the trim
+      carries a geometric constriction.  When `minimum_diameter` is
+      `None` or equal to `Di` (no constriction), they delegate to
+      `compressible_changing_area_K(fs, A_pipe, K=self.K)` — the
+      rigorous coupled (P, T) solve with T_avg entropy balance is
+      always used, replacing the inlet-property linearization in
+      `compressible_K`.  When `minimum_diameter < Di`, they delegate to
+      `compressible_dA(fs, A_throat, K=self.K, A2=A_pipe)` so the
+      isentropic acceleration to the throat is separated from the
+      K-dissipative recovery to the pipe.  Items 1, 3, 4 from §1 are
+      now silently fixed on every valve call rather than only when the
+      `dPmax`/denominator gate trips inside `compressible_K`.  The
+      `CheckValve` reverse-flow (sealing K) short-circuit is unchanged.
+      Covered by `test_valve_minimum_diameter_choke` in
+      [textbook_test_functions.py](textbook_test_functions.py) and
+      `test_K` in [examples.py](examples.py).
+    - **R2.7 [partial — component-level `dmdot_dT` landed; network
+      wiring still open].** Every compressible component class now
+      carries a `dmdot_dT(fs, P2)` inverse-solve method that mirrors the
+      contract of `dP_dT` but takes the downstream pressure as input and
+      mutates `fs` to the converged outlet state (with `fs.mdot` holding
+      the solved value).  Implementation summary:
+
+      The brentq-with-retreat machinery that originally lived inside
+      `compressible_dA`'s Mode 2 non-choked branch was extracted into a
+      shared private helper, `_solve_mdot_for_outlet_P(fs, P2,
+      forward_at_mdot, mdot_choked, ...)`, in
+      [compressible_flow.py](compressible_flow.py).  Each component's
+      `dmdot_dT` builds an appropriate forward closure and delegates;
+      `compressible_dA`'s Mode 2 was refactored to call the same helper
+      (no behavior change — `test_compressible_dA` passes byte-identical).
+
+      Per-class dispatch:
+
+        * `Orifice.dmdot_dT`: Cd<->mdot fixed point (Cd from RHG depends
+          on Re depends on mdot) wrapping `compressible_dA(..., P2=P2)`.
+          Typically converges in 2-3 outer iterations; warns on
+          non-convergence at iteration cap.  With `Cd_override` set,
+          collapses to a single direct call.
+        * `Valve.dmdot_dT` and `CheckValve.dmdot_dT` (forward flow):
+          mirror the forward dispatch on `minimum_diameter`.  With a
+          throat, forwards directly to `compressible_dA(..., P2=P2)`.
+          Without a throat, drives `compressible_changing_area_K(fs,
+          A_pipe, K)` via the shared helper.  `CheckValve` on the
+          sealing-K shadow raises `ValueError` (the inverse is
+          undefined: a sealed valve passes no flow at any P2).
+        * `Bend.dmdot_dT`: K(Re)<->mdot fixed point wrapping
+          `compressible_K(fs, K)` (Re depends only logarithmically on
+          mdot via the friction-factor correlation, so 2-3 outer
+          iterations suffice).
+        * `Contraction_Expansion.dmdot_dT`: contraction direction uses a
+          single helper drive of `compressible_changing_area_K(fs, A_DS,
+          K)` (K is geometry-only).  Expansion direction raises
+          `NotImplementedError` — for a sharp diffuser the kinetic-energy
+          recovery typically dominates K-loss so P_out > P_in,
+          reversing the residual sign convention the shared helper
+          assumes; the use case (relief discharge to fixed downstream
+          pressure) is invariably a constriction, so this was deferred.
+        * `Line_Segment.dmdot_dT`: forward closure restores fs.AS, fs.A,
+          and fs.z to the inlet snapshot on each call, then re-runs the
+          full `dP_dT` slice loop.  Choke bound uses the ideal-gas G_max
+          times the minimum profile area; the helper's retreat loop
+          discovers the real-gas Fanno choke that friction induces well
+          below the isentropic bound.  Returns `profile_points` from the
+          final converged solve, matching the forward sibling.  The
+          per-iteration ideal-gas Fanno diagnostic is suppressed during
+          the inverse drive (it would otherwise fire dozens of times
+          with slightly different cumulative integrals, defeating
+          Python's dedupe).
+
+      Failure mode across the suite: when the residual bracket cannot
+      be established subsonically, components raise `ChokedFlowError`
+      with `mdot_choked` populated — directly usable by the planned
+      network-solver clamp (R3.5).  Helper widens its retreat-catch to
+      include `ValueError` since CoolProp's internal Brent raises that
+      class when constant-area K-loss inversion is pushed past the
+      Fanno choke.
+
+      Covered by three new tests in [examples.py](examples.py):
+      `test_dmdot_dT_roundtrip` (every component recovers its forward
+      mdot to <5e-3 relative error; observed errors range 1e-7 for
+      constricted Valve to 2e-5 for Line_Segment),
+      `test_dmdot_dT_choke_raises` (Plain Valve and Bend both raise
+      `ChokedFlowError` with mdot_choked populated when P2 = 1 kPa
+      against 100 psi inlet), and `test_orifice_dmdot_dT_vs_dA`
+      (regression guard that the Cd fixed point reaches the same answer
+      as a direct `compressible_dA` Mode 2 call when `Cd_override`
+      eliminates the fixed point — observed drift 0 to machine
+      precision).
+
+      **Open follow-on:** wire `dmdot_dT` into
+      `compressible_network.walk_edge` as the boundary-condition path
+      for edges whose downstream node is P-specified (relief valves
+      discharging to a fixed header pressure, regulator setpoints,
+      atmospheric vents).  The component-level building blocks are now
+      in place; the network solver still dispatches only on the
+      flow-driven (`dP_dT`) path.
 
 - **R3 [larger].** Switch the valve component to an ISA-75.01 / IEC-60534-2-1
   sizing model parameterized by Cv (or Kv) and x_T, with explicit choked-flow

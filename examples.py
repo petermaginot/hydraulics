@@ -7,6 +7,8 @@ import composition
 from component_classes import ureg
 from compressible_flow import (
     Bend as Compressible_Bend,
+    CheckValve as Compressible_CheckValve,
+    ChokedFlowError,
     Contraction_Expansion as Compressible_Contraction_Expansion,
     Line_Segment as Compressible_Line_Segment,
     Valve as Compressible_Valve,
@@ -547,8 +549,6 @@ def test_compressible_dA():
 
     mdot = _resolve_mdot(flow_rate = ureg.Quantity(0.07, "mmscf/day"), abstract_state=AS)
 
-
-
     fs = FlowState(
         AS=AS, mdot=mdot, A=A_pipe, z=0.0,
         T_cricondentherm=T_cricondentherm, P_cricondenbar=P_cricondenbar,
@@ -713,11 +713,213 @@ def test_compressible_dA():
             )
 
 
+def test_dmdot_dT_roundtrip():
+    """Round-trip every compressible component's dP_dT against its
+    dmdot_dT inverse.
 
+    For each component: pick a representative geometry and inlet state,
+    run forward dP_dT at a chosen mdot to capture P_out, then run
+    dmdot_dT(fs_fresh, P2=P_out) and assert the recovered mdot matches
+    the original to tight tolerance.
+
+    Covers: Valve (constricted + plain), CheckValve (forward flow),
+    Orifice, Bend, Contraction_Expansion (contraction direction),
+    Line_Segment (adiabatic + isothermal).  Expansion is excluded -- its
+    dmdot_dT raises NotImplementedError by design (kinetic recovery
+    typically dominates K-loss, reversing the residual sign).
+    """
+    csv_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "example_composition.csv")
+    P_in = ureg.Quantity(100, "psi").to("Pa").magnitude
+    T_in = ureg.Quantity(150, "degF").to("degK").magnitude
+
+    AS = composition.define_composition_from_csv(csv_path)
+    phase_limits = _build_phase_limits(AS)
+
+    ID    = ureg.Quantity(1.939, "inch")
+    ID_si = ID.to("m").magnitude
+    A_pipe = math.pi * ID_si ** 2 / 4.0
+    D_trim = ureg.Quantity(0.25, "inch")
+
+    _safe_update_PT(AS, P_in, T_in, *phase_limits)
+    mdot_target = _resolve_mdot(ureg.Quantity(0.07, "mmscf/day"), AS)
+
+    fs = FlowState(
+        AS=AS, mdot=mdot_target, A=A_pipe, z=0.0,
+        T_cricondentherm=phase_limits[0], P_cricondenbar=phase_limits[1],
+        T_critical=phase_limits[2], P_critical=phase_limits[3],
+    )
+
+    def reset(A=A_pipe, mdot=mdot_target):
+        _safe_update_PT(AS, P_in, T_in, *phase_limits)
+        fs.A    = A
+        fs.z    = 0.0
+        fs.mdot = mdot
+
+    print("\ntest_dmdot_dT_roundtrip")
+
+    TOL = 5e-3
+    cases = []
+
+    def roundtrip(label, component, dP_dT_kwargs=None, dmdot_dT_kwargs=None,
+                  area=A_pipe):
+        dP_dT_kwargs   = dP_dT_kwargs   or {}
+        dmdot_dT_kwargs = dmdot_dT_kwargs or {}
+        reset(A=area)
+        component.dP_dT(fs, **dP_dT_kwargs)
+        P2 = fs.P
+        reset(A=area)
+        fs.mdot = 0.0
+        component.dmdot_dT(fs, P2=P2, **dmdot_dT_kwargs)
+        err = abs(fs.mdot - mdot_target) / mdot_target
+        cases.append((label, err, fs.mdot, fs.P, P2))
+        assert err < TOL, f"{label}: rel err {err:.2e} > {TOL:.0e}"
+
+    roundtrip("Valve+throat", Compressible_Valve(Di=ID, Cv=1.76, minimum_diameter=D_trim))
+    roundtrip("Valve plain",  Compressible_Valve(Di=ID, K=10.0))
+    roundtrip("CheckValve fwd", Compressible_CheckValve(Di=ID, K=20.0))
+    roundtrip("Orifice",      Compressible_Orifice(Di=ID, Do=D_trim))
+    roundtrip("Bend",         Compressible_Bend(Di=ID, ang_deg=90.0, bend_dias=3.0))
+    roundtrip("Contraction 2->1\"",
+              Compressible_Contraction_Expansion(
+                  Di_US=ID, Di_DS=ureg.Quantity(1.0, "inch")))
+
+    seg = Compressible_Line_Segment(
+        roughness=ureg.Quantity(0.00015, "ft"),
+        id_val=ID,
+        length=ureg.Quantity(200.0, "ft"),
+        elevation_change=ureg.Quantity(0.0, "ft"),
+        name="seg",
+    )
+    roundtrip("Line_Segment adiabatic",  seg, area=seg.inlet_area_si)
+    roundtrip("Line_Segment isothermal", seg,
+              dP_dT_kwargs={"isothermal": True},
+              dmdot_dT_kwargs={"isothermal": True},
+              area=seg.inlet_area_si)
+
+    for label, err, mdot_out, P_out, P_target in cases:
+        print(f"  {label:25s}: rel err={err:.2e}, mdot={mdot_out:.6g} "
+              f"(target {mdot_target:.6g}), P_out={P_out:.6g} "
+              f"(target {P_target:.6g})")
+
+
+def test_dmdot_dT_choke_raises():
+    """Verify dmdot_dT raises ChokedFlowError when P2 is below the
+    component's choke limit, with mdot_choked populated on the exception
+    so the network solver can clamp against it.
+    """
+    csv_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "example_composition.csv")
+    P_in = ureg.Quantity(100, "psi").to("Pa").magnitude
+    T_in = ureg.Quantity(150, "degF").to("degK").magnitude
+    AS = composition.define_composition_from_csv(csv_path)
+    phase_limits = _build_phase_limits(AS)
+
+    ID    = ureg.Quantity(1.939, "inch")
+    ID_si = ID.to("m").magnitude
+    A_pipe = math.pi * ID_si ** 2 / 4.0
+
+    _safe_update_PT(AS, P_in, T_in, *phase_limits)
+    mdot_seed = _resolve_mdot(ureg.Quantity(0.07, "mmscf/day"), AS)
+    fs = FlowState(
+        AS=AS, mdot=mdot_seed, A=A_pipe, z=0.0,
+        T_cricondentherm=phase_limits[0], P_cricondenbar=phase_limits[1],
+        T_critical=phase_limits[2], P_critical=phase_limits[3],
+    )
+
+    print("\ntest_dmdot_dT_choke_raises")
+
+    # P2 = 1 kPa is well below the choke pressure for any component at
+    # 100 psi inlet -- subsonic resolution must fail.
+    P2_below_choke = 1.0e3
+
+    def assert_chokes(label, component):
+        _safe_update_PT(AS, P_in, T_in, *phase_limits)
+        fs.A    = A_pipe
+        fs.z    = 0.0
+        fs.mdot = mdot_seed
+        try:
+            component.dmdot_dT(fs, P2=P2_below_choke)
+        except ChokedFlowError as exc:
+            assert exc.mdot_choked > 0.0, (
+                f"{label}: ChokedFlowError raised but mdot_choked is non-positive "
+                f"({exc.mdot_choked!r})"
+            )
+            print(f"  {label:13s}: ChokedFlowError raised, "
+                  f"mdot_choked={exc.mdot_choked:.4g} kg/s")
+        else:
+            raise AssertionError(f"{label}: ChokedFlowError not raised")
+
+    assert_chokes("Plain Valve", Compressible_Valve(Di=ID, K=10.0))
+    assert_chokes("Bend",        Compressible_Bend(Di=ID, ang_deg=90.0, bend_dias=3.0))
+
+
+def test_orifice_dmdot_dT_vs_dA():
+    """Confirm Orifice.dmdot_dT agrees with a direct compressible_dA Mode 2
+    call when Cd_override is supplied -- which eliminates the RHG Cd<->mdot
+    fixed point so the two paths reduce to the same numerical problem.
+
+    Regression guard: the Cd fixed point should converge to the same mdot
+    the direct call returns; any drift signals a bug in the loop's
+    convergence criterion or state restoration.
+    """
+    import fluids.flow_meter
+
+    csv_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "example_composition.csv")
+    P_in = ureg.Quantity(100, "psi").to("Pa").magnitude
+    T_in = ureg.Quantity(150, "degF").to("degK").magnitude
+    AS = composition.define_composition_from_csv(csv_path)
+    phase_limits = _build_phase_limits(AS)
+
+    ID    = ureg.Quantity(1.939, "inch")
+    D_o   = ureg.Quantity(0.25,  "inch")
+    ID_si = ID.to("m").magnitude
+    Do_si = D_o.to("m").magnitude
+    A_pipe = math.pi * ID_si ** 2 / 4.0
+    A_bore = math.pi * Do_si ** 2 / 4.0
+    Cd_fixed = 0.62
+
+    _safe_update_PT(AS, P_in, T_in, *phase_limits)
+    mdot_target = _resolve_mdot(ureg.Quantity(0.07, "mmscf/day"), AS)
+
+    fs = FlowState(
+        AS=AS, mdot=mdot_target, A=A_pipe, z=0.0,
+        T_cricondentherm=phase_limits[0], P_cricondenbar=phase_limits[1],
+        T_critical=phase_limits[2], P_critical=phase_limits[3],
+    )
+
+    orf = Compressible_Orifice(Di=ID, Do=D_o, Cd_override=Cd_fixed)
+    orf.dP_dT(fs)
+    P2 = fs.P
+
+    _safe_update_PT(AS, P_in, T_in, *phase_limits)
+    fs.A    = A_pipe
+    fs.mdot = 0.0
+    orf.dmdot_dT(fs, P2=P2)
+    mdot_via_orf = fs.mdot
+
+    K_orf = fluids.flow_meter.discharge_coefficient_to_K(
+        D=ID_si, Do=Do_si, C=Cd_fixed,
+    )
+    _safe_update_PT(AS, P_in, T_in, *phase_limits)
+    fs.A    = A_pipe
+    fs.mdot = 0.0
+    compressible_dA(fs, A_throat=Cd_fixed * A_bore, K=K_orf, A2=A_pipe, P2=P2)
+    mdot_via_dA = fs.mdot
+
+    rel_drift = abs(mdot_via_orf - mdot_via_dA) / max(mdot_via_dA, 1e-30)
+
+    print("\ntest_orifice_dmdot_dT_vs_dA")
+    print(f"  forward mdot (target) : {mdot_target:.6g} kg/s, P2 target {P2:.6g} Pa")
+    print(f"  Orifice.dmdot_dT      : {mdot_via_orf:.6g} kg/s")
+    print(f"  compressible_dA(P2=)  : {mdot_via_dA:.6g} kg/s")
+    print(f"  rel drift             : {rel_drift:.2e}")
+    assert rel_drift < 1e-6, (
+        f"Orifice/dA drift {rel_drift:.2e} exceeds 1e-6 -- Cd fixed point may "
+        f"have a convergence-criterion or state-restoration bug."
+    )
 
 
 if __name__ == "__main__":
-    
+
     # test_compressible_fittings()
     # test_compressible_line_segment_csv()
     # test_comp_hydraulics()
@@ -729,3 +931,6 @@ if __name__ == "__main__":
     # pseudo_orifice()
     # trying_orifices()
     test_compressible_dA()
+    test_dmdot_dT_roundtrip()
+    test_dmdot_dT_choke_raises()
+    test_orifice_dmdot_dT_vs_dA()
