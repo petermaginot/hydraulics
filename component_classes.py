@@ -955,10 +955,18 @@ class Base_Valve:
              rather than the pipe area.  Geometric only -- does not capture
              pressure-recovery (F_L) effects, so valves with strong recovery
              may choke earlier than this predicts.  None uses a pipe-area check.
+        F_L : float, optional.  ISA-75.01 liquid pressure-recovery factor
+             (dimensionless, typical 0.6 - 1.0, manufacturer-supplied).
+             Consumed only by the incompressible Valve.dP / Valve.dmdot
+             cavitation check.  When supplied together with the fluid's
+             vapor_pressure_si, enables the three-regime cavitation gate
+             (flashing / choked cavitating / incipient).  None disables the
+             check.  The compressible Valve ignores F_L (it uses
+             minimum_diameter for sonic-choke detection).
     """
 
     def __init__(self, Di, K=None, name=None, Cv=None, Kv=None,
-                 minimum_diameter=None):
+                 minimum_diameter=None, F_L=None):
         self.name  = name
         self.Di_si = _to_si(Di, "m")
 
@@ -1034,6 +1042,13 @@ class Base_Valve:
                     stacklevel=2,
                 )
 
+        self.F_L = float(F_L) if F_L is not None else None
+        if self.F_L is not None and not (0.0 < self.F_L <= 1.0):
+            raise ValueError(
+                f"{self.__class__.__name__}: F_L must be in (0, 1], got "
+                f"{self.F_L}."
+            )
+
     def __repr__(self):
         Di_q = ureg.Quantity(self.Di_si, "m")
         extra = ""
@@ -1044,6 +1059,8 @@ class Base_Valve:
         if self.D_min_si is not None:
             Dmin_q = ureg.Quantity(self.D_min_si, "m")
             extra += f", D_min={Dmin_q.to('inch'):.4f~P}"
+        if self.F_L is not None:
+            extra += f", F_L={self.F_L:.3f}"
         return (
             f"{self.__class__.__name__}("
             f"Di={Di_q.to('inch'):.4f~P}, "
@@ -1071,6 +1088,8 @@ class Base_Valve:
             d["Kv"] = self.Kv
         if self.D_min_si is not None:
             d["D_min_m"] = float(self.D_min_si)
+        if self.F_L is not None:
+            d["F_L"] = float(self.F_L)
         return d
 
     @classmethod
@@ -1086,6 +1105,8 @@ class Base_Valve:
         }
         if "D_min_m" in payload:
             kwargs["minimum_diameter"] = payload["D_min_m"]
+        if "F_L" in payload:
+            kwargs["F_L"] = payload["F_L"]
         if "Cv" in payload:
             return cls(Cv=payload["Cv"], **kwargs)
         if "Kv" in payload:
@@ -1114,11 +1135,14 @@ class Base_CheckValve:
              Base_Valve docstring for details and caveats.  Used only on
              the forward-flow path; the sealing-K reverse-flow shadow
              ignores it.
+        F_L : float, optional.  ISA-75.01 liquid pressure-recovery factor.
+             See Base_Valve docstring.  Used only by the incompressible
+             CheckValve cavitation check on the forward-flow path.
     """
 
     check_valve = True
 
-    def __init__(self, Di, K, name=None, minimum_diameter=None):
+    def __init__(self, Di, K, name=None, minimum_diameter=None, F_L=None):
         self.name  = name
         self.Di_si = _to_si(Di, "m")
         self.K     = float(K)
@@ -1170,12 +1194,21 @@ class Base_CheckValve:
                     stacklevel=2,
                 )
 
+        self.F_L = float(F_L) if F_L is not None else None
+        if self.F_L is not None and not (0.0 < self.F_L <= 1.0):
+            raise ValueError(
+                f"{self.__class__.__name__}: F_L must be in (0, 1], got "
+                f"{self.F_L}."
+            )
+
     def __repr__(self):
         Di_q = ureg.Quantity(self.Di_si, "m")
         extra = ""
         if self.D_min_si is not None:
             Dmin_q = ureg.Quantity(self.D_min_si, "m")
             extra = f", D_min={Dmin_q.to('inch'):.4f~P}"
+        if self.F_L is not None:
+            extra += f", F_L={self.F_L:.3f}"
         return (
             f"{self.__class__.__name__}("
             f"Di={Di_q.to('inch'):.4f~P}, "
@@ -1199,6 +1232,8 @@ class Base_CheckValve:
         }
         if self.D_min_si is not None:
             d["D_min_m"] = float(self.D_min_si)
+        if self.F_L is not None:
+            d["F_L"] = float(self.F_L)
         return d
 
     @classmethod
@@ -1215,6 +1250,8 @@ class Base_CheckValve:
         }
         if "D_min_m" in payload:
             kwargs["minimum_diameter"] = payload["D_min_m"]
+        if "F_L" in payload:
+            kwargs["F_L"] = payload["F_L"]
         return cls(**kwargs)
 
 

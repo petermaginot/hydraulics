@@ -22,6 +22,50 @@ from component_classes import ureg
 from gui import units as U
 
 
+def _format_solved_mdot(mdot_kgs, display_unit, fluid):
+    """Convert a mass flow rate [kg/s] into the user's display unit.
+
+    Mass units (kg/s, lb/h, ...) are direct conversions.  Molar and
+    standard-volume units (mol/s, mmscf/day, ...) are defined as mole
+    equivalents in the unit registry (see component_classes.py), so they
+    convert via molar mass.  Actual-volume units (m^3/s, gal/min, ...)
+    convert via in-situ density.
+
+    Args:
+        mdot_kgs     : float, mass flow rate [kg/s].
+        display_unit : str, the GUI dropdown label (may need to_pint
+                       translation for engineering aliases like BBL/D).
+        fluid        : Incompressible_Fluid or CoolProp AbstractState
+                       (anchored at the inlet (P, T)).
+
+    Returns:
+        pint Quantity in the requested unit.
+    """
+    target = U.to_pint(display_unit)
+    dim    = ureg.Quantity(1.0, target).dimensionality
+
+    if dim == {"[mass]": 1, "[time]": -1}:
+        return ureg.Quantity(mdot_kgs, "kg/s").to(target)
+
+    if dim == {"[substance]": 1, "[time]": -1}:
+        # AbstractState exposes molar_mass(); Incompressible_Fluid does
+        # not (and these units are not offered for liquids), so this
+        # branch is compressible-only.
+        mw = fluid.molar_mass()
+        return ureg.Quantity(mdot_kgs / mw, "mol/s").to(target)
+
+    if dim == {"[length]": 3, "[time]": -1}:
+        if hasattr(fluid, "rhomass"):
+            rho = fluid.rhomass()
+        else:
+            rho = fluid.density_si
+        return ureg.Quantity(mdot_kgs / rho, "m^3/s").to(target)
+
+    # Unrecognized -- fall back to SI mass flow so the summary still
+    # shows something useful.
+    return ureg.Quantity(mdot_kgs, "kg/s")
+
+
 class ResultsScreen(QWidget):
     back_clicked = Signal()
 
@@ -113,32 +157,77 @@ class ResultsScreen(QWidget):
 
     def _run(self):
         s = self.state
-        if s.segment is None or s.fluid is None or s.flow_rate is None:
+        if s.segment is None or s.fluid is None:
             QMessageBox.warning(
                 self, "Missing input",
                 "Segment or fluid is not defined.  Go back and complete the "
                 "previous screens.",
             )
             return
+        if s.solve_mode == "forward" and s.flow_rate is None:
+            QMessageBox.warning(
+                self, "Missing input",
+                "Flow rate is not defined.  Go back and complete the fluid screen.",
+            )
+            return
+        if s.solve_mode == "inverse" and s.P_outlet_Pa is None:
+            QMessageBox.warning(
+                self, "Missing input",
+                "Outlet pressure is not defined.  Go back and complete the fluid screen.",
+            )
+            return
 
         try:
             if s.flow_type == "incompressible":
-                results = s.segment.pressure_profile(
-                    fluid     = s.fluid,
-                    P0        = s.P_inlet_Pa or 0.0,
-                    flow_rate = s.flow_rate,
-                )
+                if s.solve_mode == "inverse":
+                    # dmdot returns mass flow rate; feed it back through
+                    # pressure_profile to get the curve to plot.  Both
+                    # calls use the user-supplied P_inlet as the anchor.
+                    mdot_si = s.segment.dmdot(
+                        fluid    = s.fluid,
+                        P_inlet  = s.P_inlet_Pa,
+                        P_outlet = s.P_outlet_Pa,
+                    )
+                    s.solved_mdot_kgs = mdot_si
+                    results = s.segment.pressure_profile(
+                        fluid     = s.fluid,
+                        P0        = s.P_inlet_Pa,
+                        flow_rate = ureg.Quantity(mdot_si, "kg/s"),
+                    )
+                else:
+                    s.solved_mdot_kgs = None
+                    results = s.segment.pressure_profile(
+                        fluid     = s.fluid,
+                        P0        = s.P_inlet_Pa or 0.0,
+                        flow_rate = s.flow_rate,
+                    )
             else:
-                # dP_dT mutates the AbstractState (and the FlowState it
-                # wraps) in-place, so re-anchor to the user-supplied inlet
-                # conditions and build a fresh FlowState before every run.
+                # dP_dT and dmdot_dT both mutate the AbstractState (and the
+                # FlowState it wraps) in place, so re-anchor to the user-
+                # supplied inlet conditions and build a fresh FlowState
+                # before every run.
                 s.fluid.update(CP.PT_INPUTS, s.P_inlet_Pa, s.T_inlet_K)
-                mdot = compressible_flow._resolve_mdot(s.flow_rate, s.fluid)
-                fs = compressible_flow.FlowState(
-                    s.fluid, mdot=mdot,
-                    A=s.segment.inlet_area_si, z=0.0,
-                )
-                raw = s.segment.dP_dT(fs, isothermal=s.isothermal)
+                if s.solve_mode == "inverse":
+                    # dmdot_dT seeds mdot internally; the value passed here
+                    # is overwritten on the first forward evaluation.  Use
+                    # a small positive placeholder to satisfy FlowState's
+                    # construction-time invariants.
+                    fs = compressible_flow.FlowState(
+                        s.fluid, mdot=1e-3,
+                        A=s.segment.inlet_area_si, z=0.0,
+                    )
+                    raw = s.segment.dmdot_dT(
+                        fs, P2=s.P_outlet_Pa, isothermal=s.isothermal,
+                    )
+                    s.solved_mdot_kgs = fs.mdot
+                else:
+                    mdot = compressible_flow._resolve_mdot(s.flow_rate, s.fluid)
+                    fs = compressible_flow.FlowState(
+                        s.fluid, mdot=mdot,
+                        A=s.segment.inlet_area_si, z=0.0,
+                    )
+                    raw = s.segment.dP_dT(fs, isothermal=s.isothermal)
+                    s.solved_mdot_kgs = None
                 results = [
                     {"distance_m": d, "P_Pa": P, "T_K": T, "v_ms": v}
                     for (d, P, T, v) in raw
@@ -194,6 +283,17 @@ class ResultsScreen(QWidget):
             f"Outlet P     : {P_out_q.to(y_unit).magnitude:>12.2f} {y_unit}",
             f"Total dP     : {dP_q.to(y_unit).magnitude:>12.2f} {y_unit}",
         ]
+
+        if self.state.solved_mdot_kgs is not None:
+            mdot_display = _format_solved_mdot(
+                self.state.solved_mdot_kgs,
+                self.state.flow_rate_display_unit or "kg/s",
+                self.state.fluid,
+            )
+            lines.append(
+                f"Solved flow  : {mdot_display.magnitude:>12.4g} "
+                f"{self.state.flow_rate_display_unit or 'kg/s'}"
+            )
 
         # Compressible only: overlay temperature on the right-hand axis.
         if self.state.flow_type == "compressible" and "T_K" in results[0]:

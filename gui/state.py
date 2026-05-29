@@ -30,7 +30,7 @@ class AppState:
     fluid: Any = None
 
     # pint Quantity.  Volumetric/mass for incompressible; mass/molar/std-vol
-    # for compressible.
+    # for compressible.  None in inverse solve_mode (flow rate is the unknown).
     flow_rate: Any = None
 
     # Inlet pressure (Pa).  Used as P0 for the pressure-profile call.
@@ -45,6 +45,26 @@ class AppState:
     # slice; False = adiabatic energy balance (default).  Ignored for
     # incompressible flow.
     isothermal: bool = False
+
+    # Which inverse problem the Results screen solves.
+    #   "forward" : user supplies flow_rate, solver returns pressure profile.
+    #   "inverse" : user supplies P_outlet_Pa, solver returns mass flow rate
+    #               plus the resulting pressure profile.
+    solve_mode: str = "forward"
+
+    # Target outlet pressure (Pa, absolute) for the inverse solve.  None
+    # in forward mode.
+    P_outlet_Pa: Optional[float] = None
+
+    # Display unit (string label, e.g. "BBL/D") for the solved mdot in the
+    # Results summary.  Captured from the flow-rate dropdown on the Fluid
+    # screen so the inverse-mode result is shown in the unit the user was
+    # already looking at.  None in forward mode.
+    flow_rate_display_unit: Optional[str] = None
+
+    # Populated by the Results screen after a successful inverse solve;
+    # mass flow rate in kg/s.  None until then and in forward mode.
+    solved_mdot_kgs: Optional[float] = None
 
     # Populated by the Results screen after a successful calculate().
     # Normalized to a list of dicts with keys: distance_m, P_Pa, v_ms,
@@ -61,10 +81,14 @@ class AppState:
         (or vice versa).  Easier to force the user to redefine than to
         translate.
         """
-        self.segment      = None
-        self.fluid        = None
-        self.flow_rate    = None
-        self.P_inlet_Pa   = None
-        self.T_inlet_K    = None
-        self.isothermal   = False
-        self.results      = None
+        self.segment                = None
+        self.fluid                  = None
+        self.flow_rate              = None
+        self.P_inlet_Pa             = None
+        self.T_inlet_K              = None
+        self.isothermal             = False
+        self.solve_mode             = "forward"
+        self.P_outlet_Pa            = None
+        self.flow_rate_display_unit = None
+        self.solved_mdot_kgs        = None
+        self.results                = None

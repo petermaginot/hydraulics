@@ -45,10 +45,14 @@ Fields:
 | `flow_type` | Start | `"incompressible"` / `"compressible"` / `"network"` |
 | `segment` | Segment | `Line_Segment` of the right subclass |
 | `fluid` | Fluid | `Incompressible_Fluid` or pre-updated CoolProp `AbstractState` |
-| `flow_rate` | Fluid | pint Quantity (volumetric/mass/molar/std-vol) |
+| `flow_rate` | Fluid | pint Quantity (volumetric/mass/molar/std-vol); `None` in inverse mode |
 | `P_inlet_Pa` | Fluid | inlet pressure anchor (Pa) |
 | `T_inlet_K` | Fluid | inlet T (compressible only) |
 | `isothermal` | Fluid | compressible calculation mode |
+| `solve_mode` | Fluid | `"forward"` (user provides flow rate) or `"inverse"` (user provides outlet pressure) |
+| `P_outlet_Pa` | Fluid | target outlet pressure for inverse mode (Pa); `None` in forward mode |
+| `flow_rate_display_unit` | Fluid | dropdown label (e.g. `"BBL/D"`) used to format `solved_mdot_kgs` on the Results summary; `None` in forward mode |
+| `solved_mdot_kgs` | Results | mass flow rate returned by `dmdot` / `dmdot_dT` after a successful inverse solve; `None` otherwise |
 | `results` | Results | list of `{distance_m, P_Pa, v_ms, [T_K]}` |
 
 The **network screen does not use `AppState`** beyond reading `flow_type` — it holds its own per-node spec dicts (`node_specs`) and last-solve cache (`_last_net`, `_last_result`) because its data model differs structurally from the linear flow.
@@ -76,24 +80,31 @@ The Next button enables only after a segment is successfully built; `showEvent` 
 
 ## Fluid screen — [`fluid.py`](gui/screens/fluid.py) (point-to-point only)
 
-A `QStackedWidget` swaps two panels keyed on `state.flow_type`.
+A `QStackedWidget` swaps two panels keyed on `state.flow_type`. Both panels carry an **Operating mode** radio group at the top with two choices:
 
-**Incompressible panel.** A radio toggle picks Density or API gravity (the other gets disabled). Below that: viscosity and flow rate, both with unit dropdowns. The flow-rate dropdown carries both **volumetric** and **mass** units (the `Network` / single-component solvers convert either to mass internally). On Calculate, an `Incompressible_Fluid` is built and stashed alongside the flow rate; `P_inlet_Pa` is anchored at gauge 0.
+- **"Solve for pressure profile (given flow rate)"** (default) — the existing forward solve. The Results screen calls `pressure_profile()` (incompressible) or `dP_dT()` (compressible).
+- **"Solve for flow rate (given outlet pressure)"** — inverse mode. An **Outlet pressure** field becomes enabled and the **Flow rate** value entry is disabled (its unit dropdown stays enabled — that unit becomes the display unit for the solved mdot on the Results summary). The Results screen calls `Line_Segment.dmdot()` (incompressible) or `Line_Segment.dmdot_dT()` (compressible).
 
-**Compressible panel.** A `QTableWidget` of `(Component, Mole fraction)` rows seeded with Methane = 1.0. `+ Component` / `- Remove` buttons and a `Load CSV...` reader (`composition.parse_composition_csv`). The per-row component combo filters out names already in use elsewhere, so a 20-row table can't produce a duplicate. EOS dropdown (HEOS / PR), inlet P and T fields (with unit dropdowns), and a flow-rate field whose dropdown carries mass, molar, and standard-volume units (`mmscf/day`, `mol/s`, etc.). A radio group below selects **Adiabatic (energy balance)** or **Isothermal (constant T)** mode. On Calculate, `composition.define_composition(**kwargs)` builds the `AbstractState`, `AS.update(PT_INPUTS, P, T)` anchors it at the inlet, and the AS + flow rate + inlet (P, T) + isothermal flag are stashed on `AppState`.
+Disabled fields keep their text, so toggling the radio back and forth doesn't lose user input. `_apply_incompressible_mode()` and `_apply_compressible_mode()` are the per-panel enable/disable toggles, fired on radio change.
+
+**Incompressible panel.** A radio toggle picks Density or API gravity (the other gets disabled). Below that: viscosity, **inlet pressure** (default `0 psi` — always visible, both modes), **outlet pressure** (inverse only), and flow rate, all with unit dropdowns. The flow-rate dropdown carries both **volumetric** and **mass** units (the `Network` / single-component solvers convert either to mass internally). On Calculate, an `Incompressible_Fluid` is built and stashed alongside the flow rate (forward) or the outlet pressure (inverse); `P_inlet_Pa` carries the user-supplied value (the default `0 psi` preserves the previous gauge-0 behavior when the field is left untouched). Inverse mode validates `P_inlet > P_outlet` and raises an error dialog on violation.
+
+**Compressible panel.** A `QTableWidget` of `(Component, Mole fraction)` rows seeded with Methane = 1.0. `+ Component` / `- Remove` buttons and a `Load CSV...` reader (`composition.parse_composition_csv`). The per-row component combo filters out names already in use elsewhere, so a 20-row table can't produce a duplicate. EOS dropdown (HEOS / PR), inlet P and T fields (with unit dropdowns), **outlet pressure** (inverse only), and a flow-rate field whose dropdown carries mass, molar, and standard-volume units (`mmscf/day`, `mol/s`, etc.). A radio group below selects **Adiabatic (energy balance)** or **Isothermal (constant T)** mode. On Calculate, `composition.define_composition(**kwargs)` builds the `AbstractState`, `AS.update(PT_INPUTS, P, T)` anchors it at the inlet, and the AS + (flow rate OR outlet pressure) + inlet (P, T) + isothermal flag + `solve_mode` are stashed on `AppState`. Inverse mode validates `P_inlet > P_outlet`.
 
 ---
 
 ## Results screen — [`results.py`](gui/screens/results.py) (point-to-point only)
 
-Runs the calculation on `showEvent` and again on the Re-run button.
+Runs the calculation on `showEvent` and again on the Re-run button. The Fluid screen stashes `state.solve_mode` (`"forward"` or `"inverse"`) and `_run()` branches on it for each regime:
 
-- **Incompressible** path: `state.segment.pressure_profile(fluid, P0, flow_rate)` returns the per-point list directly.
-- **Compressible** path: re-anchors the AS with `AS.update(PT_INPUTS, P_inlet, T_inlet)` before each run (because `dP_dT` mutates AS in place), constructs a `FlowState(AS, mdot, A=segment.inlet_area_si, z=0)` from that anchor — `mdot` from `_resolve_mdot(flow_rate, AS)` — then calls `segment.dP_dT(fs, isothermal=...)` and normalizes the tuple-of-tuples return into the same dict shape used downstream.
+- **Incompressible, forward**: `state.segment.pressure_profile(fluid, P0, flow_rate)` returns the per-point list directly.
+- **Incompressible, inverse**: `state.segment.dmdot(fluid, P_inlet, P_outlet)` returns mass flow rate; that value is stashed on `state.solved_mdot_kgs` and fed back through `pressure_profile()` (as a `kg/s` Quantity) to produce the curve to plot.
+- **Compressible, forward**: re-anchors the AS with `AS.update(PT_INPUTS, P_inlet, T_inlet)` before each run (because `dP_dT` mutates AS in place), constructs a `FlowState(AS, mdot, A=segment.inlet_area_si, z=0)` from that anchor — `mdot` from `_resolve_mdot(flow_rate, AS)` — then calls `segment.dP_dT(fs, isothermal=...)` and normalizes the tuple-of-tuples return into the same dict shape used downstream.
+- **Compressible, inverse**: same re-anchor, builds a `FlowState` with a placeholder `mdot` (overwritten by the solver), and calls `segment.dmdot_dT(fs, P2=P_outlet, isothermal=...)`. The solver returns the profile directly (same tuple shape as `dP_dT`); `fs.mdot` at return is the solved mass flow rate, which is stashed on `state.solved_mdot_kgs`.
 
 The plot is a pressure-vs-distance curve (left Y axis, blue) with an X-axis distance-unit selector and Y-axis pressure-unit selector. **Compressible adds a secondary right-hand axis** (linked ViewBox) carrying the temperature trace, with its own unit selector. Unit-selector changes re-render against `state.results` without re-running the solver — the underlying data is always SI.
 
-A monospace summary block above the plot reports length, inlet/outlet P, total dP, and (compressible) inlet/outlet T.
+A monospace summary block above the plot reports length, inlet/outlet P, total dP, and (compressible) inlet/outlet T. When `state.solved_mdot_kgs` is set (inverse mode), an additional **"Solved flow"** row is appended, formatted via the module-level `_format_solved_mdot()` helper. The helper inspects the requested unit's pint dimensionality and converts from `kg/s` directly (mass), via `AS.molar_mass()` (molar / std-vol units, which are registered as mole equivalents in the unit registry), or via `AS.rhomass()` / `Incompressible_Fluid.density_si` (actual-volume units). The display unit comes from `state.flow_rate_display_unit` — the value the user had selected on the (now-disabled) flow-rate dropdown when they pressed Calculate.
 
 ---
 

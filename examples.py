@@ -22,9 +22,12 @@ from compressible_flow import (
 )
 from incompressible import (
     Bend as Incompressible_Bend,
+    CheckValve as Incompressible_CheckValve,
     Contraction_Expansion as Incompressible_Contraction_Expansion,
     Incompressible_Fluid,
     Line_Segment as Incompressible_Line_Segment,
+    Orifice as Incompressible_Orifice,
+    Valve as Incompressible_Valve,
     _resolve_flow_rate,
     export_pressure_profile,
     print_results,
@@ -918,6 +921,262 @@ def test_orifice_dmdot_dT_vs_dA():
     )
 
 
+def test_incompressible_dmdot_roundtrip():
+    """Round-trip every incompressible component's dP against its
+    dmdot inverse.
+
+    For each component: pick a representative geometry and a forward
+    mass flow rate, compute the resulting outlet pressure via dP(), then
+    invert via dmdot(P_inlet, P_outlet) and assert the recovered mdot
+    matches the original.
+
+    Analytic components (Valve, CheckValve, Contraction_Expansion) round-
+    trip to machine precision (~1e-12).  Fixed-point components (Bend,
+    Orifice) round-trip to the loop tolerance (~1e-7).  Line_Segment
+    uses brentq and round-trips to ~1e-5.
+    """
+    print("\ntest_incompressible_dmdot_roundtrip")
+
+    fluid = Incompressible_Fluid(density=1000.0, viscosity=1e-3)
+    ID    = ureg.Quantity(2.0, "inch")
+    ID_si = ID.to("m").magnitude
+    A     = math.pi * ID_si ** 2 / 4.0
+    rho   = fluid.density_si
+
+    P_inlet = 5.0e5   # 5 bar absolute, well above any cavitation
+    mdot_target_pq = ureg.Quantity(20.0, "kg/s")
+    mdot_target    = mdot_target_pq.to("kg/s").magnitude
+
+    cases  = []
+    TOL    = 5e-3
+
+    def roundtrip(label, component, mdot_pq=mdot_target_pq, tol=TOL,
+                  P_in=P_inlet):
+        dP        = component.dP(fluid, mdot_pq)
+        P_out     = P_in + dP
+        mdot_inv  = component.dmdot(fluid, P_in, P_out)
+        mdot_in   = mdot_pq.to("kg/s").magnitude
+        err       = abs(mdot_inv - mdot_in) / mdot_in
+        cases.append((label, err, mdot_inv, mdot_in, dP))
+        assert err < tol, f"{label}: rel err {err:.2e} > {tol:.0e}"
+
+    roundtrip("Valve K=10",
+              Incompressible_Valve(Di=ID, K=10.0))
+    roundtrip("CheckValve K=20 fwd",
+              Incompressible_CheckValve(Di=ID, K=20.0))
+    roundtrip("Bend 90 deg",
+              Incompressible_Bend(Di=ID, ang_deg=90.0, bend_dias=3.0))
+    roundtrip("Orifice 0.75\" bore",
+              Incompressible_Orifice(
+                  Di=ID, Do=ureg.Quantity(0.75, "inch")))
+    roundtrip("Contraction 2->1\"",
+              Incompressible_Contraction_Expansion(
+                  Di_US=ID, Di_DS=ureg.Quantity(1.0, "inch")))
+    roundtrip("Expansion 1\"->2\"",
+              Incompressible_Contraction_Expansion(
+                  Di_US=ureg.Quantity(1.0, "inch"), Di_DS=ID),
+              mdot_pq=ureg.Quantity(5.0, "kg/s"))
+
+    seg = Incompressible_Line_Segment(
+        roughness=ureg.Quantity(0.00015, "ft"),
+        id_val=ID,
+        length=ureg.Quantity(200.0, "ft"),
+        elevation_change=ureg.Quantity(0.0, "ft"),
+        name="seg",
+    )
+    roundtrip("Line_Segment flat",
+              seg, mdot_pq=ureg.Quantity(15.0, "kg/s"), tol=1e-4)
+
+    seg_down = Incompressible_Line_Segment(
+        roughness=ureg.Quantity(0.00015, "ft"),
+        id_val=ID,
+        length=ureg.Quantity(200.0, "ft"),
+        elevation_change=ureg.Quantity(-10.0, "ft"),
+        name="seg_down",
+    )
+    roundtrip("Line_Segment downhill",
+              seg_down, mdot_pq=ureg.Quantity(15.0, "kg/s"), tol=1e-4)
+
+    for label, err, mdot_inv, mdot_in, dP in cases:
+        print(f"  {label:25s}: rel err={err:.2e}, mdot_inv={mdot_inv:.6g} "
+              f"(target {mdot_in:.6g}), dP={dP:.4g} Pa")
+
+
+def test_incompressible_valve_cavitation():
+    """Exercise the three-regime ISA-75.01 cavitation gate added to
+    incompressible Valve / CheckValve.
+
+    Covers: silent path (F_L=None), flashing, choked cavitating,
+    incipient warning, and round-trip preservation when F_L is set in the
+    non-cavitating regime.
+    """
+    import warnings as _warnings
+
+    print("\ntest_incompressible_valve_cavitation")
+
+    Pv = 10.0e3     # 10 kPa vapor pressure (water-like at ambient)
+    fluid = Incompressible_Fluid(
+        density=1000.0, viscosity=1e-3, vapor_pressure=Pv,
+    )
+
+    ID = ureg.Quantity(2.0, "inch")
+
+    # --- Silent path: F_L is None, no warning or error fires even at
+    # extreme cavitation conditions.
+    valve_silent = Incompressible_Valve(Di=ID, K=10.0, name="silent")
+    mdot_pq      = ureg.Quantity(40.0, "kg/s")
+    with _warnings.catch_warnings(record=True) as caught:
+        _warnings.simplefilter("always")
+        valve_silent.dP(fluid, mdot_pq, P_inlet=2.0e5)
+        valve_silent.dmdot(fluid, P_inlet=2.0e5, P_outlet=1.5e5)
+    cav_warnings = [w for w in caught if "cavitation" in str(w.message).lower()]
+    assert not cav_warnings, (
+        f"silent path leaked a cavitation warning: {[str(w.message) for w in cav_warnings]}"
+    )
+    print(f"  silent (F_L=None)        : no warnings/errors (got "
+          f"{len(caught)} unrelated warnings)")
+
+    # --- Regime 1: flashing.  P_outlet below P_v -> hard error.
+    valve = Incompressible_Valve(Di=ID, K=10.0, F_L=0.9, name="flashing-test")
+    try:
+        valve.dmdot(fluid, P_inlet=1.0e5, P_outlet=5.0e3)
+    except RuntimeError as exc:
+        assert "flashing" in str(exc).lower(), f"wrong message: {exc}"
+        print(f"  regime 1 (flashing)      : RuntimeError raised -- ok")
+    else:
+        raise AssertionError("flashing regime did not raise RuntimeError")
+
+    # --- Regime 2: choked cavitating flow.
+    # F_L=0.7, P_in=2 bar, Pv=10 kPa, F_F~=0.96 (no Pc on fluid)
+    # dP_choked = 0.49 * (2e5 - 0.96*1e4) = 0.49 * 1.904e5 = 9.33e4 Pa
+    # Choose P_outlet that drives |dP| just over 9.33e4 Pa but still
+    # leaves P_outlet > Pv (so it's choked-cavitating, not flashing).
+    valve_choked = Incompressible_Valve(Di=ID, K=10.0, F_L=0.7, name="choked-test")
+    try:
+        # |dP| = 1.0e5 Pa > 9.33e4 Pa, P_outlet = 1.0e5 Pa > Pv = 1.0e4 Pa.
+        valve_choked.dmdot(fluid, P_inlet=2.0e5, P_outlet=1.0e5)
+    except RuntimeError as exc:
+        assert "choked" in str(exc).lower(), f"wrong message: {exc}"
+        print(f"  regime 2 (choked cav.)   : RuntimeError raised -- ok")
+    else:
+        raise AssertionError("choked-cavitating regime did not raise RuntimeError")
+
+    # --- Regime 3: incipient cavitation warning.
+    # The incipient-but-not-choked window is
+    #   F_L^2 * (P_in - Pv)  <  |dP|  <  F_L^2 * (P_in - F_F*Pv)
+    # i.e. width F_L^2 * (1-F_F) * Pv.  For small Pv/P_in the window
+    # collapses to a few hundred Pa, so we use a fluid where Pv is a
+    # substantial fraction of P_in (a near-saturation high-vapor-pressure
+    # liquid) to get a workable test margin.
+    Pv_high = 5.0e5
+    fluid_hot = Incompressible_Fluid(
+        density=900.0, viscosity=5e-4, vapor_pressure=Pv_high,
+    )
+    valve_incip = Incompressible_Valve(Di=ID, K=10.0, F_L=0.95, name="incip-test")
+    # F_L=0.95 -> F_L^2 = 0.9025.  P_in=1e6, Pv=5e5, F_F=0.96.
+    # dP_incip  = 0.9025 * (1e6 - 5e5)      = 4.51e5 Pa
+    # dP_choked = 0.9025 * (1e6 - 0.96*5e5) = 4.69e5 Pa
+    # |dP|=4.60e5 -> sigma = 0.5e6/4.6e5 = 1.087 < 1/F_L^2 = 1.108 (incipient)
+    # P_outlet  = 1e6 - 4.6e5 = 5.4e5 > Pv = 5e5 (no flashing).
+    with _warnings.catch_warnings(record=True) as caught:
+        _warnings.simplefilter("always")
+        valve_incip.dmdot(fluid_hot, P_inlet=1.0e6, P_outlet=5.40e5)
+    incip = [w for w in caught
+             if "incipient cavitation" in str(w.message).lower()]
+    assert incip, f"no incipient warning; caught: {[str(w.message) for w in caught]}"
+    print(f"  regime 3 (incipient)     : UserWarning raised -- ok")
+
+    # --- CheckValve mirrors Valve: flashing path.
+    cv = Incompressible_CheckValve(Di=ID, K=20.0, F_L=0.9, name="cv-flash")
+    try:
+        cv.dmdot(fluid, P_inlet=1.0e5, P_outlet=5.0e3)
+    except RuntimeError as exc:
+        assert "flashing" in str(exc).lower()
+        print(f"  CheckValve flashing      : RuntimeError raised -- ok")
+    else:
+        raise AssertionError("CheckValve flashing did not raise")
+
+    # --- Round-trip preservation: in the non-cavitating regime, F_L set
+    # does not change the math, only adds the gate.
+    valve_safe = Incompressible_Valve(Di=ID, K=10.0, F_L=0.9, name="safe")
+    P_in = 2.0e6    # 20 bar -- gives headroom above the choked threshold
+                    # (F_L^2*(P_in-F_F*Pv) ~= 1.6 MPa) for |dP| ~ 0.5 MPa.
+    dP   = valve_safe.dP(fluid, ureg.Quantity(20.0, "kg/s"), P_inlet=P_in)
+    mdot = valve_safe.dmdot(fluid, P_inlet=P_in, P_outlet=P_in + dP)
+    err  = abs(mdot - 20.0) / 20.0
+    assert err < 1e-10, f"round-trip drift with F_L set: {err:.2e}"
+    print(f"  round-trip with F_L=0.9  : rel err {err:.2e} -- ok")
+
+
+def test_incompressible_orifice_cavitation():
+    """Verify Orifice.dP fires the cavitation gate on both forward
+    (dP) and inverse (dmdot) paths.
+
+    Regression guard for the prior sign bug: Orifice.dP used to gate the
+    cavitation check on `if dP_perm > 0.0`, which never fired since
+    dP_perm is always <= 0 for forward flow.  This test exercises a
+    parameter combination known to trip both the choked and the incipient
+    thresholds, and asserts the right outcome on both `dP` and `dmdot`.
+    """
+    import warnings as _warnings
+
+    print("\ntest_incompressible_orifice_cavitation")
+
+    # Water-like at 1 bar / 65 C (Pv ~ 25 kPa) flowing through a small
+    # restriction at high velocity.
+    Pv    = 25.0e3
+    fluid = Incompressible_Fluid(
+        density=1000.0, viscosity=1e-3, vapor_pressure=Pv,
+    )
+    orif = Incompressible_Orifice(
+        Di=ureg.Quantity(2.0, "inch"),
+        Do=ureg.Quantity(0.5, "inch"),
+        name="cav-test",
+    )
+
+    # --- Forward path: a high mdot at modest inlet pressure produces a
+    # |dP| large enough to push sigma below sigma_choked.
+    P_in_choked = 1.0e5     # 1 bar absolute
+    mdot_high   = ureg.Quantity(15.0, "kg/s")
+    try:
+        orif.dP(fluid, mdot_high, P_inlet=P_in_choked)
+    except RuntimeError as exc:
+        assert "choked cavitation" in str(exc).lower(), f"wrong message: {exc}"
+        print(f"  dP   forward choked     : RuntimeError raised -- ok")
+    else:
+        raise AssertionError(
+            "Orifice.dP did not raise RuntimeError on choked cavitation"
+        )
+
+    # --- Inverse path: same regime via dmdot.  Use a P_outlet that
+    # drives |dP| above the choked threshold.  At P_in=1 bar, Pv=25 kPa,
+    # a near-zero outlet (vacuum) gives sigma = (1e5-2.5e4)/9.9e4 ~ 0.76,
+    # well below typical sigma_choked ~ 2.5.
+    try:
+        orif.dmdot(fluid, P_inlet=P_in_choked, P_outlet=2.6e4)
+    except RuntimeError as exc:
+        assert "choked cavitation" in str(exc).lower(), f"wrong message: {exc}"
+        print(f"  dmdot inverse choked    : RuntimeError raised -- ok")
+    else:
+        raise AssertionError(
+            "Orifice.dmdot did not raise RuntimeError on choked cavitation"
+        )
+
+    # --- Silent path: high inlet pressure keeps sigma well above all
+    # thresholds.  dP must not raise or warn about cavitation.
+    P_in_safe = 5.0e6     # 50 bar -- huge sigma headroom
+    mdot_low  = ureg.Quantity(1.0, "kg/s")
+    with _warnings.catch_warnings(record=True) as caught:
+        _warnings.simplefilter("always")
+        dP = orif.dP(fluid, mdot_low, P_inlet=P_in_safe)
+    cav = [w for w in caught if "cavitation" in str(w.message).lower()]
+    assert not cav, (
+        f"silent path leaked cavitation warning: "
+        f"{[str(w.message) for w in cav]}"
+    )
+    print(f"  dP   safe regime        : no cavitation warning (dP={dP:.3g} Pa)")
+
+
 if __name__ == "__main__":
 
     # test_compressible_fittings()
@@ -934,3 +1193,6 @@ if __name__ == "__main__":
     test_dmdot_dT_roundtrip()
     test_dmdot_dT_choke_raises()
     test_orifice_dmdot_dT_vs_dA()
+    test_incompressible_dmdot_roundtrip()
+    test_incompressible_valve_cavitation()
+    test_incompressible_orifice_cavitation()

@@ -98,6 +98,8 @@ After convergence, the external flow at each P-spec node is recovered from its m
 
 At least one P-spec node is required to anchor pressures.
 
+**Per-component `dmdot` — analytic inverse, not wired into the solver.** Every incompressible component class carries a `dmdot(fluid, P_inlet, P_outlet) -> mdot_kg_s` method that mirrors the compressible `dmdot_dT(fs, P2)` contract. `Valve` / `CheckValve` / `Contraction_Expansion` are analytic closed-form inversions of `dP`; `Bend` and `Orifice` use a 2–3 iteration K(Re) or Cd(Re) fixed point; `Line_Segment` uses a 1-D `brentq` on `mdot` against `pressure_profile()` because per-slice f(Re) plus staircase area changes plus elevation rule out closed form. Unlike the compressible case, these methods are **not** plumbed into a `walk_edge_inverse` analog inside `Network.solve()` — the incompressible residual `(P_from - P_to) + dP(Q) == 0` is already symmetric in which end is pinned (no special inverse mode needed for P-spec-downstream edges). The `dmdot` methods exist as standalone analytic helpers for post-solve diagnostics, GUI flow-rate-driven workflows, and as the natural inverse for any future control-loop or sensitivity tooling.
+
 ---
 
 ## Compressible solver — `Compressible_Network.solve`

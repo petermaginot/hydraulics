@@ -54,7 +54,7 @@ The module also registers custom pint units `scm`, `scf`, `mscf`, and `mmscf` as
 Liquid pipeline hydraulics. Components inherit geometry from `Base_*` and add Darcy-Weisbach friction, hydrostatic elevation head, and Bernoulli / K-factor area-change losses.
 
 ### `Incompressible_Fluid`
-Stores density (kg/m³) and dynamic viscosity (Pa·s) as the working fluid properties. Both can be supplied as pint `Quantity` objects or plain SI floats.
+Stores density (kg/m³) and dynamic viscosity (Pa·s) as the working fluid properties. Both can be supplied as pint `Quantity` objects or plain SI floats. Optional `vapor_pressure` and `critical_pressure` slots (`vapor_pressure_si`, `critical_pressure_si`) are consumed by the cavitation checks on `Valve`, `CheckValve`, and `Orifice`; when omitted those checks are silently skipped.
 
 `Incompressible_Fluid.from_api_gravity(api_gravity, viscosity)` constructs the fluid from petroleum API gravity using `ρ = 1000 · 141.5 / (API + 131.5)`.
 
@@ -68,16 +68,26 @@ Adds the methods:
 
 - **`dP(fluid, flow_rate)`** — convenience wrapper returning the total static pressure change across the segment (negative when pressure decreases in the flow direction).
 
+- **`dmdot(fluid, P_inlet, P_outlet)`** — inverse of `dP`. Returns the forward-flow mass flow rate (kg/s) that produces the requested pressure pair. Implemented as a 1-D `scipy.optimize.brentq` on `pressure_profile()` so it handles staircase profiles and elevation transparently. Raises `ValueError` if the bracket cannot be established (e.g. uphill segment with insufficient head).
+
 `flow_rate` is a pint `Quantity` and may be volumetric (`[length]³/[time]`) or mass (`[mass]/[time]`).
 
 ### `Bend` (inherits `Base_Bend`)
-Adds `dP(fluid, flow_rate)` using the `fluids.fittings.bend_rounded()` K-factor correlation, which accounts for bend angle, bend radius, and Reynolds number. Result is always ≤ 0.
+Adds `dP(fluid, flow_rate)` using the `fluids.fittings.bend_rounded()` K-factor correlation, which accounts for bend angle, bend radius, and Reynolds number. Result is always ≤ 0. Also adds `dmdot(fluid, P_inlet, P_outlet)`, the inverse — a short K(Re) fixed point (typically 2–3 iterations) solves for mdot from the target pressure pair.
 
 ### `Valve` (inherits `Base_Valve`)
-Adds `dP(fluid, flow_rate)` using the pre-computed K-factor stored on the instance: `dP = -K · ½ρv²`. No correlation or Reynolds-number lookup is performed. Result is always ≤ 0.
+Adds `dP(fluid, flow_rate, P_inlet=None)` using the pre-computed K-factor stored on the instance: `dP = -K · ½ρv²`. No correlation or Reynolds-number lookup is performed. Result is always ≤ 0. Adds `dmdot(fluid, P_inlet, P_outlet)` — an analytic inverse since K is constant: `Q = A · sqrt(2 · (P_inlet − P_outlet) / (K · ρ))`.
+
+If the valve was constructed with `F_L` (ISA-75.01 liquid pressure-recovery factor) and the fluid carries `vapor_pressure_si`, both `dP` (when called with `P_inlet`) and `dmdot` run a three-regime cavitation gate: flashing (`P_out < P_v`) and choked cavitating (`|dP| ≥ F_L² · (P_in − F_F · P_v)`, where `F_F = 0.96 − 0.28·sqrt(P_v / P_c)` if the fluid has `critical_pressure_si`, else 0.96) both raise `RuntimeError`; incipient cavitation (`σ = (P_in − P_v)/|dP| < 1/F_L²`) warns. With `F_L=None` the check is silent.
+
+### `CheckValve` (inherits `Base_CheckValve`)
+Same `dP(fluid, flow_rate, P_inlet=None)` and `dmdot(fluid, P_inlet, P_outlet)` shape as `Valve`, with the same optional `F_L` cavitation gate (forward flow only). Reverse flow is handled by the network solver's `_reversed_component()` machinery, which substitutes a sealing-K shadow.
+
+### `Orifice` (inherits `Base_Orifice`)
+Adds `dP(fluid, flow_rate, P_inlet=None)` using the Reader-Harris-Gallagher discharge-coefficient correlation (or `Cd_override` if supplied) converted to a K-factor referenced to the upstream pipe velocity. When `P_inlet` is supplied and the fluid carries `vapor_pressure_si`, a Cd-based sigma cavitation check fires (`RuntimeError` for choked, `UserWarning` for incipient). Adds `dmdot(fluid, P_inlet, P_outlet)` — a short Cd(Re) fixed point solves for mdot.
 
 ### `Contraction_Expansion` (inherits `Base_Contraction_Expansion`)
-Adds `dP(fluid, flow_rate)` returning the total static pressure change (Bernoulli velocity-head exchange + permanent K-factor loss). Returns 0 when `Di_US == Di_DS`.
+Adds `dP(fluid, flow_rate)` returning the total static pressure change (Bernoulli velocity-head exchange + permanent K-factor loss). Returns 0 when `Di_US == Di_DS`. Adds `dmdot(fluid, P_inlet, P_outlet)` — an analytic inverse of the quadratic relationship `dP_static = 0.5·ρ·Q²·β` (β is geometry-only), supports both contraction and expansion directions.
 
 ### Module-level functions
 - **`dP_friction(fluid, flow_rate, flow_area, eps, D_h, dL)`** — Darcy-Weisbach friction loss for a uniform pipe length.
@@ -259,5 +269,5 @@ File for containing utility functions.
 -Switch `Valve.dP_dT` to `compressible_dA` so the throat / K-recovery split replaces the inlet-linearized `compressible_K` path for high-dP service
 -Wire the downstream-pressure-dictated mode of `compressible_dA` into the network solver (today only the flow-rate-dictated path is exercised)
 -Handle flow choking due to pipe area, friction, or heat transfer on pipe segments
--Handle cavitation checks for incompressible fluids (need to add fluid vapor pressure as property)
+-Surface the incompressible Valve/CheckValve cavitation check at the network level — thread `P_inlet` through `_component_signed_dP` so the ISA-75.01 three-regime gate fires automatically during a network solve (today it fires only on direct `dP(..., P_inlet=...)` / `dmdot(...)` calls). See R5 in [improvements.md](improvements.md).
 -Add heat transfer calculation to pipe segments

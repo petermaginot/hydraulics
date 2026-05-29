@@ -468,14 +468,107 @@ entirely:
   silently. Does *not* catch cavitation specifically but catches the bug
   class you are worried about.
 
-- **R5 [tier 2, cavitation check].** Add optional constructor args:
+- **R5 [tier 2, cavitation check ✅ DONE — component-level; network surfacing
+  still open].** New optional constructor args landed:
   - `Incompressible_Fluid(..., vapor_pressure=None, critical_pressure=None)`
-  - `Valve(..., F_L=None)` and same on `CheckValve`.
+    — `vapor_pressure_si` already existed; `critical_pressure_si` is the
+    new slot, consumed only by the `F_F` factor in the choked threshold.
+  - `Base_Valve(..., F_L=None)` and `Base_CheckValve(..., F_L=None)` in
+    [component_classes.py](component_classes.py), validated to `(0, 1]`,
+    round-tripped through `to_dict` / `from_dict`. The compressible side
+    ignores `F_L` (it uses `minimum_diameter` for sonic choke); only the
+    incompressible Valve / CheckValve read it.
 
-  When both `fluid.vapor_pressure` and `valve.F_L` are present, run the
-  three-regime check above per valve during the network walk, and surface
-  results on the network result object so the GUI can flag offending
-  components. Defaults of `None` preserve current behavior.
+  Implementation: shared module-level helper
+  `_valve_cavitation_check(component, fluid, P_inlet, dP_perm)` in
+  [incompressible.py](incompressible.py) runs the three-regime gate
+  (flashing → `RuntimeError`, choked-cavitating → `RuntimeError`,
+  incipient → `UserWarning`) when `F_L`, `vapor_pressure_si`, and
+  `P_inlet` are all present. Silent no-op otherwise so existing call
+  sites continue to behave identically. `Valve.dP` and `CheckValve.dP`
+  gained an optional `P_inlet=None` kwarg (mirroring `Orifice.dP`) so
+  the check can fire on the forward path; `Valve.dmdot` and
+  `CheckValve.dmdot` (see R5.5) pass `P_inlet` automatically since they
+  have it natively.
+
+  `F_F = 0.96 - 0.28 * sqrt(Pv/Pc)` when `critical_pressure_si` is
+  supplied; falls back to `F_F = 0.96` (the low-`Pv/Pc` asymptote)
+  otherwise. The fallback is conservative — it yields a slightly higher
+  choked-cavitation threshold than the true value, so spurious
+  early-trips are not introduced when `Pc` is unknown.
+
+  Reference: [LANL valve cavitation review](https://www.osti.gov/biblio/10155405),
+  page 13 and following.
+
+  Coverage: `test_incompressible_valve_cavitation` in
+  [examples.py](examples.py) exercises the silent path (F_L=None),
+  flashing, choked-cavitating, incipient warning, the `CheckValve`
+  mirror, and round-trip preservation when F_L is set in the
+  non-cavitating regime.
+
+  **Open follow-on:** network-level surfacing. `Network.solve()` does
+  not yet pass `P_inlet` into the per-component `dP` call sites, so the
+  cavitation check is currently opportunistic — it fires when a caller
+  invokes `component.dP(..., P_inlet=...)` or `component.dmdot(...)`
+  directly, but not during a network solve. R4's negative-pressure
+  floor is the natural place to thread `P_inlet` through; both are
+  small additions to `_component_signed_dP` and the residual loop.
+
+- **R5.5 [✅ DONE — `dmdot` on every incompressible component; Orifice.dP
+  cavitation sign bug fixed].** Symmetric to the compressible R2.7
+  work: every incompressible component class now carries a
+  `dmdot(fluid, P_inlet, P_outlet) -> mdot_kg_s` method that mirrors
+  the contract of `dP` but takes the downstream pressure as input.
+  Most paths are analytic (closed-form rearrangement of the dP
+  equation); a couple need a small inner loop:
+
+  - **`Valve` / `CheckValve` / `Contraction_Expansion`:** analytic.
+    `Q = A * sqrt(2 * dP_drop / (K * rho))` for the K-only components;
+    `Contraction_Expansion` solves the quadratic
+    `dP_static = 0.5 * rho * Q^2 * beta` where `beta` is geometry-only
+    (handles both contraction and expansion directions — unlike the
+    compressible analog which raises `NotImplementedError` on
+    expansions for residual-sign reasons that don't apply here).
+  - **`Bend`:** K(Re) fixed point — solve Q analytically from K, refresh
+    Re and K, iterate. 2–3 iterations typical.
+  - **`Orifice`:** Cd(Re) RHG fixed point + cavitation σ check (same
+    thresholds the forward path uses).
+  - **`Line_Segment`:** 1-D `brentq` on `mdot`, residual is
+    `pressure_profile(P0=P_inlet, mdot)[-1]['P_Pa'] - P_outlet`.
+    Closed form is infeasible because each slice carries its own
+    f(Re), the staircase profile can change area between slices, and
+    elevation `-rho*g*dz` is mdot-independent. Bracket: `[1e-9,
+    mdot_hi]` with `mdot_hi` from a fully-turbulent `f~0.02` estimate
+    using the segment's minimum `D_h` / `A`, expanded up to ~3 decades
+    if the initial bracket fails.
+
+  Returns `mdot` in kg/s (not pint, no `fs` to mutate — incompressible
+  has no thermodynamic state container).
+
+  Coverage: `test_incompressible_dmdot_roundtrip` in
+  [examples.py](examples.py) round-trips every component (analytic
+  paths to machine precision ~1e-16, K(Re) fixed point to ~1e-11,
+  brentq Line_Segment to ~1e-13).
+
+  **Network not wired** (deliberate, scope-limited): the incompressible
+  network's existing residual `(P_from - P_to) + dP(Q) == 0` is already
+  symmetric in which end is pinned — unlike the compressible case
+  where the forward walk takes `mdot` as input and produces
+  `walked_P`. No `walk_edge_inverse` analog is needed for correctness.
+  The new `dmdot` methods are useful as standalone analytic helpers
+  (post-solve diagnostics, GUI flow-rate-driven workflows, future
+  control-loop work).
+
+  **Orifice.dP cavitation sign bug fixed as part of this work.** The
+  pre-existing block in `Orifice.dP` gated on `if dP_perm > 0.0`,
+  which never fires since `dP_perm <= 0` for forward flow — so the
+  Orifice cavitation check was effectively dead code in `dP`
+  ([incompressible.py](incompressible.py#L856-L877), formerly L840-L864).
+  Three concomitant bugs cleaned up: gating now reads `dP_perm < 0.0`;
+  sigma uses `dP_abs = -dP_perm` (was dividing by negative dP_perm,
+  giving a negative sigma that always passed the `< sigma_choked`
+  test for the wrong reason); the dead `P_out = P_inlet - dP_perm`
+  line is gone. Covered by `test_incompressible_orifice_cavitation`.
 
 - **R6 [tier 3, contractions].** `Contraction_Expansion` does *not* need F_L —
   the throat static pressure follows from Bernoulli, since for a sharp
@@ -683,7 +776,11 @@ the ODE becomes stiff.
   (vena contracta) choke check on valves is now wired through the new
   `minimum_diameter` parameter (R2); predictive ideal-gas
   Fanno / isothermal choke diagnostic for line segments now warns at
-  `Line_Segment.dP_dT` entry (R7).*
+  `Line_Segment.dP_dT` entry (R7); incompressible Valve / CheckValve
+  cavitation now flagged by the ISA-75.01 three-regime gate when `F_L`
+  and `vapor_pressure_si` are supplied (R5); Orifice cavitation check
+  on the forward `dP` path resurrected from a long-standing dead-code
+  bug (R5.5).*
 
 - **The network walk is the natural enforcement point for both
   cavitation checks and the negative-pressure sanity floor.** Absolute
