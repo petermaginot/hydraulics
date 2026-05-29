@@ -733,12 +733,10 @@ class Bend(Base_Bend):
         rho_in = fs.rho
         mu     = _viscosity_or_LGE(fs.AS, T1, rho_in)
 
-        # Choke bound at the (constant) pipe area.  choked_mass_flux
-        # mutates fs to the sonic throat state; restore inlet.
-        choke = choked_mass_flux(fs=fs, A_throat=A)
-        mdot_choked = choke[0]
-        _safe_flowstate_update_PT(fs, P1, T1)
-        fs.A = A
+        # Cheap ideal-gas choke bound -- the expensive real-gas
+        # choked_mass_flux is deferred to the bracket-failure branch
+        # below (only fires on actual choke).
+        mdot_choked = _ideal_gas_G_max(fs.AS) * A
 
         # Seed mdot for the first Re/K evaluation.
         if fs.mdot > 0.0:
@@ -759,10 +757,13 @@ class Bend(Base_Bend):
             )
 
             def forward_at_mdot(mdot_trial, K=K):
+                # skip_choke_check=True: mdot_hi capped at 0.95*mdot_choked
+                # by _solve_mdot_for_outlet_P, so the per-iteration
+                # choked_mass_flux inside compressible_K is redundant.
                 _safe_flowstate_update_PT(fs, P1, T1)
                 fs.A    = A
                 fs.mdot = mdot_trial
-                compressible_K(fs, K)
+                compressible_K(fs, K, skip_choke_check=True)
 
             mdot_guess = A * math.sqrt(2.0 * (P1 - P2) * rho_in / max(K, 1e-6))
 
@@ -775,6 +776,9 @@ class Bend(Base_Bend):
                     caller_name="Bend.dmdot_dT",
                 )
             except RuntimeError as exc:
+                _safe_flowstate_update_PT(fs, P1, T1)
+                fs.A = A
+                choke = choked_mass_flux(fs=fs, A_throat=A)
                 raise ChokedFlowError(*choke) from exc
 
             if abs(mdot_new - mdot_seed) <= _MDOT_REL_TOL * max(mdot_new, 1e-30):
@@ -899,20 +903,26 @@ class Valve(Base_Valve):
         A1     = fs.A
         rho_in = fs.rho
 
-        # Choke bound at the pipe area.  choked_mass_flux mutates fs.AS to
-        # the throat (sonic) state; restore inlet for the forward closure.
-        choke = choked_mass_flux(fs=fs, A_throat=A1)
-        mdot_choked = choke[0]
-        _safe_flowstate_update_PT(fs, P1, T1)
-        fs.A = A1
+        # Cheap ideal-gas choke bound -- choked_mass_flux is expensive
+        # (~1.5 s on HEOS mixtures because it grid-scans an isentrope
+        # with ~40 CoolProp PT updates) but only its scalar mdot_choked
+        # is needed for brentq's upper bracket, and the helper's
+        # retreat loop tolerates a loose overestimate.  The full real-
+        # gas payload is only needed when actually choked, so defer
+        # that call to the bracket-failure branch.
+        mdot_choked = _ideal_gas_G_max(fs.AS) * A1
 
         mdot_guess = A1 * math.sqrt(2.0 * (P1 - P2) * rho_in / self.K)
 
         def forward_at_mdot(mdot_trial):
+            # skip_choke_check=True: mdot_hi capped at 0.95*mdot_choked
+            # by _solve_mdot_for_outlet_P, so the per-iteration
+            # choked_mass_flux is redundant with the outer estimate.
             _safe_flowstate_update_PT(fs, P1, T1)
             fs.A    = A1
             fs.mdot = mdot_trial
-            compressible_changing_area_K(fs=fs, A_out=A1, K=self.K)
+            compressible_changing_area_K(fs=fs, A_out=A1, K=self.K,
+                                         skip_choke_check=True)
 
         try:
             _solve_mdot_for_outlet_P(
@@ -925,8 +935,12 @@ class Valve(Base_Valve):
         except RuntimeError as exc:
             # Bracket failure on a monotonically-decreasing residual means
             # the component cannot subsonically attain P2 at this inlet
-            # state.  Surface as ChokedFlowError so the network solver can
-            # clamp mdot via the structured payload.
+            # state.  Get the real-gas choke payload now (expensive but
+            # we only run this on the failure path) and surface as
+            # ChokedFlowError so the network solver can clamp mdot.
+            _safe_flowstate_update_PT(fs, P1, T1)
+            fs.A = A1
+            choke = choked_mass_flux(fs=fs, A_throat=A1)
             raise ChokedFlowError(*choke) from exc
 
 
@@ -1185,21 +1199,22 @@ class Contraction_Expansion(Base_Contraction_Expansion):
         T1     = fs.T
         rho_in = fs.rho
 
-        # Choke is at the smaller area.  choked_mass_flux mutates fs to
-        # the sonic-throat state; restore inlet for the forward closure.
+        # Choke is at the smaller area.  Cheap ideal-gas estimate now;
+        # the expensive real-gas choked_mass_flux runs only on the
+        # bracket-failure path below.
         A_throat = min(A_US, A_DS)
-        choke = choked_mass_flux(fs=fs, A_throat=A_throat)
-        mdot_choked = choke[0]
-        _safe_flowstate_update_PT(fs, P1, T1)
-        fs.A = A_US
+        mdot_choked = _ideal_gas_G_max(fs.AS) * A_throat
 
         mdot_guess = A_US * math.sqrt(2.0 * (P1 - P2) * rho_in / max(K, 1e-6))
 
         def forward_at_mdot(mdot_trial):
+            # skip_choke_check=True: mdot_hi capped at 0.95*mdot_choked
+            # by _solve_mdot_for_outlet_P, so the per-iteration
+            # choked_mass_flux is redundant with the outer estimate.
             _safe_flowstate_update_PT(fs, P1, T1)
             fs.A    = A_US
             fs.mdot = mdot_trial
-            compressible_changing_area_K(fs, A_DS, K)
+            compressible_changing_area_K(fs, A_DS, K, skip_choke_check=True)
 
         try:
             _solve_mdot_for_outlet_P(
@@ -1210,6 +1225,9 @@ class Contraction_Expansion(Base_Contraction_Expansion):
                 caller_name="Contraction_Expansion.dmdot_dT",
             )
         except RuntimeError as exc:
+            _safe_flowstate_update_PT(fs, P1, T1)
+            fs.A = A_US
+            choke = choked_mass_flux(fs=fs, A_throat=A_throat)
             raise ChokedFlowError(*choke) from exc
 
 
@@ -2144,7 +2162,8 @@ def compressible_changing_area(fs, A_out):
     return (P_out, T_out)
 
 
-def compressible_changing_area_K(fs, A_out, K=0.0, e_loss=None):
+def compressible_changing_area_K(fs, A_out, K=0.0, e_loss=None,
+                                 skip_choke_check=False):
     """Outlet pressure and temperature for a compressible fluid passing through
     an area change with a known loss coefficient K applied to inlet velocity.
     Alternatively, e_loss, the mechanical energy loss per unit mass, can be supplied
@@ -2233,8 +2252,14 @@ def compressible_changing_area_K(fs, A_out, K=0.0, e_loss=None):
     # Choked-flow pre-screen at A_throat = min(A_in, A_out), with recovery
     # to A_out.  On choke, fs.A is updated to A_out and ChokedFlowError
     # is raised; otherwise AS is restored to inlet for the subsonic Newton
-    # solve below.
-    _choke_pre_screen(fs, min(A_in, A_out), A_out, A_on_choke=A_out)
+    # solve below.  Callers that have already verified mdot is well
+    # below the choke point (e.g. compressible_dA Mode 2's brentq, which
+    # caps mdot_hi at 0.95 * mdot_choked) can pass skip_choke_check=True
+    # to bypass this -- the pre-screen runs choked_mass_flux which costs
+    # ~150-200 ms on HEOS mixtures, and amortizing it over a brentq's
+    # ~10-20 trial mdots is what makes per-iteration inversion practical.
+    if not skip_choke_check:
+        _choke_pre_screen(fs, min(A_in, A_out), A_out, A_on_choke=A_out)
 
     H_total = H_in + 0.5 * v_in**2    # stagnation enthalpy [J/kg], conserved as no work or heat input is assumed
     if e_loss is None:
@@ -2339,7 +2364,7 @@ def compressible_changing_area_K(fs, A_out, K=0.0, e_loss=None):
         )
 
 
-def compressible_K(fs, K, dPmax=0.05, A_throat=None):
+def compressible_K(fs, K, dPmax=0.05, A_throat=None, skip_choke_check=False):
     """Outlet conditions for a compressible fluid passing through a fitting
     with a known loss coefficient K and no area change.
 
@@ -2422,8 +2447,13 @@ def compressible_K(fs, K, dPmax=0.05, A_throat=None):
     # (compressible_changing_area_K) branch is taken below.  The inner
     # screens of those branches use the body area and would miss internal
     # choking when A_throat < flow_area; this one closes that gap.
+    # Callers running an outer brentq with mdot capped well below
+    # mdot_choked can pass skip_choke_check=True to bypass the ~150 ms
+    # choked_mass_flux call here (and propagate the skip to the slow-path
+    # fallback below).  Used by Bend.dmdot_dT's forward closure.
     throat_screened = False
-    if A_throat is not None and 0.0 < A_throat < flow_area:
+    if (not skip_choke_check
+            and A_throat is not None and 0.0 < A_throat < flow_area):
         _choke_pre_screen(fs, A_throat, flow_area)
         throat_screened = True
 
@@ -2442,14 +2472,15 @@ def compressible_K(fs, K, dPmax=0.05, A_throat=None):
     # pre-screen, so we do NOT run one here -- otherwise the computationally intensive isentropic choke finding function
     # would execute twice for the same inlet state.
     if (abs(dP) / P_in > dPmax) or (denominator < 0.5):
-        compressible_changing_area_K(fs, A_out=flow_area, K=K)
+        compressible_changing_area_K(fs, A_out=flow_area, K=K,
+                                     skip_choke_check=skip_choke_check)
 
     else: #small dP, not near choked
 
         # Body-area choke pre-screen (fast-path only).  Skip if the
         # hoisted A_throat screen above already covered a smaller area --
         # that's strictly more restrictive than this one.
-        if not throat_screened:
+        if not throat_screened and not skip_choke_check:
             _choke_pre_screen(fs, flow_area, flow_area)
 
         P_out  = P_in + dP
@@ -3161,13 +3192,20 @@ def compressible_dA(fs, A_throat, K = 0.0, A2 = None, P2 = None):
 
     def forward_at_mdot(mdot_trial):
         # Restore inlet conditions; the kernels mutate fs in place.
+        # skip_choke_check=True on both kernel calls: mdot_hi is capped
+        # at 0.95*mdot_choked by _solve_mdot_for_outlet_P, so the
+        # ~150 ms per-call choked_mass_flux pre-screen is wasted work
+        # here -- mdot_choked is already known from the outer
+        # choked_mass_flux call above.
         _safe_flowstate_update_PT(fs, P1, T1)
         fs.A    = A1
         fs.mdot = mdot_trial
         v1_t   = mdot_trial / (rho_in * A1)
         e_loss = 0.5 * K * v1_t**2
-        compressible_changing_area_K(fs=fs, A_out=A_throat, K=0.0)
-        compressible_changing_area_K(fs=fs, A_out=A2, e_loss=e_loss)
+        compressible_changing_area_K(fs=fs, A_out=A_throat, K=0.0,
+                                     skip_choke_check=True)
+        compressible_changing_area_K(fs=fs, A_out=A2, e_loss=e_loss,
+                                     skip_choke_check=True)
 
     _solve_mdot_for_outlet_P(
         fs, P2,

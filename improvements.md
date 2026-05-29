@@ -179,12 +179,16 @@ feedback in the denominator strengthens nonlinearly as the gas expands.
       Covered by `test_valve_minimum_diameter_choke` in
       [textbook_test_functions.py](textbook_test_functions.py) and
       `test_K` in [examples.py](examples.py).
-    - **R2.7 [partial — component-level `dmdot_dT` landed; network
-      wiring still open].** Every compressible component class now
-      carries a `dmdot_dT(fs, P2)` inverse-solve method that mirrors the
-      contract of `dP_dT` but takes the downstream pressure as input and
-      mutates `fs` to the converged outlet state (with `fs.mdot` holding
-      the solved value).  Implementation summary:
+    - **R2.7 [✅ DONE — component-level `dmdot_dT` and network wiring
+      both landed].** Every compressible component class now carries a
+      `dmdot_dT(fs, P2)` inverse-solve method that mirrors the contract
+      of `dP_dT` but takes the downstream pressure as input and mutates
+      `fs` to the converged outlet state (with `fs.mdot` holding the
+      solved value).  `Compressible_Network.solve` auto-detects edges
+      whose downstream node is P-spec and dispatches them through an
+      inverse walker (`walk_edge_inverse`) that swaps the standard
+      `(walked_P - P_outlet)/P_ref` pipe residual for the local
+      `(mdot - mdot_solved)/mdot_ref` form.  Implementation summary:
 
       The brentq-with-retreat machinery that originally lived inside
       `compressible_dA`'s Mode 2 non-choked branch was extracted into a
@@ -253,13 +257,149 @@ feedback in the denominator strengthens nonlinearly as the gas expands.
       eliminates the fixed point — observed drift 0 to machine
       precision).
 
-      **Open follow-on:** wire `dmdot_dT` into
-      `compressible_network.walk_edge` as the boundary-condition path
-      for edges whose downstream node is P-specified (relief valves
-      discharging to a fixed header pressure, regulator setpoints,
-      atmospheric vents).  The component-level building blocks are now
-      in place; the network solver still dispatches only on the
-      flow-driven (`dP_dT`) path.
+      **Network-level wiring (`Compressible_Network.solve`).**
+      Auto-detection is one line at the top of `solve()`:
+      `inverse_of = [self._nodes[e.to_node].P_spec_Pa is not None for e
+      in self._edges]`.  The residual function consults `inverse_of[e_idx]`
+      twice -- once when choosing between `walk_edge` (forward) and
+      `walk_edge_inverse`, and once when assembling the pipe-equation
+      residual (`mdot - mdot_solved` for inverse edges, `walked_P -
+      P_outlet` for forward).  Mass and energy balances are untouched
+      -- they consume the unknown-vector `mdot[e_idx]` and the
+      `walked_h_out[e_idx]` populated by both walkers.
+
+      `walk_edge_inverse` itself dispatches on edge shape:
+
+        * **Single-component edge** (the common relief-valve case):
+          delegates directly to `component.dmdot_dT(fs, P2=P_target)`.
+          This is essential for correctness on components with internal
+          throats (Orifice, Valve / CheckValve with `minimum_diameter`):
+          the component knows its own throat geometry and routes through
+          `compressible_dA` Mode 2's exact bracketing.  An earlier
+          implementation that did its own brentq with
+          `mdot_choked = G_max * A_min` over component inlet areas
+          consistently failed to bracket on constricted Valves and
+          Orifices (throat is much smaller than the inlet area), then
+          fell through to a penalty `mdot_solved = 0` which LM accepted
+          as a trivial solution on single-edge two-P-spec networks.
+        * **Multi-component edge**: builds a forward closure that walks
+          the entire chain and drives mdot via the shared
+          `_solve_mdot_for_outlet_P` helper.  Choke bound uses the cheap
+          `_ideal_gas_G_max * A_min` estimate; the helper's retreat
+          loop handles overestimates.
+        * **Sealed CV on the edge** (highest priority): returns the
+          clamped sealed-state outlet and `sealed=True`, identical to
+          the forward `walk_edge` sealed-CV path.  The residual
+          dispatcher then uses the sealed-edge `mdot / mdot_ref`
+          residual rather than the inverse form.
+        * **Reverse-flow trial** (`mdot_trial < 0`): not supported on
+          inverse edges; returns `mdot_solved = 0` (driving the
+          inverse residual toward zero, away from negative territory)
+          plus a once-per-solve UserWarning via `_warn_once`.  Relief
+          valves are physically forward-only so this is sufficient for
+          the canonical use case.
+        * **`P_target >= P_in_trial`** (transient infeasibility during
+          LM): subsonic flow cannot reduce pressure to that target;
+          returns `mdot_solved = 0` plus a once-per-solve UserWarning.
+        * **ChokedFlowError from `component.dmdot_dT` or the inner
+          brentq**: clamps `mdot_solved = exc.mdot_choked`, leaves AS at
+          the choked outlet state, returns normally.  The Newton then
+          drives `mdot[e_idx]` to the choke value.  This addresses
+          R3.5's intent (consume `ChokedFlowError.mdot_choked` to clamp
+          the solver) on the inverse path; the forward `walk_edge`
+          ChokedFlowError handler still uses its own penalty-pressure
+          smoothing, since the forward residual form doesn't have a
+          natural place to consume the mdot value.
+
+      **LM finite-difference step.**  When any edge is inverse-mode,
+      `solve()` passes `diff_step=1e-5` to `least_squares` (vs the
+      default `sqrt(machine_eps) ~ 1.5e-8`).  The cheap brentq tolerance
+      inside `walk_edge_inverse` (`xtol_factor=1e-8`) has a noise floor
+      that swamps the FD signal at the default step size, stalling LM
+      on a non-zero residual.  1e-5 sits well above the brentq noise
+      floor with negligible truncation-error penalty.  Forward-only
+      networks keep the default step.
+
+      **Energy-balance guard at P-spec outlets.**  An LM trial that
+      flips an edge's mdot temporarily negative drives the implicit
+      `Q_ext_eff` at a connected P-spec outlet positive (apparent
+      "supply" into the network).  Previously the energy-balance loop
+      read `node.T_spec_K` to evaluate the supply enthalpy, which crashes
+      with `TypeError` on a P-spec-only outlet.  Fixed: the supply
+      branch now `pass`-es when `T_spec_K is None`, treating that
+      transient configuration as zero supply contribution so LM can
+      step away.  At the converged solution the branch never fires
+      (real outlets always have `Q_ext_eff < 0`).
+
+      **Choke pre-screen optimization (the perf big win).**  The
+      compressible kernels (`compressible_changing_area_K`,
+      `compressible_K`) each run a `_choke_pre_screen` that calls
+      `choked_mass_flux` -- a real-gas isentropic march that costs
+      ~150-200 ms per call on HEOS mixtures (~80 CoolProp PT updates
+      grid-scanning an isentrope).  This pre-screen is necessary for
+      safety on arbitrary mdot inputs but is redundant inside any
+      brentq driver that has already capped `mdot_hi ≤ 0.95 * mdot_choked`
+      from a prior choke determination.  Both kernels now accept a
+      `skip_choke_check=False` parameter; the brentq closures inside
+      `compressible_dA` Mode 2, `Valve.dmdot_dT`, `Bend.dmdot_dT`, and
+      `Contraction_Expansion.dmdot_dT` all pass `True`.  In tandem,
+      Valve/Bend/Contraction_Expansion `dmdot_dT` switched from the
+      expensive real-gas `choked_mass_flux` to a cheap
+      `_ideal_gas_G_max * A` for the brentq upper bound (the
+      real-gas call is now deferred to the bracket-failure branch
+      where the structured `ChokedFlowError` payload is needed).
+      Combined effect on a methane-mix benchmark (100 → 90 psi,
+      `benchmark_dmdot.py`):
+
+        * `Valve.dmdot_dT` (plain): 1697 ms → 11 ms (~150x)
+        * `Bend.dmdot_dT`: 2922 ms → 18 ms (~160x)
+        * Single-edge inverse network solve:
+            - Valve plain:        22.2 s → 3.7 s (6.0x)
+            - Bend:               12.6 s → 3.3 s (3.8x)
+            - Line_Segment 200ft:  9.5 s → 8.9 s (1.1x)
+            - Valve constricted:  28.0 s (wrong mdot) → 8.6 s (correct)
+            - Orifice:            33.2 s (wrong mdot) → 10.7 s (correct)
+
+      Constricted-throat components (Orifice, constricted Valve) still
+      pay ~500-770 ms per forward `dP_dT` because `compressible_dA`
+      Mode 1 retains its own upfront `choked_mass_flux` call -- that
+      one is load-bearing (used both for the brentq bound and for the
+      `P2_choked` branch decision).  Splitting Mode 2's choke logic to
+      defer the real-gas call would remove the remaining bottleneck
+      but is a deeper restructure.
+
+      **Coverage.**  Three new tests in
+      [examples.py](examples.py) at the component level:
+      `test_dmdot_dT_roundtrip`, `test_dmdot_dT_choke_raises`,
+      `test_orifice_dmdot_dT_vs_dA`.  Three at the network level in
+      [compressible_network.py](compressible_network.py):
+      `_test_inverse_single_relief_valve`,
+      `_test_inverse_relief_from_junction`,
+      `_test_inverse_choked_relief`.  All five pre-existing
+      network self-tests
+      (`_test_single_segment_forward`, `_test_parallel_two_branches`,
+      `_test_mixing_junction`, `_test_orifice_subsonic`,
+      `_test_orifice_choke`) still pass -- the kernel signature
+      additions (`skip_choke_check`) default to the original behavior
+      and the energy-balance guard only changes behavior on the
+      previously-crashing path.
+
+      **Limitations / known issues.**
+
+        * No opt-out kwarg.  Auto-detection is hard-coded; if a user
+          needs an edge with a P-spec downstream to run in forward
+          mode anyway (e.g. for diagnostic comparison), they would need
+          to patch `inverse_of` manually.  Add `force_forward_edges=[...]`
+          to `solve()` if this comes up.
+        * Reverse-flow on inverse edges is not modeled.  The penalty
+          mdot pushes LM back toward positive flow; an edge that
+          legitimately needs to reverse cannot be inverse-mode.  Use
+          the forward path (downstream junction instead of P-spec) for
+          those edges.
+        * `Contraction_Expansion.dmdot_dT` raises `NotImplementedError`
+          on the expansion direction (kinetic recovery typically
+          dominates K-loss so the residual sign reverses).  An inverse
+          edge containing only an expansion would crash.
 
 - **R3 [larger].** Switch the valve component to an ISA-75.01 / IEC-60534-2-1
   sizing model parameterized by Cv (or Kv) and x_T, with explicit choked-flow
@@ -267,12 +407,23 @@ feedback in the denominator strengthens nonlinearly as the gas expands.
   `compressible_dA`'s two-stage structure is the natural place to host the
   expansion-factor `Y` correction once `x_T` is wired in.
 
-- **R3.5 [follow-on to R1.5].** Have `compressible_network.walk_edge`
-  catch `ChokedFlowError` specifically and consume `mdot_choked` from the
-  exception to clamp the solver's `dmdot` step.  Today the exception is
-  caught generically as a walk failure and the structured data on the
-  exception is discarded, so the solver still recovers via repeated
-  failed walks rather than a single targeted retreat.
+- **R3.5 [partial — inverse-path covered by R2.7; forward path open].**
+  Have `compressible_network.walk_edge` catch `ChokedFlowError`
+  specifically and consume `mdot_choked` from the exception to clamp
+  the solver's `dmdot` step.
+
+  *Inverse-path status:* `walk_edge_inverse` already consumes the
+  payload -- on `ChokedFlowError` it sets `mdot_solved = exc.mdot_choked`
+  and the `(mdot - mdot_choked)/mdot_ref` residual drives the Newton
+  to the clamp value in one step.
+
+  *Forward-path status (still open):* `walk_edge` catches
+  `ChokedFlowError` but only to compute a smoothed penalty-pressure
+  (`(mdot_choked / abs_mdot)**2 * exc.P_outlet`) that gives LM a
+  monotonic gradient back toward subsonic.  The `mdot_choked` value
+  itself is discarded.  A more targeted retreat that snaps `mdot[e_idx]`
+  to `0.99 * exc.mdot_choked` in the next residual call would converge
+  in fewer LM iterations.
 
 ---
 

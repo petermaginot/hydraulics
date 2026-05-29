@@ -60,8 +60,9 @@ from network import (
     _reversed_component, _to_si_or_none, _to_pint_qty,
 )
 from compressible_flow import (
-    _build_phase_limits, _safe_update_PT,
+    _build_phase_limits, _safe_update_PT, _safe_flowstate_update_PT,
     _is_sealed_check_valve, _sealed_outlet_PT,
+    _solve_mdot_for_outlet_P, _ideal_gas_G_max,
     FlowState, ChokedFlowError,
 )
 
@@ -72,6 +73,16 @@ from compressible_flow import (
 # after normalization by P_ref), signalling "infeasible trial" to the
 # trust-region solver without crashing the whole solve.
 _WALK_FAIL_P_PA = 1.0
+
+# Inverse-mode penalty mdot returned by walk_edge_inverse when the trial
+# state is infeasible (reverse flow on an inverse edge, P_target >= P_in,
+# or the per-edge brentq kernel fails outright).  With mdot_solved = 0
+# the pipe-equation residual reduces to mdot[e_idx] / mdot_ref, identical
+# in form to the sealed-CV residual: zero only at mdot = 0, with positive
+# slope so LM sees a clean gradient pulling the trial mdot back toward
+# zero.  Once mdot crosses back into the feasible (positive) region the
+# next trial re-enters the brentq branch and converges normally.
+_INVERSE_PENALTY_MDOT_SOLVED = 0.0
 
 
 # ---------------------------------------------------------------------------
@@ -314,6 +325,20 @@ class Compressible_Network(Network):
                 "specified pressure to anchor the solution."
             )
 
+        # Auto-detect inverse-mode edges: any edge whose downstream node
+        # (to_node) is P-spec.  Inverse-mode edges replace the standard
+        # forward pipe-equation residual (walked_P_out - P_node) with a
+        # locally solved (mdot - mdot_solved) residual driven by
+        # _solve_mdot_for_outlet_P.  Advantages: analytic Jacobian column
+        # for the edge's mdot (+1 / mdot_ref), brentq-bracketed local
+        # solve robust near choke, and choke-aware via ChokedFlowError
+        # clamp.  Edges feeding a junction keep the forward path
+        # unchanged.  See network.md "Compressible solver" section.
+        inverse_of = [
+            self._nodes[edge.to_node].P_spec_Pa is not None
+            for edge in self._edges
+        ]
+
         # Build adjacency for mass / energy balance.
         # adj[i] = list of (edge_idx, sign) where sign=+1 means positive Q_e
         # carries fluid INTO this node, sign=-1 means it carries fluid OUT.
@@ -542,6 +567,197 @@ class Compressible_Network(Network):
                     abstract_state.hmass(),
                     inlet_i, outlet_i, False)
 
+        # Set of warning keys already emitted by walk_edge_inverse on
+        # this solve.  A noisy LM trial can re-enter walk_edge_inverse
+        # with the same infeasibility (reverse flow, P_target >= P_in)
+        # dozens of times per residual call -- _warn_once dedupes so the
+        # log shows one informational warning per condition per solve.
+        warn_keys_seen = set()
+
+        def _warn_once(key, message):
+            if key in warn_keys_seen:
+                return
+            warn_keys_seen.add(key)
+            warnings.warn(message, UserWarning)
+
+        def walk_edge_inverse(edge, mdot_trial, P, T):
+            """Inverse of walk_edge: solve for mdot such that a forward
+            walk through edge.components from the upstream node lands at
+            the downstream (P-spec) node's pressure.
+
+            Returns the same 6-tuple as walk_edge, plus mdot_solved:
+            (P_outlet, T_outlet, h_outlet, inlet_i, outlet_i, sealed,
+            mdot_solved).  The caller stores mdot_solved separately and
+            uses it as the (mdot - mdot_solved) pipe-equation residual.
+
+            mdot_trial is consulted only as a sign hint and as a brentq
+            seed -- the bracketed local solve is what determines
+            magnitude.  Reverse flow (mdot_trial < 0) is not supported
+            on inverse-mode edges; returns a penalty mdot_solved so the
+            LM solver retreats to positive mdot.
+            """
+            inlet_i  = idx_of[edge.from_node]
+            outlet_i = idx_of[edge.to_node]
+            P_in_e   = P[inlet_i]
+            T_in_e   = T[inlet_i]
+            z_in_e   = self._nodes[node_names[inlet_i]].elevation_m
+
+            mdot_penalty = _INVERSE_PENALTY_MDOT_SOLVED
+
+            # Reverse-flow guard.  Inverse mode is forward-only by
+            # design (relief valves, regulators); a trial mdot < 0 from
+            # the LM solver is treated as an infeasible region.
+            if mdot_trial < 0.0:
+                _warn_once(
+                    f"inverse_reverse_{edge.name}",
+                    f"Compressible_Network.solve: inverse-mode edge "
+                    f"{edge.name!r} produced a negative trial mdot; "
+                    f"inverse mode does not support reverse flow.  "
+                    f"Using penalty residual to drive mdot back positive.",
+                )
+                _safe_update_PT(abstract_state, P_in_e, T_in_e,
+                                T_cric, P_bar, T_c, P_c)
+                return (_WALK_FAIL_P_PA, T_in_e, abstract_state.hmass(),
+                        inlet_i, outlet_i, False, mdot_penalty)
+
+            # Sealed-CV short-circuit takes priority over inverse mode:
+            # a sealed CV blocks all flow regardless of the pressure
+            # mismatch across it.  Same clamped sealed-state outlet as
+            # walk_edge, and we still flag sealed=True so the
+            # residual-function dispatcher uses the sealed-edge
+            # mdot/mdot_ref residual.
+            if any(_is_sealed_check_valve(c) for c in edge.components):
+                P_out, T_out = _sealed_outlet_PT(P_in_e, T_in_e)
+                _safe_update_PT(abstract_state, P_out, T_out,
+                                T_cric, P_bar, T_c, P_c)
+                return (abstract_state.p(),
+                        abstract_state.T(),
+                        abstract_state.hmass(),
+                        inlet_i, outlet_i, True, 0.0)
+
+            P_target = P[outlet_i]
+
+            # P_target >= P_in: subsonically impossible (would require
+            # negative friction).  Penalty mdot so LM retreats; same
+            # once-per-solve warning as reverse flow.
+            if P_target >= P_in_e:
+                _warn_once(
+                    f"inverse_P_invert_{edge.name}",
+                    f"Compressible_Network.solve: inverse-mode edge "
+                    f"{edge.name!r} has trial inlet P ({P_in_e:.4g} Pa) "
+                    f"at or below outlet spec P ({P_target:.4g} Pa); "
+                    f"subsonic flow is impossible.  Using penalty residual.",
+                )
+                _safe_update_PT(abstract_state, P_in_e, T_in_e,
+                                T_cric, P_bar, T_c, P_c)
+                return (_WALK_FAIL_P_PA, T_in_e, abstract_state.hmass(),
+                        inlet_i, outlet_i, False, mdot_penalty)
+
+            # Zero-component edge: pure connector, no dP.  Trivially
+            # mdot_solved equals whatever satisfies mass balance; with
+            # no pressure drop, any mdot is consistent so we just match
+            # the LM trial.
+            if not edge.components:
+                _safe_update_PT(abstract_state, P_in_e, T_in_e,
+                                T_cric, P_bar, T_c, P_c)
+                return (P_in_e, T_in_e, abstract_state.hmass(),
+                        inlet_i, outlet_i, False, mdot_trial)
+
+            # Single-component edge (the common relief-valve case):
+            # delegate to component.dmdot_dT(fs, P2).  This is much
+            # faster than the multi-component brentq path -- the
+            # component-level method knows its own internal throat
+            # geometry (Cd*A_bore for Orifice, pi*D_min^2/4 for
+            # constricted Valve / CheckValve) so it can dispatch to
+            # compressible_dA Mode 2's exact bracketing instead of
+            # our generic G_max * A_min estimate, which is way too
+            # generous for components with an internal restriction and
+            # otherwise exhausts the retreat budget.
+            if len(edge.components) == 1:
+                comp = edge.components[0]
+                _safe_update_PT(abstract_state, P_in_e, T_in_e,
+                                T_cric, P_bar, T_c, P_c)
+                fs = FlowState(
+                    abstract_state, max(mdot_trial, 1.0e-9),
+                    A=node_area[inlet_i], z=z_in_e,
+                    T_cricondentherm=T_cric, P_cricondenbar=P_bar,
+                    T_critical=T_c, P_critical=P_c,
+                )
+                try:
+                    with warnings.catch_warnings():
+                        warnings.simplefilter("ignore", UserWarning)
+                        comp.dmdot_dT(fs, P2=P_target)
+                except ChokedFlowError as exc:
+                    _safe_update_PT(abstract_state, exc.P_outlet,
+                                    exc.T_outlet, T_cric, P_bar, T_c, P_c)
+                    return (exc.P_outlet, exc.T_outlet,
+                            abstract_state.hmass(),
+                            inlet_i, outlet_i, False, exc.mdot_choked)
+                except (RuntimeError, ValueError):
+                    _safe_update_PT(abstract_state, P_in_e, T_in_e,
+                                    T_cric, P_bar, T_c, P_c)
+                    return (_WALK_FAIL_P_PA, T_in_e,
+                            abstract_state.hmass(),
+                            inlet_i, outlet_i, False, mdot_penalty)
+                return (fs.P, fs.T, fs.AS.hmass(),
+                        inlet_i, outlet_i, False, fs.mdot)
+
+            # Multi-component edge: drive an outer brentq over mdot
+            # whose forward closure walks the whole chain.
+            # Choke bound: ideal-gas isentropic sonic mass flux at the
+            # smallest component inlet area along the edge.  True choke
+            # under friction is lower; the helper's retreat handles it.
+            _safe_update_PT(abstract_state, P_in_e, T_in_e,
+                            T_cric, P_bar, T_c, P_c)
+            G_max = _ideal_gas_G_max(abstract_state)
+            A_min = min(c.inlet_area_si for c in edge.components)
+            mdot_choked = G_max * A_min
+
+            fs = FlowState(
+                abstract_state, max(mdot_trial, 1.0e-9 * mdot_choked),
+                A=node_area[inlet_i], z=z_in_e,
+                T_cricondentherm=T_cric, P_cricondenbar=P_bar,
+                T_critical=T_c, P_critical=P_c,
+            )
+
+            def forward_at_mdot(mdot_t):
+                _safe_flowstate_update_PT(fs, P_in_e, T_in_e)
+                fs.A    = node_area[inlet_i]
+                fs.z    = z_in_e
+                fs.mdot = mdot_t
+                for c in edge.components:
+                    c.dP_dT(fs)
+
+            # Brentq tolerance: tight enough that LM's FD perturbation of
+            # the upstream-node P / T produces a clean signal in
+            # mdot_solved, but not so tight that the inner brentq
+            # dominates wall-time.
+            try:
+                with warnings.catch_warnings():
+                    warnings.simplefilter("ignore", UserWarning)
+                    mdot_solved = _solve_mdot_for_outlet_P(
+                        fs, P_target,
+                        forward_at_mdot=forward_at_mdot,
+                        mdot_choked=mdot_choked,
+                        mdot_guess=max(mdot_trial, 1.0e-3 * mdot_choked),
+                        xtol_factor=1.0e-8,
+                        rtol=1.0e-9,
+                        caller_name=f"walk_edge_inverse[{edge.name}]",
+                    )
+            except ChokedFlowError as exc:
+                _safe_update_PT(abstract_state, exc.P_outlet, exc.T_outlet,
+                                T_cric, P_bar, T_c, P_c)
+                return (exc.P_outlet, exc.T_outlet, abstract_state.hmass(),
+                        inlet_i, outlet_i, False, exc.mdot_choked)
+            except (RuntimeError, ValueError):
+                _safe_update_PT(abstract_state, P_in_e, T_in_e,
+                                T_cric, P_bar, T_c, P_c)
+                return (_WALK_FAIL_P_PA, T_in_e, abstract_state.hmass(),
+                        inlet_i, outlet_i, False, mdot_penalty)
+
+            return (fs.P, fs.T, fs.AS.hmass(),
+                    inlet_i, outlet_i, False, mdot_solved)
+
         # Reference scales used to non-dimensionalize each residual class.
         # All three are then O(1) at the initial guess and any further
         # imbalance is relative, so the Jacobian is not dominated by one
@@ -556,15 +772,21 @@ class Compressible_Network(Network):
             P, T, mdot = unpack(x)
             res = np.empty(n_p_free + n_t_free + n_edges)
 
-            walked_h_out = np.empty(n_edges)
-            walked_P_out = np.empty(n_edges)
-            outlet_i_of  = [None] * n_edges
-            sealed_of    = [False] * n_edges
+            walked_h_out   = np.empty(n_edges)
+            walked_P_out   = np.empty(n_edges)
+            mdot_solved_of = np.zeros(n_edges)
+            outlet_i_of    = [None] * n_edges
+            sealed_of      = [False] * n_edges
 
             for e_idx, edge in enumerate(self._edges):
-                wP, wT, wh, _, outlet_i, sealed = walk_edge(
-                    edge, mdot[e_idx], P, T
-                )
+                if inverse_of[e_idx]:
+                    wP, wT, wh, _, outlet_i, sealed, m_solved = \
+                        walk_edge_inverse(edge, mdot[e_idx], P, T)
+                    mdot_solved_of[e_idx] = m_solved
+                else:
+                    wP, wT, wh, _, outlet_i, sealed = walk_edge(
+                        edge, mdot[e_idx], P, T
+                    )
                 walked_P_out[e_idx] = wP
                 walked_h_out[e_idx] = wh
                 outlet_i_of[e_idx]  = outlet_i
@@ -629,11 +851,23 @@ class Compressible_Network(Network):
                     Q_ext_eff = 0.0   # interior junction
 
                 if Q_ext_eff > 0.0:
-                    # External supply at T_spec (validated above to exist).
-                    _safe_update_PT(abstract_state, P_n, node.T_spec_K,
-                                    T_cric, P_bar, T_c, P_c)
-                    h_supply = abstract_state.hmass()
-                    sum_in += Q_ext_eff * h_supply
+                    if node.T_spec_K is None:
+                        # P-spec node with no T-spec acting as a transient
+                        # implicit supply during an LM trial step (only
+                        # reachable when a connected edge's trial mdot
+                        # flipped sign).  No T to evaluate h_supply
+                        # against; skip the supply contribution so the
+                        # solver can step away rather than crash.  At the
+                        # converged solution this branch never fires
+                        # because a P-spec node without T-spec is a
+                        # withdrawal, so Q_ext_eff is negative.
+                        pass
+                    else:
+                        # External supply at T_spec.
+                        _safe_update_PT(abstract_state, P_n, node.T_spec_K,
+                                        T_cric, P_bar, T_c, P_c)
+                        h_supply = abstract_state.hmass()
+                        sum_in += Q_ext_eff * h_supply
                 elif Q_ext_eff < 0.0:
                     sum_out += abs(Q_ext_eff) * h_node
 
@@ -653,6 +887,15 @@ class Compressible_Network(Network):
             for e_idx in range(n_edges):
                 if sealed_of[e_idx]:
                     res[n_p_free + n_t_free + e_idx] = mdot[e_idx] / mdot_ref
+                elif inverse_of[e_idx]:
+                    # Inverse mode: drive mdot toward the locally-solved
+                    # value (brentq inside walk_edge_inverse).  Jacobian
+                    # column for this edge's mdot is +1 / mdot_ref
+                    # (analytic); only the upstream-node coupling needs
+                    # finite differences.
+                    res[n_p_free + n_t_free + e_idx] = (
+                        mdot[e_idx] - mdot_solved_of[e_idx]
+                    ) / mdot_ref
                 else:
                     res[n_p_free + n_t_free + e_idx] = (
                         walked_P_out[e_idx] - P[outlet_i_of[e_idx]]
@@ -691,11 +934,25 @@ class Compressible_Network(Network):
         lb[n_p_free + n_t_free:] = -100.0 * mdot_ref_scalar
         ub[n_p_free + n_t_free:] = +100.0 * mdot_ref_scalar
 
-        sol_obj = least_squares(
-            residuals, x0, bounds=(lb, ub),
+        # LM's default FD step is sqrt(machine_eps) ~ 1.5e-8 relative.
+        # On networks with inverse-mode edges the per-edge brentq inside
+        # walk_edge_inverse has a noise floor (set by xtol_factor below)
+        # that swamps the FD signal at that step size, stalling LM on a
+        # non-zero residual.  Bump the FD step to 1e-5 (relative) when
+        # any edge is inverse-mode: ~700x larger, well above brentq's
+        # 1e-8 noise floor, with negligible truncation-error penalty
+        # since the residual is still O(1) at LM tolerances.  Forward
+        # edges' walked_P_out has CoolProp precision (~1e-12 relative),
+        # so the larger step is also fine for them.
+        ls_kwargs = dict(
+            bounds=(lb, ub),
             method="trf", x_scale="jac",
             xtol=xtol, ftol=xtol, gtol=xtol, max_nfev=maxfev,
         )
+        if any(inverse_of):
+            ls_kwargs["diff_step"] = 1.0e-5
+
+        sol_obj = least_squares(residuals, x0, **ls_kwargs)
         residual_norm = float(np.linalg.norm(sol_obj.fun))
         converged = sol_obj.success and residual_norm < 1e-3
         if not converged:
@@ -1351,6 +1608,128 @@ def _test_orifice_choke():
         )
 
 
+def _test_inverse_single_relief_valve():
+    """Single-edge network with a Valve between two P-spec nodes
+    (vessel -> atmosphere).  Auto-detection marks the edge inverse-mode
+    because to_node is P-spec; walk_edge_inverse drives mdot locally.
+    Recovers the same mdot as a direct forward Valve.dP_dT call.
+    """
+    from compressible_flow import Valve
+    import composition
+
+    AS = composition.define_composition(
+        y_Methane=0.9, y_Ethane=0.05, y_Propane=0.02,
+        y_n_Butane=0.01, y_CarbonDioxide=0.02, eos="PR",
+    )
+    T_cric, P_bar, T_c, P_c = _build_phase_limits(AS)
+
+    P_vessel_Pa = ureg.Quantity(150.0 + 14.7, "psi").to("Pa").magnitude
+    P_atm_Pa    = ureg.Quantity(14.7, "psi").to("Pa").magnitude
+    T_vessel    = 300.0
+
+    relief = Valve(Di=ureg.Quantity(1.0, "inch"), K=20.0)
+
+    # Forward ground truth: pick any mdot, walk Valve.dP_dT, measure
+    # the outlet pressure, then ask the inverse to recover that mdot
+    # from the same boundary conditions.
+    _safe_update_PT(AS, P_vessel_Pa, T_vessel, T_cric, P_bar, T_c, P_c)
+    A_pipe = math.pi * relief.Di_si ** 2 / 4.0
+    fs_ref = FlowState(
+        AS, mdot=0.3, A=A_pipe, z=0.0,
+        T_cricondentherm=T_cric, P_cricondenbar=P_bar,
+        T_critical=T_c, P_critical=P_c,
+    )
+    relief.dP_dT(fs_ref)
+    P_target = fs_ref.P
+    mdot_ref = 0.3
+
+    net = Compressible_Network()
+    net.add_node("vessel", P=P_vessel_Pa, T=T_vessel)
+    net.add_node("atm",    P=P_target)
+    net.add_edge("relief", "vessel", "atm", relief)
+
+    result = net.solve(AS, mdot_init_kgs=0.1, verbose=True)
+    assert result["converged"]
+
+    mdot_solved = result["mdot_kgs"]["relief"]
+    rel_err = abs(mdot_solved - mdot_ref) / mdot_ref
+    print(f"[inv-single]  ground-truth mdot = {mdot_ref:.6f} kg/s, "
+          f"P_atm spec = {P_target/6894.757:.4f} psi")
+    print(f"[inv-single]  network solve     = {mdot_solved:.6f} kg/s, "
+          f"rel err = {rel_err:.2e}")
+    assert rel_err < 1e-5
+
+
+def _test_inverse_relief_from_junction():
+    """Three-node network: an inlet feeds a junction which splits to a
+    main outlet (P-spec) and a relief vent (P-spec, lower).  Both
+    outgoing edges are auto-detected as inverse-mode; the inlet edge
+    stays forward.  Sanity: mass balance closes at the junction.
+    """
+    from compressible_flow import Line_Segment, Valve
+    import composition
+
+    AS = composition.define_composition(
+        y_Methane=0.9, y_Ethane=0.05, y_Propane=0.02,
+        y_n_Butane=0.01, y_CarbonDioxide=0.02, eos="PR",
+    )
+
+    P_in_Pa     = ureg.Quantity(200.0 + 14.7, "psi").to("Pa").magnitude
+    P_main_Pa   = ureg.Quantity(100.0 + 14.7, "psi").to("Pa").magnitude
+    P_relief_Pa = ureg.Quantity(14.7,         "psi").to("Pa").magnitude
+
+    feed = Line_Segment(
+        roughness=ureg.Quantity(0.00015, "ft"),
+        id_val=ureg.Quantity(3.068, "inch"),
+        length=ureg.Quantity(50.0, "ft"),
+        elevation_change=ureg.Quantity(0.0, "ft"),
+        name="feed",
+    )
+    main = Line_Segment(
+        roughness=ureg.Quantity(0.00015, "ft"),
+        id_val=ureg.Quantity(3.068, "inch"),
+        length=ureg.Quantity(200.0, "ft"),
+        elevation_change=ureg.Quantity(0.0, "ft"),
+        name="main",
+    )
+    relief = Valve(Di=ureg.Quantity(1.0, "inch"), K=20.0)
+
+    net = Compressible_Network()
+    net.add_node("inlet",  P=P_in_Pa, T=320.0)
+    net.add_node("JCT")
+    net.add_node("main_outlet",   P=P_main_Pa)
+    net.add_node("relief_outlet", P=P_relief_Pa)
+    net.add_edge("feed",   "inlet", "JCT",            feed)
+    net.add_edge("main",   "JCT",   "main_outlet",    main)
+    net.add_edge("relief", "JCT",   "relief_outlet",  relief)
+
+    result = net.solve(
+        AS,
+        mdot_init_kgs={"feed": 1.0, "main": 0.7, "relief": 0.3},
+        verbose=True,
+    )
+    assert result["converged"]
+
+    mdot_feed   = result["mdot_kgs"]["feed"]
+    mdot_main   = result["mdot_kgs"]["main"]
+    mdot_relief = result["mdot_kgs"]["relief"]
+    P_JCT       = result["P_Pa"]["JCT"]
+    T_JCT       = result["T_K"]["JCT"]
+
+    mass_err = mdot_feed - mdot_main - mdot_relief
+    print(f"[inv-junction] P_JCT = {P_JCT/6894.757:.4f} psi, T_JCT = {T_JCT:.4f} K")
+    print(f"[inv-junction] mdot_feed   = {mdot_feed:.6f} kg/s")
+    print(f"[inv-junction] mdot_main   = {mdot_main:.6f} kg/s")
+    print(f"[inv-junction] mdot_relief = {mdot_relief:.6f} kg/s")
+    print(f"[inv-junction] mass balance at JCT: {mass_err:.3e} kg/s")
+    assert abs(mass_err) < 1e-6
+    assert P_main_Pa < P_JCT < P_in_Pa
+    # Relief should choke (P_relief = atm well below choke pressure),
+    # so mdot_relief takes whatever the local mdot_choked at JCT gives.
+    # Just check it is positive and reasonable.
+    assert 0.0 < mdot_relief < 5.0
+
+
 if __name__ == "__main__":
     _test_single_segment_forward()
     print()
@@ -1361,3 +1740,7 @@ if __name__ == "__main__":
     _test_orifice_subsonic()
     print()
     _test_orifice_choke()
+    print()
+    _test_inverse_single_relief_valve()
+    print()
+    _test_inverse_relief_from_junction()
