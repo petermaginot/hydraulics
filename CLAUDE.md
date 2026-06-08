@@ -2,6 +2,9 @@
 
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
+## Planning
+Large changes to the code should be planned before any editing takes place. In plan mode, only describe what you would do. Never make actual file edits.
+
 ## Reference documents
 
 The repo already carries dense design docs. Read them before making architectural changes — don't duplicate their content here.

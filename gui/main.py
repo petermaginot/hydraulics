@@ -1,6 +1,6 @@
 """MainWindow + run() entry point.
 
-A QStackedWidget switches between the three workflow screens.  Each screen
+A QStackedWidget switches between the workflow screens.  Each screen
 owns a reference to a single AppState; navigation signals are wired here.
 """
 
@@ -9,13 +9,15 @@ import sys
 from PySide6.QtWidgets import QApplication, QMainWindow, QStackedWidget
 
 from gui.state import AppState
-from gui.screens.start                import StartScreen
-from gui.screens.segment              import SegmentScreen
-from gui.screens.fluid                import FluidScreen
-from gui.screens.results              import ResultsScreen
-from gui.screens.network              import NetworkScreen
-from gui.screens.composition          import CompressibleCompositionScreen
-from gui.screens.compressible_network import CompressibleNetworkScreen
+from gui.screens.start                       import StartScreen
+from gui.screens.segment                     import SegmentScreen
+from gui.screens.fluid                       import FluidScreen
+from gui.screens.results                     import ResultsScreen
+from gui.screens.network                     import NetworkScreen
+from gui.screens.composition                 import CompressibleCompositionScreen
+from gui.screens.compressible_network        import CompressibleNetworkScreen
+from gui.screens.single_fitting              import SingleFittingScreen
+from gui.screens.compressible_single_fitting import CompressibleSingleFittingScreen
 
 
 class MainWindow(QMainWindow):
@@ -33,9 +35,11 @@ class MainWindow(QMainWindow):
         self.network_screen      = NetworkScreen(self.state)
         self.composition_screen  = CompressibleCompositionScreen(self.state)
         self.cnetwork_screen     = CompressibleNetworkScreen(self.state)
+        self.fitting_screen      = SingleFittingScreen(self.state)
+        self.cfitting_screen     = CompressibleSingleFittingScreen(self.state)
 
-        # Display-unit combos live on the composition screen; the compressible
-        # network screen reads them via these attribute assignments.
+        # Display-unit combos live on the composition screen; wire them to
+        # both the compressible network screen and the compressible fitting screen.
         self.cnetwork_screen.d_pressure    = self.composition_screen.d_pressure
         self.cnetwork_screen.d_flow        = self.composition_screen.d_flow
         self.cnetwork_screen.d_temperature = self.composition_screen.d_temperature
@@ -54,16 +58,19 @@ class MainWindow(QMainWindow):
         self.stack.addWidget(self.network_screen)
         self.stack.addWidget(self.composition_screen)
         self.stack.addWidget(self.cnetwork_screen)
+        self.stack.addWidget(self.fitting_screen)
+        self.stack.addWidget(self.cfitting_screen)
         self.setCentralWidget(self.stack)
 
-        # Start.Next routes by flow_type.  Linear point-to-point flows
-        # go to the segment screen; the two network flows go to their
-        # canvas (incompressible) or to the composition definition step
-        # first (compressible).
+        # Start.Next routes by flow_type.
         self.start_screen.next_clicked.connect(self._on_start_next)
+
+        # Network screens
         self.network_screen.back_clicked.connect(
             lambda: self.stack.setCurrentWidget(self.start_screen)
         )
+
+        # Segment / Fluid / Results pipeline
         self.segment_screen.back_clicked.connect(
             lambda: self.stack.setCurrentWidget(self.start_screen)
         )
@@ -79,23 +86,45 @@ class MainWindow(QMainWindow):
         self.results_screen.back_clicked.connect(
             lambda: self.stack.setCurrentWidget(self.fluid_screen)
         )
+
+        # Composition -> compressible network or compressible single fitting
         self.composition_screen.back_clicked.connect(
             lambda: self.stack.setCurrentWidget(self.start_screen)
         )
         self.composition_screen.next_clicked.connect(
-            lambda: self.stack.setCurrentWidget(self.cnetwork_screen)
+            self._on_composition_next
         )
         self.cnetwork_screen.back_clicked.connect(
             lambda: self.stack.setCurrentWidget(self.composition_screen)
         )
 
+        # Single fitting screens
+        self.fitting_screen.back_clicked.connect(
+            lambda: self.stack.setCurrentWidget(self.start_screen)
+        )
+        self.cfitting_screen.back_clicked.connect(
+            lambda: self.stack.setCurrentWidget(self.composition_screen)
+        )
+
     def _on_start_next(self):
-        if self.state.flow_type == "network":
+        ft = self.state.flow_type
+        if ft == "network":
             self.stack.setCurrentWidget(self.network_screen)
-        elif self.state.flow_type == "compressible_network":
+        elif ft == "compressible_network":
+            self.stack.setCurrentWidget(self.composition_screen)
+        elif ft == "single_fitting_incompressible":
+            self.stack.setCurrentWidget(self.fitting_screen)
+        elif ft == "single_fitting_compressible":
             self.stack.setCurrentWidget(self.composition_screen)
         else:
             self.stack.setCurrentWidget(self.segment_screen)
+
+    def _on_composition_next(self):
+        ft = self.state.flow_type
+        if ft == "single_fitting_compressible":
+            self.stack.setCurrentWidget(self.cfitting_screen)
+        else:
+            self.stack.setCurrentWidget(self.cnetwork_screen)
 
 
 def run():

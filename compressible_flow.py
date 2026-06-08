@@ -2996,8 +2996,12 @@ def _solve_mdot_for_outlet_P(
         # Brent when constant-area K-loss inversion is pushed past the
         # Fanno choke), retreat the upper bracket toward zero and retry
         # until either the kernel succeeds or the retreat budget is
-        # exhausted.
-        for shrink in (1.0, 0.9, 0.8, 0.6, 0.4, 0.2):
+        # exhausted.  Linear shrinks (1.0 -> 0.2) cover near-choke
+        # bracket failures; the log-spaced tail (0.1 -> 0.001) covers
+        # long pipe segments whose true Fanno choke is orders of
+        # magnitude below the ideal-gas G_max * A_min initial bound.
+        for shrink in (1.0, 0.9, 0.8, 0.6, 0.4, 0.2,
+                       0.1, 0.03, 0.01, 0.003, 0.001):
             mdot_t = mdot_try * shrink
             if mdot_t <= mdot_lo:
                 break
@@ -3012,6 +3016,24 @@ def _solve_mdot_for_outlet_P(
 
     mdot_hi, r_hi = _safe_residual_at(mdot_hi)
     r_lo = residual(mdot_lo)
+    # If r_hi is still on the same side as r_lo (positive -- need more mdot
+    # to drive fs.P down to P2), the solution sits between mdot_hi and
+    # mdot_choked.  This happens whenever P2 is only slightly above the
+    # choke recovery pressure.  Progressively push the upper bracket
+    # toward mdot_choked until either the sign flips or the kernel
+    # consistently fails near choke.
+    if r_lo * r_hi > 0.0 and r_hi > 0.0:
+        for frac in (0.99, 0.999, 0.9999):
+            mdot_try = frac * mdot_choked
+            if mdot_try <= mdot_hi:
+                continue
+            try:
+                r_try = residual(mdot_try)
+            except (ChokedFlowError, RuntimeError, ValueError):
+                break
+            mdot_hi, r_hi = mdot_try, r_try
+            if r_lo * r_hi <= 0.0:
+                break
     if r_lo * r_hi > 0.0:
         raise RuntimeError(
             f"{caller_name}: failed to bracket the non-choked solution "
@@ -3067,9 +3089,15 @@ def compressible_dA(fs, A_throat, K = 0.0, A2 = None, P2 = None):
 
     From the throat condition to the outlet condition, the change in entropy is given by:
 
-        S2 = S1 + 0.5 * (1/T) * K * v1**2
+        S2 = S1 + 0.5 * (1/T) * K * v1**2 * (rho_in/rho_throat)**2
 
-    where K is given at inlet conditions and the temperature is the average of the throat temperature and the outlet temperature
+    where K is the incompressible permanent-loss coefficient (referenced to the inlet velocity head at the INLET density)
+    and the temperature is the average of the throat temperature and the outlet temperature. The (rho_in/rho_throat)**2
+    factor scales the inlet-referenced velocity head to the actual throat velocity head: in compressible flow the throat
+    gas has expanded, so the real throat velocity (and the dissipated head) exceeds the incompressible estimate by this
+    factor. It equals 1.0 in the low-Mach limit, leaving low-Mach results unchanged, and rises toward full throat-KE
+    dissipation as the throat approaches sonic -- without it the sonic throat KE is nearly fully recovered as pressure,
+    over-predicting downstream pressure recovery and the choke threshold.
 
     And again, energy is conserved from the inlet conditions:
         H2 + 0.5 * v2^2 = H1 + 0.5 * v1^2
@@ -3086,7 +3114,7 @@ def compressible_dA(fs, A_throat, K = 0.0, A2 = None, P2 = None):
     If the choked P2 is less than the P2 passed to the function, the flow is not choked. Entropy accounting calculates outlet entropy
     that should be expected and the solver iterates the temperature until the outlet T2, P2 combo gives the required outlet entropy.
 
-        S2 = S1 + 0.5 * (1/T) * K * v1**2
+        S2 = S1 + 0.5 * (1/T) * K * v1**2 * (rho_in/rho_throat)**2
 
 
     """
@@ -3119,11 +3147,17 @@ def compressible_dA(fs, A_throat, K = 0.0, A2 = None, P2 = None):
 
     if P2 is None:
         # ---- Mode 1: dictate mdot, solve for outlet pressure.
-        # Mechanical energy loss from K at inlet velocity head.
-        e_loss = 0.5 * K * v1**2
-
         # Isentropic acceleration to throat (kernel performs its own choke check).
         compressible_changing_area_K(fs=fs, A_out=A_throat, K=0.0)
+
+        # K is the incompressible permanent-loss coefficient (inlet velocity
+        # head evaluated at the INLET density).  In compressible flow the
+        # throat gas has expanded, so the actual throat velocity -- and the
+        # dissipated velocity head -- is larger by (rho_in/rho_throat)**2.
+        # This factor is 1.0 in the low-Mach limit, so low-Mach results are
+        # unchanged.  fs is now at the throat, so fs.rho is rho_throat.
+        rho_throat = fs.rho
+        e_loss = 0.5 * K * v1**2 * (rho_in / rho_throat)**2
 
         # Recovery to A2 with the K-derived dissipation.
         compressible_changing_area_K(fs=fs, A_out=A2, e_loss=e_loss)
@@ -3132,7 +3166,7 @@ def compressible_dA(fs, A_throat, K = 0.0, A2 = None, P2 = None):
     # ---- Mode 2: dictate P2, solve for mdot.
     # Find the choked mass flow rate for the given upstream stagnation state.
     # choked_mass_flux leaves fs.AS at the throat state when A_outlet is None.
-    mdot_choked, _P_choke, _T_choke, _, _, _ = choked_mass_flux(
+    mdot_choked, P_choke, T_choke, rho_choke, _, _ = choked_mass_flux(
         fs=fs, A_throat=A_throat,
     )
 
@@ -3140,14 +3174,36 @@ def compressible_dA(fs, A_throat, K = 0.0, A2 = None, P2 = None):
     # produced by the choked-flow scenario.  At this point fs.AS is at the
     # throat (sonic) state; re-marching inlet -> throat at mdot_choked would
     # be degenerate (the subsonic root collapses onto Ma=1), so we instead
-    # advance directly from the throat.  The K reference velocity is still
-    # the inlet velocity at the choked rate.
+    # advance directly from the throat.  The K reference velocity is the inlet
+    # velocity at the choked rate, scaled to the actual throat velocity head by
+    # (rho_in/rho_throat)**2 (see the Mode 1 comment).  Without this factor the
+    # sonic throat KE is nearly fully recovered as pressure, putting P2_choked
+    # far above the true sonic throat pressure and declaring choke at too high
+    # an outlet pressure.
     fs.mdot = mdot_choked
     fs.A    = A_throat
     v1_choked  = mdot_choked / (rho_in * A1)
-    e_loss_chk = 0.5 * K * v1_choked**2
+    e_loss_chk = 0.5 * K * v1_choked**2 * (rho_in / rho_choke)**2
     compressible_changing_area_K(fs=fs, A_out=A2, e_loss=e_loss_chk)
     P2_choked = fs.P
+
+    def _take_choked_branch(fs_at_recovery):
+        """Adiabatically expand from the choked-recovery state to P2 and
+        enforce the supersonic-outlet guard.  fs is mutated in place."""
+        adiabatic_expansion_solver(fs=fs_at_recovery, P2=P2)
+        try:
+            a_out = fs_at_recovery.AS.speed_sound()
+        except (ValueError, RuntimeError):
+            a_out = 0.0
+        if a_out > 0.0 and fs_at_recovery.v / a_out > 1.0 + _MA_SONIC_TOL:
+            raise RuntimeError(
+                f"compressible_dA: choked-branch adiabatic expansion to "
+                f"P2={P2:.4g} Pa produced a supersonic outlet "
+                f"(Ma_out={fs_at_recovery.v / a_out:.4f}) at A2={A2:.4g} m^2. "
+                f"P2 is below the post-throat free-expansion limit at this "
+                f"geometry; the result would require a shock or additional "
+                f"dissipation that this function does not model."
+            )
 
     if P2 < P2_choked:
         # ---- Choked branch: mdot is fixed at mdot_choked. The downstream
@@ -3155,24 +3211,7 @@ def compressible_dA(fs, A_throat, K = 0.0, A2 = None, P2 = None):
         # the user-supplied P2. fs is currently at the choked-recovery
         # state, so adiabatic_expansion_solver's snapshot of fs.h_stagnation
         # equals the inlet stagnation enthalpy (the entire path is adiabatic).
-        adiabatic_expansion_solver(fs=fs, P2=P2)
-
-        # Reject supersonic outlets -- physically requires a shock or further
-        # dissipation that this model does not capture. Mirrors the guard in
-        # compressible_changing_area_K.
-        try:
-            a_out = fs.AS.speed_sound()
-        except (ValueError, RuntimeError):
-            a_out = 0.0
-        if a_out > 0.0 and fs.v / a_out > 1.0 + _MA_SONIC_TOL:
-            raise RuntimeError(
-                f"compressible_dA: choked-branch adiabatic expansion to "
-                f"P2={P2:.4g} Pa produced a supersonic outlet "
-                f"(Ma_out={fs.v / a_out:.4f}) at A2={A2:.4g} m^2. "
-                f"P2 is below the post-throat free-expansion limit at this "
-                f"geometry; the result would require a shock or additional "
-                f"dissipation that this function does not model."
-            )
+        _take_choked_branch(fs)
         return
 
     # ---- Non-choked branch: iterate mdot until the two-stage march reaches
@@ -3201,19 +3240,46 @@ def compressible_dA(fs, A_throat, K = 0.0, A2 = None, P2 = None):
         fs.A    = A1
         fs.mdot = mdot_trial
         v1_t   = mdot_trial / (rho_in * A1)
-        e_loss = 0.5 * K * v1_t**2
         compressible_changing_area_K(fs=fs, A_out=A_throat, K=0.0,
                                      skip_choke_check=True)
+        # Scale the inlet-referenced K loss to the actual throat velocity head
+        # (see the Mode 1 comment); fs is at the throat after the call above.
+        rho_throat_t = fs.rho
+        e_loss = 0.5 * K * v1_t**2 * (rho_in / rho_throat_t)**2
         compressible_changing_area_K(fs=fs, A_out=A2, e_loss=e_loss,
                                      skip_choke_check=True)
 
-    _solve_mdot_for_outlet_P(
-        fs, P2,
-        forward_at_mdot=forward_at_mdot,
-        mdot_choked=mdot_choked,
-        mdot_guess=mdot_guess,
-        caller_name="compressible_dA",
-    )
+    try:
+        _solve_mdot_for_outlet_P(
+            fs, P2,
+            forward_at_mdot=forward_at_mdot,
+            mdot_choked=mdot_choked,
+            mdot_guess=mdot_guess,
+            caller_name="compressible_dA",
+        )
+    except RuntimeError as e:
+        if "failed to bracket" not in str(e):
+            raise
+        # Near-choke fallback: P2 sits in the numerically indeterminate
+        # band just above P2_choked, where the subsonic root of the
+        # two-stage march degenerates toward Ma=1 at the throat and the
+        # kernel can no longer evaluate cleanly enough to bracket.  Re-
+        # anchor fs to the cached throat sonic state, march to A2, then
+        # adiabatically expand to P2 -- the choked-branch path.
+        import warnings as _warnings
+        _safe_flowstate_update_PT(fs, P_choke, T_choke)
+        fs.mdot = mdot_choked
+        fs.A    = A_throat
+        compressible_changing_area_K(fs=fs, A_out=A2, e_loss=e_loss_chk)
+        _take_choked_branch(fs)
+        _warnings.warn(
+            f"compressible_dA: outlet pressure P2={P2:.4g} Pa is within "
+            f"the near-choke numerical band above P2_choked="
+            f"{P2_choked:.4g} Pa; reporting choked conditions "
+            f"(mdot={mdot_choked:.4g} kg/s).",
+            UserWarning,
+            stacklevel=2,
+        )
 
 
 def adiabatic_expansion_solver(fs, P2, T_ITER_MAX = 8, H_ABS_TOL = 1.0, H_REL_TOL = 1.0e-9):

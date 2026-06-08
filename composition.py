@@ -11,7 +11,7 @@ KNOWN_COMPONENTS = [
     "Methane", "Ethane", "Propane", "n_Butane", "IsoButane",
     "n_Pentane", "Isopentane", "n_Hexane", "n_Heptane", "n_Octane",
     "n_Nonane", "n_Decane", "Benzene", "CarbonDioxide", "Water", "Nitrogen",
-    "Oxygen", "Argon", "Hydrogen", "HydrogenSulfide",
+    "Oxygen", "Argon", "Hydrogen", "HydrogenSulfide", "CarbonMonoxide",
 ]
 
 
@@ -177,6 +177,7 @@ def define_composition(
     y_Argon           = 0.0,
     y_Hydrogen        = 0.0,
     y_HydrogenSulfide = 0.0,
+    y_CarbonMonoxide  = 0.0,
     eos = "HEOS"              #equation of state. HEOS is CoolProp's default Helmholz equation of state. Can also use Peng Robinson (PR) which is faster, although it doesn't allow the calculation of viscosity.
     ):
     # ------------------------------------
@@ -349,6 +350,7 @@ def calc_viscosity():
         y_Argon           = 0.0,
         y_Hydrogen        = 0.0,
         y_HydrogenSulfide = 0.0,
+        y_CarbonMonoxide  = 0.0,
         eos = "HEOS")
     
     T_in = ureg.Quantity(60, "degF").to("degK").magnitude

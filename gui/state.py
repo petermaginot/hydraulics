@@ -24,6 +24,13 @@ class AppState:
     # compressible_flow.Line_Segment), with geometry + roughness baked in.
     segment: Any = None
 
+    # Set on the single-fitting screen.  A built component instance
+    # (Bend / Valve / CheckValve / Orifice / Contraction_Expansion),
+    # incompressible or compressible class depending on flow_type.
+    fitting: Any = None
+    # "bend" / "valve" / "check_valve" / "orifice" / "contraction_expansion"
+    fitting_kind: Optional[str] = None
+
     # Set on the Fluid screen.
     # Incompressible: Incompressible_Fluid instance.
     # Compressible : CoolProp AbstractState, already updated to (P_inlet, T_inlet).
@@ -82,6 +89,8 @@ class AppState:
         translate.
         """
         self.segment                = None
+        self.fitting                = None
+        self.fitting_kind           = None
         self.fluid                  = None
         self.flow_rate              = None
         self.P_inlet_Pa             = None
