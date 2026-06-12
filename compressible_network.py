@@ -1665,6 +1665,7 @@ def _test_inverse_relief_from_junction():
     main outlet (P-spec) and a relief vent (P-spec, lower).  Both
     outgoing edges are auto-detected as inverse-mode; the inlet edge
     stays forward.  Sanity: mass balance closes at the junction.
+    NOTE: This test seems to be broken and never converges. Need to troubleshoot.
     """
     from compressible_flow import Line_Segment, Valve
     import composition

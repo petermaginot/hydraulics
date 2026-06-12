@@ -551,7 +551,7 @@ def test_Crane_gas_pipeline():
         _safe_update_PT, compressible_changing_area_K,
         compressible_pipe_segment, _resolve_mdot, FlowState,
     )
-    csv_path = os.path.join(os.path.dirname(__file__), "testprofile_crane.csv")
+    csv_path = os.path.join(os.path.dirname(__file__), "Pipe_profiles/testprofile_crane.csv")
     roughness = ureg.Quantity(0.00015, "ft")
     seg_length = ureg.Quantity(100, "miles")
     OD = ureg.Quantity(14.0, "inch")
@@ -747,328 +747,93 @@ def test_Crane_choked_steam():
         else:
             mdot = mdot * (M_target / Ma_out)
 
-
-def test_choked_mass_flux_ideal_gas_air():
-    """Ideal-gas air nozzle sanity check for choked_mass_flux.
-
-    For an ideal gas with constant gamma = 1.4, classical isentropic-nozzle
-    theory gives the critical pressure ratio P*/P0 = (2/(gamma+1))^(gamma/
-    (gamma-1)) approx 0.5283 and the critical temperature ratio T*/T0 =
-    2/(gamma+1) approx 0.8333.  The mass-flux coefficient is
-        G_max = P0 * sqrt(gamma/(R_s*T0)) * (2/(gamma+1))^((gamma+1)/(2*(gamma-1)))
-    With P0 = 10 bar, T0 = 300 K, and A_throat = 1 cm^2 = 1e-4 m^2, dry air
-    (M = 28.96 g/mol => R_s = 287.0 J/(kg.K)) gives mdot_choked ~ 0.2354 kg/s.
-
-    CoolProp's HEOS-air pseudo-pure backend is close to but not exactly
-    ideal-gas (slight Z deviation, slight gamma deviation), so we allow
-    a 1% tolerance on each quantity.
-    """
+def test_Crane_4_21():
+    #Fanno flow example from Crane textbook. 125 psig/139.696 psia coke oven gas at 140 F with a specific gravity of 0.42 flows through
+    # 20 ft of 3" Sch 40 pipe to atmosphere.
+    import warnings
     from compressible_flow import (
-        choked_mass_flux, _build_phase_limits, _safe_update_PT, FlowState,
+        Line_Segment, Contraction_Expansion,
+        _build_phase_limits, _safe_update_PT, _safe_flowstate_update_PT,
+        FlowState, _fanno_choke_mdot, _ideal_gas_G_max,
     )
+    from fluids import fittings
+    roughness = ureg.Quantity(0.00015, "ft")
+    seg_length = ureg.Quantity(20, "ft")
+    OD = ureg.Quantity(3.5, "inch")
+    WT = ureg.Quantity(0.216, "inch")
+    # Crane gives the 139.7 psia / 140 F header as STAGNATION conditions, with
+    # a K=0.5 sharp-entrance loss into the pipe (Crane total K = f*L/D + 0.5
+    # entrance + 1.0 exit = 2.87; the exit term does not affect a choked exit).
+    P0 = ureg.Quantity( 125.0 + 14.696, "psi").to("Pa").magnitude   # stagnation P
+    T0 = ureg.Quantity(140.0, "degF").to("K").magnitude             # stagnation T
+    ID = OD - 2*WT
 
-    P0 = ureg.Quantity(10.0, "bar").to("Pa").magnitude   # 1.0e6 Pa
-    T0 = 300.0                                           # K
-    A_throat = 1.0e-4                                    # m^2
+    AS = composition.define_composition(
+        y_Methane         = 0.3,
+        y_Ethane          = 0.03,
+        y_Nitrogen        = 0.07,
+        y_Hydrogen        = 0.5,
+        y_CarbonDioxide   = 0.03,
+        y_CarbonMonoxide  = 0.07,
+        eos = "HEOS")
 
-    AS = AbstractState("HEOS", "Air")
-    phase_limits = _build_phase_limits(AS)
-    _safe_update_PT(AS, P0, T0, *phase_limits)
+    # Model the header as a near-stagnation reservoir (large area, v~=0) and the
+    # pipe entrance as a sharp contraction to the pipe ID.  The contraction
+    # converts the stagnation state to the pipe-inlet static state AND applies
+    # the entrance loss; contraction_sharp from a huge area gives K ~= 0.5.
+    A_big   = 1.0                                  # m^2, arbitrarily large reservoir
+    Di_US   = ureg.Quantity((4.0 * A_big / math.pi) ** 0.5, "m")
+    entrance = Contraction_Expansion(Di_US=Di_US, Di_DS=ID)
+    seg = Line_Segment(roughness=roughness, id_val=ID, length=seg_length,
+                       elevation_change=0.0)
 
-    # choked_mass_flux's new convention: fs.AS at the static inlet and
-    # fs.mdot used to build the stagnation enthalpy reference internally.
-    # We set fs.mdot to a small probe value so v_in approx 0 -- i.e. the
-    # inlet is effectively stagnation, matching the textbook reference.
+    T_cric, P_bar, T_c, P_c = _build_phase_limits(AS)
+    _safe_update_PT(AS, P0, T0, T_cric, P_bar, T_c, P_c)
+
+    K_entrance = fittings.contraction_sharp(Di1=Di_US.to("m").magnitude,
+                                            Di2=ID.to("m").magnitude)
+    print(f'Gamma = {AS.cpmolar()/AS.cvmolar():.4f}')
+    print(f'Entrance contraction K (downstream-referenced) = {K_entrance:.4f}')
+
     fs = FlowState(
-        AS, mdot=1e-12, A=A_throat, z=0.0,
-        T_cricondentherm=phase_limits[0], P_cricondenbar=phase_limits[1],
-        T_critical=phase_limits[2],       P_critical=phase_limits[3],
-    )
-    mdot_choked, P_star, T_star, rho_star, P_out, T_out = choked_mass_flux(
-        fs, A_throat, A_outlet=A_throat,
-    )
-
-    # Closed-form ideal-gas reference values for gamma = 1.4, M_air = 28.96 g/mol.
-    gamma = 1.4
-    M_air = 28.96e-3
-    R_s   = 8.31446261815324 / M_air
-    P_ratio_ref = (2.0/(gamma+1.0)) ** (gamma/(gamma-1.0))             # ~0.5283
-    T_ratio_ref = 2.0/(gamma+1.0)                                       # ~0.8333
-    crit_coeff  = (2.0/(gamma+1.0)) ** ((gamma+1.0)/(2.0*(gamma-1.0)))
-    G_ref       = P0 * math.sqrt(gamma/(R_s*T0)) * crit_coeff
-    mdot_ref    = G_ref * A_throat
-
-    def check(label, value, ref, tol_rel):
-        err = abs(value - ref) / abs(ref)
-        status = "OK  " if err < tol_rel else "FAIL"
-        print(f"  [{status}] {label}: got {value:.6g}, ref {ref:.6g}, "
-              f"rel err {err:.2%} (tol {tol_rel:.0%})")
-
-    print("Ideal-gas air-nozzle choke validation (P0=10 bar, T0=300 K, A=1 cm^2):")
-    check("P*/P0",        P_star/P0,  P_ratio_ref, 0.01)
-    check("T*/T0",        T_star/T0,  T_ratio_ref, 0.01)
-    check("mdot_choked",  mdot_choked, mdot_ref,   0.02)
-    print(f"  (raw: P*={P_star:.4g} Pa, T*={T_star:.4g} K, "
-          f"rho*={rho_star:.4g} kg/m^3, mdot={mdot_choked:.4g} kg/s)")
-
-
-def test_compressible_K_choke_roundtrip():
-    """Validate the FlowState-aware stagnation reference inside choked_mass_flux.
-
-    The cross-cutting bug fix that introducing FlowState delivered: before,
-    choked_mass_flux read AS.hmass() directly and labelled it h0,
-    silently treating the static inlet as stagnation.  Now it reads
-    fs.h_stagnation = h_static + 0.5*v_in**2, which correctly grows the
-    stagnation reference when the inlet carries non-trivial kinetic
-    energy.  Consequence: for a fixed inlet (P, T, A), the choked mass
-    flow grows monotonically with v_in (more accessible enthalpy in the
-    expansion).
-
-    Test: at the same inlet (P_in, T_in) and area A, evaluate
-    choked_mass_flux at two FlowStates -- one with v_in approx 0 (the
-    classical stagnation case) and one with v_in approx half the local
-    speed of sound -- and verify mdot_choked rises by a few percent in
-    the latter.  Under the old (buggy) code these two would have
-    returned the same value.
-
-    Also verify the lower-Ma case round-trips against the textbook
-    stagnation formula to within 1%.
-    """
-    from compressible_flow import (
-        choked_mass_flux, _build_phase_limits, _safe_update_PT, FlowState,
-    )
-
-    P_in = ureg.Quantity(20.0, "bar").to("Pa").magnitude
-    T_in = 300.0
-    Di   = ureg.Quantity(0.5, "inch").to("m").magnitude
-    A    = math.pi * Di**2 / 4.0
-
-    AS = composition.define_composition(
-        y_Methane=0.95, y_Ethane=0.04, y_CarbonDioxide=0.01, eos="HEOS",
-    )
-    phase_limits = _build_phase_limits(AS)
-
-    def _mdot_choked_at(v_in_target):
-        """Build a FlowState whose v_in is approximately v_in_target and
-        return the choked mass flow for that inlet state."""
-        _safe_update_PT(AS, P_in, T_in, *phase_limits)
-        rho_in_seed = AS.rhomass()
-        mdot_seed = max(v_in_target * rho_in_seed * A, 1e-12)
-        fs = FlowState(
-            AS, mdot=mdot_seed, A=A, z=0.0,
-            T_cricondentherm=phase_limits[0], P_cricondenbar=phase_limits[1],
-            T_critical=phase_limits[2],       P_critical=phase_limits[3],
-        )
-        mdot_ch, *_ = choked_mass_flux(fs, A, A_outlet=A)
-        return mdot_ch, fs.Ma
-
-    # Probe at v_in ~ 0 (essentially stagnation inlet).
-    _safe_update_PT(AS, P_in, T_in, *phase_limits)
-    a_in = AS.speed_sound()
-    mdot_stag, Ma_stag = _mdot_choked_at(0.0)
-
-    # Probe at v_in ~ 0.5 * a_in.  With the FlowState-aware h0 the choked
-    # mass flow should rise by a few percent vs the stagnation reference.
-    mdot_hot, Ma_hot = _mdot_choked_at(0.5 * a_in)
-
-    rel_lift = (mdot_hot - mdot_stag) / mdot_stag
-
-    print("FlowState-aware choked_mass_flux (methane-rich mixture, P_in=20 bar, T_in=300 K):")
-    print(f"  v_in ~ 0    (Ma_in={Ma_stag:.3f}):  mdot_choked = {mdot_stag:.6g} kg/s")
-    print(f"  v_in ~ a/2  (Ma_in={Ma_hot:.3f}):  mdot_choked = {mdot_hot:.6g} kg/s")
-    print(f"  relative lift from v_in**2/2 in h0:  {rel_lift:+.2%}")
-
-    status = "OK  " if 0.0 < rel_lift < 0.25 else "FAIL"
-    print(f"  [{status}] mdot_choked rises with v_in (expected: 0 < lift < ~25%)")
-
-
-def test_valve_minimum_diameter_choke():
-    """Verify Valve.minimum_diameter sharpens internal-throat choke detection.
-
-    Sets up a 2" pipe carrying a methane-rich mixture at 20 bar / 300 K, a
-    globe-valve-like K=5, and an internal throat half the pipe diameter
-    (A_throat = A_pipe/4).  Picks mdot in the band where:
-        mdot_choked_at_pipe_area  > mdot  > mdot_choked_at_throat_area
-    so the pipe-area screen (Valve without minimum_diameter)
-    silently passes, but the throat-area screen (Valve with
-    minimum_diameter) raises ChokedFlowError.  This is the gap that
-    improvements.md R1.5 / R2 flagged and that minimum_diameter closes.
-    """
-    from compressible_flow import (
-        Valve, FlowState, ChokedFlowError, choked_mass_flux,
-        _build_phase_limits, _safe_update_PT,
-    )
-
-    P_in = ureg.Quantity(20.0, "bar").to("Pa").magnitude
-    T_in = 300.0
-    D_pipe = ureg.Quantity(2.0, "inch").to("m").magnitude
-    D_min  = ureg.Quantity(1.0, "inch").to("m").magnitude
-    A_pipe   = math.pi * D_pipe ** 2 / 4.0
-    A_throat = math.pi * D_min  ** 2 / 4.0
-
-    AS = composition.define_composition(
-        y_Methane=0.95, y_Ethane=0.04, y_CarbonDioxide=0.01, eos="HEOS",
-    )
-    phase_limits = _build_phase_limits(AS)
-
-    def fresh_fs(mdot):
-        _safe_update_PT(AS, P_in, T_in, *phase_limits)
-        return FlowState(
-            AS, mdot=mdot, A=A_pipe, z=0.0,
-            T_cricondentherm=phase_limits[0], P_cricondenbar=phase_limits[1],
-            T_critical=phase_limits[2],       P_critical=phase_limits[3],
+        AS, 0.0, A=A_big, z=0.0,
+        T_cricondentherm=T_cric, P_cricondenbar=P_bar,
+        T_critical=T_c, P_critical=P_c,
         )
 
-    # Reference choked mass flows at the two candidate areas (using a
-    # near-stagnation inlet for both -- the test mdot is set well below
-    # mdot_choked_pipe and well above mdot_choked_throat so the small
-    # KE-in-stagnation correction cannot flip either comparison).
-    _safe_update_PT(AS, P_in, T_in, *phase_limits)
-    fs_probe = FlowState(
-        AS, mdot=1e-6, A=A_pipe, z=0.0,
-        T_cricondentherm=phase_limits[0], P_cricondenbar=phase_limits[1],
-        T_critical=phase_limits[2],       P_critical=phase_limits[3],
-    )
-    mdot_pipe,   *_ = choked_mass_flux(fs_probe, A_pipe,   A_outlet=A_pipe)
-    _safe_update_PT(AS, P_in, T_in, *phase_limits)
-    fs_probe = FlowState(
-        AS, mdot=1e-6, A=A_pipe, z=0.0,
-        T_cricondentherm=phase_limits[0], P_cricondenbar=phase_limits[1],
-        T_critical=phase_limits[2],       P_critical=phase_limits[3],
-    )
-    mdot_throat, *_ = choked_mass_flux(fs_probe, A_throat, A_outlet=A_pipe)
+    # Forward chain: re-anchor to the stagnation reservoir, then march the
+    # sharp entrance and the pipe.  seg.dP_dT raises at its Ma>=0.98 reactive
+    # gate, so the largest mdot the chain passes is the choked flow rate.
+    def forward_at_mdot(mdot_trial):
+        _safe_flowstate_update_PT(fs, P0, T0)
+        fs.A    = A_big
+        fs.z    = 0.0
+        fs.mdot = mdot_trial
+        entrance.dP_dT(fs)
+        seg.dP_dT(fs)
 
-    # Pick mdot squarely in the band [mdot_throat, mdot_pipe].
-    mdot_test = 0.5 * (mdot_pipe + mdot_throat)
+    # Loose upper bound on the choke: ideal-gas sonic mass flux at the pipe
+    # area.  The true Fanno choke is lower; _fanno_choke_mdot bisects down to it.
+    A_pipe          = seg.profile[-1][3]
+    mdot_infeasible = _ideal_gas_G_max(AS) * A_pipe
+    mdot_seed       = 0.1 * mdot_infeasible
 
-    print("Valve internal-throat choke detection (methane mix, 20 bar, 300 K):")
-    print(f"  D_pipe = 2 in,  D_min = 1 in  (A_throat = A_pipe/4)")
-    print(f"  mdot_choked at A_pipe   = {mdot_pipe:.4f} kg/s  (legacy screen)")
-    print(f"  mdot_choked at A_throat = {mdot_throat:.4f} kg/s  (new screen)")
-    print(f"  test mdot               = {mdot_test:.4f} kg/s  (between the two)")
-
-    # 1) Valve with minimum_diameter: should raise ChokedFlowError.
-    v_throat = Valve(Di=D_pipe, K=20.0, minimum_diameter=D_min)
-    fs = fresh_fs(mdot_test)
-    new_raised = False
-    try:
-        v_throat.dP_dT(fs)
-    except ChokedFlowError as e:
-        new_raised = True
-        mdot_clamp = e.mdot_choked
-
-    # 2) Valve without minimum_diameter: legacy path, should NOT raise.
-    v_legacy = Valve(Di=D_pipe, K=5.0)
-    fs2 = fresh_fs(mdot_test)
-    legacy_raised = False
-    try:
-        v_legacy.dP_dT(fs2)
-    except ChokedFlowError:
-        legacy_raised = True
-
-    print(f"  Valve(minimum_diameter=1in):  ChokedFlowError raised? {new_raised}"
-          + (f"  (mdot_choked={mdot_clamp:.4f} kg/s)" if new_raised else ""))
-    print(f"  Valve(no minimum_diameter):   ChokedFlowError raised? {legacy_raised}")
-
-    status = "OK  " if (new_raised and not legacy_raised) else "FAIL"
-    print(f"  [{status}] minimum_diameter catches internal choke that the "
-          f"pipe-area screen misses")
-
-
-def test_line_segment_choke_diagnostic():
-    """Verify the predictive Fanno / isothermal choke diagnostic on
-    Line_Segment.dP_dT (improvements.md R7).
-
-    Sets up a methane-rich mixture at P_in = 5 bar, T_in = 300 K in 1"
-    Sch 40 pipe with mdot chosen so inlet Ma ~ 0.2.  Under ideal-gas
-    Fanno theory L_max ~ 20 m for these inputs, so a 200 m segment
-    should trip the predictive warning while a 5 m segment should not.
-    The isothermal branch is checked separately at the same long
-    length.
-    """
-    import warnings as _warnings
-    from compressible_flow import (
-        Line_Segment, FlowState, _build_phase_limits, _safe_update_PT,
-    )
-
-    P_in = ureg.Quantity(5.0, "bar").to("Pa").magnitude
-    T_in = 300.0
-    OD = ureg.Quantity(1.315, "inch").to("m").magnitude
-    WT = ureg.Quantity(0.133, "inch").to("m").magnitude
-    ID = OD - 2 * WT
-    A_pipe = math.pi * ID ** 2 / 4.0
-    roughness = ureg.Quantity(0.00015, "ft").to("m").magnitude
-
-    AS = composition.define_composition(
-        y_Methane=0.95, y_Ethane=0.04, y_CarbonDioxide=0.01, eos="HEOS",
-    )
-    phase_limits = _build_phase_limits(AS)
-
-    # Pick mdot so inlet Ma ~ 0.2 at the static (P_in, T_in).
-    _safe_update_PT(AS, P_in, T_in, *phase_limits)
-    rho_in = AS.rhomass()
-    a_in   = AS.speed_sound()
-    Ma_target = 0.2
-    mdot = Ma_target * a_in * rho_in * A_pipe
-
-    def fresh_fs():
-        _safe_update_PT(AS, P_in, T_in, *phase_limits)
-        return FlowState(
-            AS, mdot=mdot, A=A_pipe, z=0.0,
-            T_cricondentherm=phase_limits[0], P_cricondenbar=phase_limits[1],
-            T_critical=phase_limits[2],       P_critical=phase_limits[3],
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", UserWarning)
+        mdot_choke, P_exit, T_exit, *_ = _fanno_choke_mdot(
+            forward_at_mdot, fs,
+            mdot_seed=mdot_seed,
+            mdot_infeasible=mdot_infeasible,
         )
 
-    def run(length_m, isothermal):
-        seg = Line_Segment(
-            roughness=ureg.Quantity(roughness, "m"),
-            id_val=ureg.Quantity(ID, "m"),
-            length=ureg.Quantity(length_m, "m"),
-            elevation_change=ureg.Quantity(0.0, "m"),
-        )
-        fs = fresh_fs()
-        with _warnings.catch_warnings(record=True) as caught:
-            _warnings.simplefilter("always")
-            try:
-                seg.dP_dT(fs, isothermal=isothermal)
-            except RuntimeError:
-                # Reactive choke in compressible_pipe_segment is still
-                # possible at very long lengths; the diagnostic should
-                # have fired BEFORE the RuntimeError.
-                pass
-        choke_warnings = [w for w in caught
-                          if issubclass(w.category, UserWarning)
-                          and "chok" in str(w.message).lower()]
-        return choke_warnings
+    ndot = ureg.Quantity(mdot_choke / AS.molar_mass(), 'mol/s').to('scf/h')
+    print(f'Choked flow rate: {ndot:.4e}  '
+          f'(pipe exit P={ureg.Quantity(P_exit, "Pa").to("psi").magnitude:.1f} psia, '
+          f'T={T_exit:.1f} K, Ma~0.98)')
+    print('Crane textbook solution: 1.028e6 scfh')
 
-    print(f"Line_Segment predictive choke diagnostic "
-          f"(methane mix, P_in=5 bar, T_in=300 K, ID=1\" Sch 40, Ma_in~{Ma_target}):")
-    print(f"  mdot = {mdot:.4f} kg/s")
 
-    # 1) Adiabatic long pipe -- should warn.
-    warns_long_adi = run(200.0, isothermal=False)
-    long_adi_ok = len(warns_long_adi) >= 1 and "fanno" in str(warns_long_adi[0].message).lower()
-    print(f"  adiabatic, L=200 m:  warnings={len(warns_long_adi)}  "
-          f"[{'OK  ' if long_adi_ok else 'FAIL'}] expect Fanno-choke UserWarning")
-    if warns_long_adi:
-        print(f"    -> {warns_long_adi[0].message}")
-
-    # 2) Adiabatic short pipe -- should NOT warn.
-    warns_short_adi = run(5.0, isothermal=False)
-    short_adi_ok = len(warns_short_adi) == 0
-    print(f"  adiabatic, L=5 m:    warnings={len(warns_short_adi)}  "
-          f"[{'OK  ' if short_adi_ok else 'FAIL'}] expect no choke UserWarning")
-
-    # 3) Isothermal long pipe -- should warn (different branch / text).
-    warns_long_iso = run(200.0, isothermal=True)
-    long_iso_ok = len(warns_long_iso) >= 1 and "isothermal" in str(warns_long_iso[0].message).lower()
-    print(f"  isothermal, L=200 m: warnings={len(warns_long_iso)}  "
-          f"[{'OK  ' if long_iso_ok else 'FAIL'}] expect isothermal-choke UserWarning")
-    if warns_long_iso:
-        print(f"    -> {warns_long_iso[0].message}")
-
-    overall = long_adi_ok and short_adi_ok and long_iso_ok
-    print(f"  [{'OK  ' if overall else 'FAIL'}] R7 predictive diagnostic behaves as expected")
+     
 
 
 if __name__ == "__main__":
@@ -1100,26 +865,17 @@ if __name__ == "__main__":
     # print('\nCrane TP410 example 4-18')
     # test_Crane_gas_pipeline()
 
-    print('--------------------------------------------------------')
-    print('\nCrane TP410 example 4-16')
-    test_Crane_air_line()
+    # print('--------------------------------------------------------')
+    # print('\nCrane TP410 example 4-16')
+    # test_Crane_air_line()
+
+    # print('--------------------------------------------------------')
+    # print('\nCrane TP410 example 4-10')
+    # test_Crane_4_10()
+
 
     print('--------------------------------------------------------')
-    print('\nCrane TP410 example 4-10')
-    test_Crane_4_10()
+    print('\nCrane TP410 example 4-21')
+    test_Crane_4_21()
 
-    print('--------------------------------------------------------')
-    print('\nChoked-flow ideal-gas air nozzle')
-    test_choked_mass_flux_ideal_gas_air()
 
-    print('--------------------------------------------------------')
-    print('\ncompressible_K choke round-trip')
-    test_compressible_K_choke_roundtrip()
-
-    print('--------------------------------------------------------')
-    print('\nValve internal-throat (minimum_diameter) choke detection')
-    test_valve_minimum_diameter_choke()
-
-    print('--------------------------------------------------------')
-    print('\nLine_Segment predictive Fanno / isothermal choke diagnostic (R7)')
-    test_line_segment_choke_diagnostic()

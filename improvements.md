@@ -231,7 +231,16 @@ feedback in the denominator strengthens nonlinearly as the gas expands.
           times the minimum profile area; the helper's retreat loop
           discovers the real-gas Fanno choke that friction induces well
           below the isentropic bound.  Returns `profile_points` from the
-          final converged solve, matching the forward sibling.  The
+          final converged solve, matching the forward sibling.  **Update:**
+          on the bracket-failure (choked) branch the `ChokedFlowError`
+          payload is now the *true Fanno choke* — located by the new
+          `_fanno_choke_mdot`, which bisects the forward-solve feasibility
+          boundary (the largest mdot the segment passes before its
+          `Ma ≥ 0.98` reactive gate fires) — rather than the looser
+          `choked_mass_flux` isentropic-nozzle bound at the minimum profile
+          area, which ignores wall friction and overstates a pipe's choke.
+          The network's single-`Line_Segment`-edge inverse clamp inherits
+          the corrected value automatically.  The
           per-iteration ideal-gas Fanno diagnostic is suppressed during
           the inverse drive (it would otherwise fire dozens of times
           with slightly different cumulative integrals, defeating
@@ -400,6 +409,78 @@ feedback in the denominator strengthens nonlinearly as the gas expands.
           on the expansion direction (kinetic recovery typically
           dominates K-loss so the residual sign reverses).  An inverse
           edge containing only an expansion would crash.
+
+- **R2.8 [✅ DONE — kernel flash-count reduction].** Cut the EOS-flash
+  count of `compressible_changing_area_K` (the kernel every component
+  routes through) from ~7-16 to ~2-3 per call, and of the
+  `choked_mass_flux` march from ~150 to ~90 per call.  Three changes:
+
+    * **Damped Newton replaces unconditional `scipy.optimize.root(hybr)`.**
+      The 2x2 (P, T) system is now driven by a hand-rolled damped Newton
+      using the existing analytic Jacobian (partials cached by each
+      residual flash, ~1 us).  Each iteration costs exactly one PT flash;
+      termination is on scaled residuals < 1e-9 *or* a relative Newton
+      step < 1e-9 (the step test catches the K=0 case where the entropy
+      residual bottoms out at the double-precision noise floor of
+      `AS.smass()`).  Both sit far below the network FD noise floor
+      (`diff_step=1e-5`).  Convergence leaves `fs.AS` at the solution, so
+      the old redundant final `_safe_flowstate_update_PT` flash is gone
+      too.  Per-coordinate trust region (P within a factor of ~2, T above
+      0.3*T_in) keeps a bad step from pushing CoolProp into an
+      unevaluable state; on any CoolProp failure mid-walk or
+      non-convergence at 10 iterations, the solve restarts with hybr
+      *from the original guess* — exactly what the old implementation
+      always did — so robustness is unchanged.  (An earlier draft fell
+      back from the last Newton iterate; that corrupted hybr's start
+      point on the sonic-throat recovery path in `compressible_dA` and
+      crashed three examples.py tests with negative-pressure flashes.)
+    * **Initial-guess physics fix.**  The old K-correction
+      `T0 += e_loss/Cp` was wrong: for adiabatic constant-area flow the
+      dissipation does not raise T_out (it is already inside the
+      conserved stagnation enthalpy; for an ideal gas dT -> 0 as
+      dP -> -rho*e_loss).  The guess now uses the linearized
+      constant-area forms from `compressible_K`'s derivation (inlet
+      partials, zero extra flashes): `dP_K = -e_loss*rho/denom` with the
+      acceleration-feedback denominator, `dT_K = (e_loss +
+      (1/rho - (dH/dP)_T)*dP_K)/Cp`.  When the denominator falls below
+      0.25 (Ma -> 1, e.g. subsonic recovery from a sonic throat) the
+      linearization over-shoots, so the historical crude correction is
+      kept there.  `Cp_in` and the guess partials are read before the
+      choke pre-screen mutates AS (removes a silent ordering dependency).
+    * **`choked_mass_flux` directed bracketing + two-tier tolerance.**
+      The Mach=1 bracket scan is seeded at the critical pressure ratio
+      `(2/(gamma+1))^(gamma/(gamma-1))` (real-gas gamma = cp/cv at the
+      inlet, clamped to [1.01, 3.0] against the near-critical cp spike)
+      and walks geometrically (factor 1.25) in the direction the first
+      sign indicates — 2-5 evaluations vs ~8-10 for the historical
+      top-down 40-point log grid, which is retained as a fallback for
+      non-monotonic isentropes.  The scan runs the inner
+      `_T_at_P_along_isentrope` at a loosened 1e-2 K tolerance (sign
+      detection doesn't need micro-Kelvin roots); the final brentq
+      polish keeps the tight 1e-6 K default, so the returned throat
+      state moves only within the pre-existing brentq xtol
+      (~1e-5 relative).  `_ideal_gas_G_max` also switched to the
+      real-gas gamma (clamped) per review.
+
+  Measured (example_composition mix, 100 psi / 150 F, scratch counter on
+  `_safe_update_PT`): plain K=5 fitting 7 -> 3 flashes, `_area_match`
+  +0.1% boundary 6 -> 2, K=20 8 -> 3, choke march 154 -> 87,
+  `compressible_dA` Mode 1 287 -> 169, Mode 2 295 -> 138.  Converged
+  P_out/T_out unchanged to <= 1e-4 Pa / 1e-6 K on the kernel cases.
+  `benchmark_dmdot.py` single-edge inverse network solves: Valve
+  constricted 8.6 s -> 3.1 s, Orifice 10.7 s -> 2.8 s, Valve plain
+  3.7 s -> 2.8 s, Line_Segment 200 ft 8.9 s -> 7.8 s.  The "constricted
+  components pay ~500-770 ms per forward dP_dT" bottleneck noted under
+  R2.7 is also gone (the Mode 1 march now costs ~60% of its old flash
+  count and the kernels behind it converge in 1-3 flashes).
+
+  **Deferred (out of scope, revisit if marches still dominate
+  profiles):** caching a real-gas correction ratio
+  `mdot_choked / (G_max_ideal*A)` on the FlowState to skip repeated
+  marches across network LM iterations (cache invalidation is tricky:
+  inlet P/T change on every LM trial); and a 1-D P-solve along the
+  exact isentrope for the K=0 kernel case (the inner T-root-solve
+  flashes more than the 2-D Newton saves).
 
 - **R3 [larger].** Switch the valve component to an ISA-75.01 / IEC-60534-2-1
   sizing model parameterized by Cv (or Kv) and x_T, with explicit choked-flow
@@ -605,19 +686,58 @@ Files: [compressible_flow.py:1245-1731](compressible_flow.py#L1245-L1731),
 - The dT formula correctly splits into JT cooling
   (`-(T/rho^2)*(drho/dT)_P*dP` = `-mu_JT*dP`), friction heating, and external
   heat. Textbook-correct and a real strength.
-- The two-metric splitter (energy residual + relative dP/dL change) is well
-  motivated and catches most failure modes.
+- The splitter (energy residual + relative dP/dL change + Mach change as
+  of R8) is well motivated and catches most failure modes.
 
-### Central limitation
+### Central limitation — ✅ RESOLVED by R9 (Heun corrector)
 
-**Forward Euler with inlet-only properties.** Every coefficient
-(rho, v, Cp, A, B, f, T) is evaluated at the inlet and held constant across
-the slice ([compressible_flow.py:1490-1497](compressible_flow.py#L1490-L1497)). Base scheme is first-order with O(dL) global accuracy. The
-splitter compensates, but it is compensating for a low-order integrator.
-A second-order scheme (midpoint, RK2, implicit trapezoidal) would cost one
-extra property evaluation per step and let slices grow ~5-10x for the same
-error. Implicit trapezoidal additionally buys A-stability near choke, where
-the ODE becomes stiff.
+**Was: forward Euler with inlet-only properties.** Every coefficient
+(rho, v, Cp, A, B, f, T) was evaluated at the inlet and held constant across
+the slice — first-order with O(dL) global accuracy, with the splitter
+compensating for the low-order integrator.
+
+*Implemented:* the integrator is now a **Heun (trapezoidal)
+predictor-corrector**. The Euler step stands as the predictor; the dP/dL
+slope re-evaluated at the trial outlet (already computed for the splitter)
+is averaged with the inlet slope for the corrected P_out, and T_out comes
+from the stagnation-enthalpy Newton projection extended with a
+`d(H_calc)/dP|_T` cross-term to account for P moving from the Euler trial
+to the Heun value. **No additional EOS flash**: the corrected-state flash
+replaces the final flash the old energy correction always required (still
+2 flashes per converged slice). The same trapezoidal average is applied to
+the isothermal branch (there it adds one flash over the old single-flash
+path, traded for second-order accuracy; near-stagnant slices skip it — see
+below). Measured on a methane-mix case at 10 bar with a ~11% single-slice
+pressure drop: single-step error fell from ~1e-2 of dP (Euler, ratio-2
+convergence confirmed) to 9.2e-5 of dP, with error reduction ~17x per
+2x step refinement (first order gives 2x). Covered by
+`test_pipe_segment_convergence_order` in
+[textbook_test_functions.py](textbook_test_functions.py).
+
+A new `correction_skip_rel_tol` kwarg (default 1e-9) skips the
+corrected-state flash when the Heun/Newton correction is negligible
+relative to (P_in, T_in) — in practice this fires on near-stagnant slices
+(common while the network LM solver probes tiny trial mdots), halving the
+flash count on those walks. The threshold is deliberately conservative:
+the discarded correction is a signed truncation term that accumulates
+across slices, and a skip/no-skip flip must stay below the network
+solver's FD noise floor (diff_step=1e-5 on inverse edges).
+
+**New bug found and fixed during this work — isothermal choke gate could
+never fire.** Both Mach gates tested `v/a` (isentropic sound speed)
+against 0.98, but isothermal flow goes singular at the *isothermal* sound
+speed `a_T = sqrt((dP/drho)_T) = a/sqrt(gamma)` for an ideal gas (~0.88·a
+at gamma=1.3). The dP/dL denominator blew up before the gate could fire,
+surfacing as a misleading depth-exhaustion "failed to converge". The
+inlet/outlet gates now test `Ma_T = v*sqrt((drho/dP)_T)` in isothermal
+mode, with the choke named in the error message. Covered by
+`test_isothermal_choke_gate` in
+[textbook_test_functions.py](textbook_test_functions.py). Note for
+`_fanno_choke_mdot` users: for isothermal segments the feasibility
+boundary it bisects now sits at the (earlier, physical) isothermal choke.
+
+Implicit trapezoidal (A-stability near choke) remains open as R10,
+conditional on demand.
 
 ### Issues for large dP / near-choke
 
@@ -628,27 +748,39 @@ the ODE becomes stiff.
    diagnostic. Today the user sees "failed to converge after 8 splits" with
    no way to distinguish numerical drift from physical impossibility.
 
-9. **[polish]** The 0.98 Mach gate ([compressible_flow.py:1727](compressible_flow.py#L1727)) is a discontinuity. Ma_out = 0.97 returns
-   silently as if all is well, although the inlet-property linearization is
-   already poor. Either lower the warn threshold (warn at 0.7, hard-fail at
-   0.95) or add a Ma-change splitter metric.
+9. **[polish — partially addressed]** The 0.98 Mach gate (in
+   `compressible_pipe_segment`) is a discontinuity. Ma_out = 0.97 returns
+   silently as if all is well. The Ma-change splitter metric (item 10) now
+   bounds how badly a single slice can degrade before splitting, and the
+   gate itself is now mode-aware (isothermal Ma_T — see the resolved
+   "Central limitation" section above), but the warn-vs-fail threshold
+   split (warn at 0.7, hard-fail at 0.95) remains open. **Note:** this gate
+   is load-bearing as the *feasibility boundary* that `_fanno_choke_mdot`
+   bisects to report a pipe's Fanno choke (`Line_Segment.dmdot_dT`), so
+   changing its threshold also shifts the reported choke mass flow — update
+   that helper's docstring in tandem (it now documents the mode-dependence).
 
-10. **[gap, splitter blind spot]** The splitter checks dP/dL and energy but
-    *not* change in Mach number. A slice taking Ma from 0.3 to 0.7 can pass
-    both metrics while having order-1 relative property change. Add
-    `|Ma_out_trial - Ma_in| > Ma_change_tol` (default ~0.1) as a third
-    splitter metric.
+10. **[gap, splitter blind spot] ✅ DONE (R8).**
+    `abs(Ma_out_trial - Ma_in) > Ma_change_tol` (default 0.1) is now the
+    third splitter metric in both branches, exposed as `Ma_change_tol` on
+    `compressible_pipe_segment`, `Line_Segment.dP_dT`, and
+    `Line_Segment.dmdot_dT`, and reported in the depth-exceeded message.
+    Costs one `speed_sound()` call at the already-flashed trial state.
 
-11. **[bug, error reporting]** Near choke, trial-outlet dP/dL recomputation
-    can have `denom_out` ([compressible_flow.py:1551](compressible_flow.py#L1551)) cross zero. needs_split fires (good) but the
-    diagnostic does not mention the choke origin — user sees only "failed to
-    converge."
+11. **[bug, error reporting] ✅ DONE.** The depth-exceeded message now
+    appends a choke-origin hint when the dP/dL denominator at the deepest
+    failing slice's *inlet* is near its singular zero (within 0.3, i.e.
+    Ma ≳ 0.84): "likely choking (Fanno)" in the adiabatic branch, "likely
+    reaching the isothermal choke (v = a_T)" in the isothermal branch. The
+    inlet denominator is used rather than the trial-outlet one because the
+    deepest slice's inlet sits hard against the singularity while its trial
+    outlet may be unevaluable (NaN).
 
-12. **[polish, energy correction]** The single Newton step on T_out
-    ([compressible_flow.py:1625](compressible_flow.py#L1625)) projects onto
-    the energy-conservation manifold at the *Euler-computed* P_out. P_out
-    itself is not corrected. A midpoint / trapezoidal scheme would conserve
-    energy to integrator order and this fixup would not be needed.
+12. **[polish, energy correction] ✅ RESOLVED by R9.** The Heun corrector
+    fixes P_out with the trapezoidal slope average, and the Newton step now
+    projects onto the energy manifold *at the corrected P* via the
+    `d(H_calc)/dP|_T` cross-term — the fixup is the corrector, not a
+    band-aid applied at the wrong pressure.
 
 ### Issues with the splitter machinery
 
@@ -746,11 +878,18 @@ the ODE becomes stiff.
   methane-rich mix at 5 bar / 300 K, 1" Sch 40, `Ma_in≈0.2` — the
   diagnostic fires on a 200 m segment (both adiabatic and isothermal)
   and stays silent on a 5 m segment.
-- **R8 [cheap, high value].** Add Ma-change splitter metric (item 10). One
-  extra divide per slice. Catches the dP/dL+energy blind spot.
-- **R9 [medium, broad win].** Upgrade integrator to RK2 / midpoint. Doubles
-  per-step cost, gains ~5-10x larger slices, removes need for the T-correction
-  band-aid.
+- **R8 [✅ DONE].** Ma-change splitter metric added (see item 10).
+- **R9 [✅ DONE — as Heun predictor-corrector].** Implemented as Heun
+  (explicit trapezoidal) rather than midpoint: the trial-outlet slope the
+  splitter already computes doubles as the corrector slope, so second-order
+  accuracy costs *zero* extra EOS flashes in the non-isothermal branch
+  (see the resolved "Central limitation" section above for measurements
+  and the `correction_skip_rel_tol` flash-skip). The existing
+  `energy_tol` / `dPdL_rel_tol` defaults were kept — they now size slices
+  for a second-order step, so realized accuracy improves at the same
+  split rate. Loosening `dPdL_rel_tol` (e.g. 0.05 → 0.15) to convert the
+  accuracy gain into fewer splits is a possible follow-on, supported by
+  `test_pipe_segment_convergence_order`.
 - **R10 [larger, conditional].** Implicit trapezoidal as an option for users
   routinely operating at Ma > 0.5. Bigger change; needs concrete demand.
 - **R11 [cheap].** Document the staircase-diameter assumption in
@@ -780,7 +919,14 @@ the ODE becomes stiff.
   cavitation now flagged by the ISA-75.01 three-regime gate when `F_L`
   and `vapor_pressure_si` are supplied (R5); Orifice cavitation check
   on the forward `dP` path resurrected from a long-standing dead-code
-  bug (R5.5).*
+  bug (R5.5).  The `choked_mass_flux` isentrope march now floors its
+  internal temperature search just above the mixture cricondentherm so
+  it cannot enter the two-phase dome — a single-phase root below that
+  floor raises the new `TwoPhaseIsentropeError` instead of CoolProp's
+  cryptic "stationary point" failure (single-phase scope is explicit).
+  `Line_Segment.dmdot_dT` reports the true friction-limited Fanno choke
+  on the choked branch via the new `_fanno_choke_mdot` feasibility-
+  boundary bisection rather than the looser isentropic-nozzle bound.*
 
 - **The network walk is the natural enforcement point for both
   cavitation checks and the negative-pressure sanity floor.** Absolute

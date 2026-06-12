@@ -166,7 +166,7 @@ All five take a `FlowState` as their first argument; `mdot`, `A`, and the phase-
   1. Stagnation-enthalpy conservation: `H_out + v_out²/2 = H_in + v_in²/2`.
   2. Entropy generation from the irreversible loss: `S_out − S_in = K·v_in² / (2·T_avg)`.
 
-  via `scipy.optimize.root` (hybrid method), with the isentropic ideal gas result as the initial guess. Updates the `AbstractState` in place. This function is rather slow, as the scipy root finding takes a lot of iterations with a lot of abstract state updates, but unfortunately there's no easy one-step process to estimate this.
+  via a damped Newton iteration with an analytic Jacobian assembled from CoolProp partial derivatives (each Newton step costs exactly one `PT_INPUTS` flash; the partials at the just-flashed state are ~1 µs). The initial guess is the isentropic ideal gas result plus the linearized constant-area K-correction from `compressible_K`'s derivation, so typical calls converge in 1–3 flashes. If Newton stalls or walks somewhere CoolProp cannot evaluate, the solve restarts with `scipy.optimize.root` (hybrid method) from the original guess. Updates the `AbstractState` in place.
 
 - **`compressible_K(fs, K, dPmax=0.05)`** — outlet conditions for a constant-area fitting (e.g. bend, valve) with a known `K`. Applies a single-step analytical result derived from the combined energy + continuity + entropy + EOS equations with `dA = 0`:
 
@@ -179,7 +179,9 @@ All five take a `FlowState` as their first argument; `mdot`, `A`, and the phase-
 
   **Adaptive fallback:** after computing the linearized `dP`, if `|dP|/P_in > dPmax` (default 5%) or the compressibility denominator `< 0.5` (indicating near-sonic conditions where the linearization breaks down), the function automatically delegates to `compressible_changing_area_K` with `A_out = fs.A`. This makes `Valve.dP_dT` and `Bend.dP_dT` regime-aware without any API change. Pass a larger `dPmax` to force the fast path, or smaller to be more conservative.
 
-- **`choked_mass_flux(fs, A_throat, A_outlet=None, n_grid=40)`** — real-gas choked mass flow through a throat of area `A_throat`, using the an isentropic expansion. The stagnation enthalpy reference is built from `fs.h_stagnation = h_static + 0.5·v_in²`, so the choked mass flow correctly grows when the inlet carries non-trivial kinetic energy. Used internally by `compressible_K` and `compressible_changing_area_K` as a real-gas choke pre-screen; on choke they raise `ChokedFlowError` carrying `mdot_choked` and the (recovered) outlet state.
+- **`choked_mass_flux(fs, A_throat, A_outlet=None, n_grid=40)`** — real-gas choked mass flow through a throat of area `A_throat`, using the an isentropic expansion. The stagnation enthalpy reference is built from `fs.h_stagnation = h_static + 0.5·v_in²`, so the choked mass flow correctly grows when the inlet carries non-trivial kinetic energy. The Mach=1 bracketing is a directed walk seeded at the critical pressure ratio `(2/(γ+1))^(γ/(γ−1))` (real-gas `γ = cp/cv` at the inlet) with a loosened inner entropy-root tolerance, falling back to an `n_grid`-point top-down scan if the walk finds no sign change; the final `brentq` polish runs at the tight tolerance, so the returned throat state is unaffected by the loose scan. Used internally by `compressible_K` and `compressible_changing_area_K` as a real-gas choke pre-screen; on choke they raise `ChokedFlowError` carrying `mdot_choked` and the (recovered) outlet state. The internal isentrope temperature search is floored just above the mixture cricondentherm so it cannot wander into the two-phase dome (where CoolProp's PT update fails); an expansion whose single-phase root would lie below that floor raises `TwoPhaseIsentropeError` rather than a cryptic EOS "stationary point" error, since this layer models single-phase flow only.
+
+- **`_fanno_choke_mdot(forward_at_mdot, fs, mdot_seed, mdot_infeasible)`** — locate the Fanno (friction-limited) choke mass flow of a pipe segment by bisecting the feasibility boundary of its forward solve: `compressible_pipe_segment` raises at its `Ma ≥ 0.98` reactive gate, so the largest `mdot` the segment passes subsonically *is* the choke. Returns the 6-tuple `ChokedFlowError` expects (the pipe exit is the sonic throat). Used by `Line_Segment.dmdot_dT` to report the true Fanno choke in its `ChokedFlowError` rather than the looser isentropic-nozzle bound `choked_mass_flux` gives at the pipe area — the latter ignores wall friction and overstates the choke for a distributed-friction pipe.
 
 - **`compressible_dA(fs, A_throat, K=0.0, A2=None, P2=None)`** — single-entry-point constriction solver (valve, orifice, restriction). Splits the process into two physically distinct stages: an *isentropic* acceleration from inlet to the throat / vena contracta (`compressible_changing_area_K(K=0)`), then a *K-dissipative* recovery from throat to outlet area `A2` (`compressible_changing_area_K(e_loss=0.5·K·v_in²)`). The entropy balance on the recovery step uses the throat-to-outlet average temperature, which better matches real geometry (most of the entropy generation lives in the post-vena-contracta turbulence) than averaging inlet to outlet.
 
@@ -256,9 +258,14 @@ Each iteration resets `AS` to the common inlet `(P0, T0)`, constructs one `FlowS
 
 ---
 
-## Test functions — [textbook_test_functions.py](textbook_test_functions.py)
+## Textbook test functions — [textbook_test_functions.py](textbook_test_functions.py)
 
 End-to-end examples that check the program's calculations against textbook problems to validate its output.
+
+## Debugging test functions - [test.py](test.py)
+
+Debugging tests run to test new features
+
 
 ## Utilities - [utilities.py](utilities.py)
 
