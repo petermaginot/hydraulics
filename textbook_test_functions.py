@@ -832,6 +832,98 @@ def test_Crane_4_21():
           f'T={T_exit:.1f} K, Ma~0.98)')
     print('Crane textbook solution: 1.028e6 scfh')
 
+def test_Crane_4_22():
+    #Fanno flow example from Crane textbook. Air measured at 19.3 psig/34 psia at 100 F flows through
+    # 10 ft of 1/2" Sch 80 pipe to atmosphere.
+    import warnings
+    from compressible_flow import (
+        Line_Segment, Contraction_Expansion,
+        _build_phase_limits, _safe_update_PT, _safe_flowstate_update_PT,
+        FlowState, _solve_mdot_for_outlet_P, _fanno_choke_mdot, _ideal_gas_G_max,
+    )
+    from fluids import fittings
+    roughness = ureg.Quantity(0.00015, "ft")
+    seg_length = ureg.Quantity(10, "ft")
+    OD = ureg.Quantity(0.84, "inch")
+    WT = ureg.Quantity(0.147, "inch")
+    # Crane gives the 19.3 psig / 100 F conditions as FLOWING conditions
+    # Crane total K = f*L/D + 1.0 exit = 7.04.
+    P0 = ureg.Quantity( 19.3 + 14.696, "psi").to("Pa").magnitude   # initial P
+    T0 = ureg.Quantity(100.0, "degF").to("K").magnitude             # initial T
+    ID = OD - 2*WT
+    P2 = ureg.Quantity(14.696, "psi").to("Pa").magnitude            #Outlet pressure
+
+    A_pipe = math.pi * (ID**2)/4.0
+    A_pipe_si = A_pipe.to("m^2").magnitude
+
+    AS = composition.define_composition(
+        y_Oxygen         = 0.21,
+        y_Nitrogen       = 0.79,
+        eos = "HEOS")
+
+  
+    A_big   = 1.0                                  # m^2, arbitrarily large exit conditions
+    Di_DS   = ureg.Quantity((4.0 * A_big / math.pi) ** 0.5, "m")
+
+    seg = Line_Segment(roughness=roughness, id_val=ID, length=seg_length, elevation_change=0.0)
+    sharp_exit = Contraction_Expansion(Di_US=ID, Di_DS=Di_DS)
+
+    T_cric, P_bar, T_c, P_c = _build_phase_limits(AS)
+    _safe_update_PT(AS, P0, T0, T_cric, P_bar, T_c, P_c)
+
+    K_exit = fittings.diffuser_sharp(Di1=ID.to("m").magnitude, Di2 = Di_DS.magnitude)
+
+    print(f'Gamma = {AS.cpmolar()/AS.cvmolar():.4f}')
+    print(f'Exit expansion K (upstream-referenced) = {K_exit:.4f}')
+
+    fs = FlowState(
+        AS, 0.0, A=A_pipe_si, z=0.0,
+        T_cricondentherm=T_cric, P_cricondenbar=P_bar,
+        T_critical=T_c, P_critical=P_c,
+        )
+
+    # Forward chain: re-anchor to the inlet conditions, then march the
+    # pipe and sharp exit.  seg.dP_dT raises at its Ma>=0.98 reactive
+    # gate, so the largest mdot the chain passes is the choked flow rate.
+    def forward_at_mdot(mdot_trial):
+        _safe_flowstate_update_PT(fs, P0, T0)
+        fs.A    = A_pipe_si
+        fs.z    = 0.0
+        fs.mdot = mdot_trial
+        seg.dP_dT(fs)
+
+        #Note that including the sharp expansion is basically pointless. The K-factor should be about 1.0
+        #which means that all of the kinetic energy will just be dumped into thermal energy without any corresponding
+        #increase in pressure. But I'll keep it in for the sake of matching the Crane problem setup.
+        sharp_exit.dP_dT(fs)
+
+    # Loose upper bound on the choke: ideal-gas sonic mass flux at the pipe area
+    A_pipe_exit     = seg.profile[-1][3]
+    mdot_infeasible = _ideal_gas_G_max(AS) * A_pipe_exit
+    mdot_seed       = 0.1 * mdot_infeasible
+
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", UserWarning)
+        mdot_choke, P_exit, T_exit, *_ = _fanno_choke_mdot(
+            forward_at_mdot, fs,
+            mdot_seed=mdot_seed,
+            mdot_infeasible=mdot_infeasible,
+        )
+
+    #Now we have the max choked flow rate, feed that to the function that solves mdot for the outlet pressure.
+
+    mdot_solved = _solve_mdot_for_outlet_P(fs, P2, forward_at_mdot, mdot_choke)
+
+    # Alternative option - just use the dmdot_dT function, ignoring the expansion. Should give essentially the same answer
+    # since a K=1 expansion just dumps all of the kinetic energy without increasing pressure.
+    # seg.dmdot_dT(fs, P2)
+    # mdot_solved = fs.mdot
+
+    ndot = ureg.Quantity(mdot_solved / AS.molar_mass(), 'mol/s').to('scf/min')
+    print(f'Calculated flow rate: {ndot:.4e}  '
+          f'(pipe exit P={ureg.Quantity(AS.p(), "Pa").to("psi").magnitude:.1f} psia, '
+          f'T={AS.T():.1f} K, Ma = {fs.Ma})')
+    print('Crane textbook solution: 62.7 scfm')
 
      
 
@@ -874,8 +966,12 @@ if __name__ == "__main__":
     # test_Crane_4_10()
 
 
+    # print('--------------------------------------------------------')
+    # print('\nCrane TP410 example 4-21')
+    # test_Crane_4_21()
+
     print('--------------------------------------------------------')
-    print('\nCrane TP410 example 4-21')
-    test_Crane_4_21()
+    print('\nCrane TP410 example 4-22')
+    test_Crane_4_22()
 
 

@@ -242,7 +242,7 @@ def _area_match(fs, A_target, tol=1e-6):
     """If fs.A != A_target within tol, run an isentropic area change so
     that fs.AS reflects the state at A_target and fs.A == A_target.
 
-    No-op when fs.A is already at A_target.  Used at the top of every
+    Skip when fs.A is already at A_target.  Used at the top of every
     component dP_dT method to absorb any area discontinuity between
     consecutive components automatically.
     """
@@ -455,7 +455,7 @@ class Line_Segment(Base_Line_Segment):
         T0   = fs.AS.T()
         mdot = fs.mdot
 
-        # Cheap ideal-gas predictive choke check.  Warns (does not raise)
+        # Cheap ideal-gas predictive choke check.  Warns (does not raise error)
         # if the segment is predicted to choke before its outlet.
         _line_segment_choke_diagnostic(
             fs, self.profile, self.roughness_si, isothermal, mu, self.name,
@@ -539,12 +539,12 @@ class Line_Segment(Base_Line_Segment):
         ideal-gas sonic mass flux at the smallest profile area --
         deliberately loose; the helper's retreat loop handles real-gas
         drift and the Fanno-style choke that friction induces well below
-        the isentropic isentropic bound.
+        the isentropic choke bound.
 
         The forward closure restores fs.AS, fs.A, and fs.z to the inlet
         state on each call so the slice loop sees the same starting
         conditions every iteration.  Heat input q_wall and integrator
-        tolerances are forwarded verbatim to the inner dP_dT.
+        tolerances are forwarded to the inner dP_dT.
 
         Args:
             fs : FlowState at the segment inlet (static).  fs.AS must be
@@ -2243,7 +2243,33 @@ def compressible_changing_area(fs, A_out):
     A_star_ratio_out = A_star_ratio_in * (A_out / A_in)
 
     # ------------------------------------------------------------------
+    # Deep-subsonic short-circuit for very large expansions.
+    #
+    # As M -> 0 the area-Mach relation collapses to its asymptote
+    #     _area_ratio(M) -> C / M ,   C = (2/(gamma+1))**exp_num,
+    # so a target A/A*_out implies an outlet Mach of about C/A_star_ratio_out.
+    # A huge A/A*_out (an expansion into a near-infinite area, or any area
+    # change evaluated at a vanishingly small mdot -- A* scales with mdot)
+    # drives that root below the brentq bracket's fixed Ma_lo=1e-9, which
+    # would otherwise mis-fire as "could not bracket".  But the physics here
+    # is trivial: the flow simply decelerates to stagnation.  Outlet static
+    # P and T depend on Ma_out**2 (~1e-12 or smaller in this branch), so they
+    # equal the stagnation values to far better than machine precision.
+    # Return them directly rather than push brentq into a Ma ~ 1e-14 root.
+    # ------------------------------------------------------------------
+    C_asymptote = (2.0 / (gamma + 1.0)) ** exp_num
+    Ma_out_est  = C_asymptote / A_star_ratio_out
+    if Ma_out_est < 1e-6:
+        P_out = P_total * _p_ratio(Ma_out_est)
+        T_out = T_total * _t_ratio(Ma_out_est)
+        return (P_out, T_out)
+
+    # ------------------------------------------------------------------
     # Solve for subsonic Ma_out such that _area_ratio(Ma_out) == A_star_ratio_out.
+    # Ma_lo=1e-9 brackets every A/A*_out up to ~C/1e-9 (~5.8e8 for air); the
+    # short-circuit above handles anything larger, so the bracket never fails
+    # spuriously here.  A choking contraction gives A/A*_out < 1 (small, not
+    # large), so it skips the short-circuit and still raises below as intended.
     # ------------------------------------------------------------------
     Ma_lo = 1e-9
     Ma_hi = 1.0 - 1e-9
@@ -2990,22 +3016,60 @@ def compressible_pipe_segment(
             Ma_out_trial = v_out_trial / AS.speed_sound()
             Ma_chg       = abs(Ma_out_trial - Ma)
 
-            # Splitter decision: split if any metric is out of tolerance.
-            # The 1.0 Pa/m floor in dPdL_avg prevents division-by-zero artifacts
-            # when both slopes happen to be tiny (e.g. zero-q horizontal slice).
+            # Splitter decision.  The dP/dL-change and Mach-change metrics
+            # gauge whether the inlet-property linearization stays valid over
+            # the slice -- judge those on the trial state.  The 1.0 Pa/m floor
+            # in dPdL_avg prevents division-by-zero artifacts when both slopes
+            # happen to be tiny (e.g. zero-q horizontal slice).
             dPdL_avg    = max(abs(dPdL_in), abs(dPdL_out), 1.0)
             dPdL_relchg = abs(dPdL_out - dPdL_in) / dPdL_avg
-            needs_split = ((abs(energy_error) > energy_tol)
-                           or (dPdL_relchg > dPdL_rel_tol)
-                           or (Ma_chg > Ma_change_tol))
+            needs_split = (dPdL_relchg > dPdL_rel_tol) or (Ma_chg > Ma_change_tol)
+
+            # The energy metric, by contrast, must be judged on what this
+            # function actually RETURNS: the Heun corrector + authoritative
+            # Newton-on-T energy step (applied below) drives stagnation-enthalpy
+            # conservation to O(dL^4), far tighter than the O(dL^2) Euler-
+            # predictor error.  Gating the split on the predictor error rejects
+            # slices the corrector has already fixed (a strongly accelerating
+            # Ma~0.6 slice can carry a -10 J/kg predictor error whose corrected
+            # error is ~-0.002 J/kg).  So apply the corrector now -- reusing the
+            # partials at the just-flashed trial state -- and test energy on the
+            # corrected state.  Only do this when the cheap gates above pass; a
+            # slice already splitting on dP/dL or Ma restores its inlet and
+            # recurses regardless, so the corrector flash there would be wasted.
+            corrected_energy_error = energy_error
+            if not needs_split:
+                P_corr        = P_in + dL * (dPdL_in + dPdL_out) / 2.0
+                Cp_out_state  = AS.cpmass()
+                drhodT_P_out  = AS.first_partial_deriv(CP.iDmass, CP.iT, CP.iP)
+                dHdP_T_out    = AS.first_partial_deriv(CP.iHmass, CP.iP, CP.iT)
+                drhodP_T_out  = AS.first_partial_deriv(CP.iDmass, CP.iP, CP.iT)
+                dHcalc_dT = Cp_out_state - mdot**2/(flow_area**2*rho_out_trial**3)*drhodT_P_out
+                dHcalc_dP = dHdP_T_out - v_out_trial**2/rho_out_trial*drhodP_T_out
+                error_at_corr = energy_error - dHcalc_dP * (P_corr - P_out)
+                T_corr = T_out + error_at_corr / dHcalc_dT
+
+                if (abs(P_corr - P_out) > correction_skip_rel_tol * P_in
+                        or abs(T_corr - T_out) > correction_skip_rel_tol * T_in):
+                    # Apply the corrected state and measure energy on it.
+                    _safe_flowstate_update_PT(fs, P_corr, T_corr)
+                    rho_corr = AS.rhomass()
+                    v_corr   = mdot / (flow_area * rho_corr)
+                    corrected_energy_error = H_total_out - (AS.hmass() + v_corr**2/2)
+                # else: correction negligible -- trial state stands as the
+                # outlet and its (already tiny) predictor error is what we
+                # deliver; AS is left at the trial state.
+                needs_split = abs(corrected_energy_error) > energy_tol
         except (RuntimeError, ValueError) as exc:
-            # Trial state unevaluable -- definitely need to split.  Mark the
-            # metrics as undefined so the depth-exceeded message is informative.
+            # Trial (or corrected) state unevaluable -- definitely need to
+            # split.  Mark the metrics as undefined so the depth-exceeded
+            # message is informative.
             trial_eval_error = exc
-            energy_error     = float('nan')
-            dPdL_relchg      = float('nan')
-            Ma_chg           = float('nan')
-            needs_split      = True
+            energy_error           = float('nan')
+            corrected_energy_error = float('nan')
+            dPdL_relchg            = float('nan')
+            Ma_chg                 = float('nan')
+            needs_split            = True
 
         if needs_split:
             if _split_depth >= _max_split_depth:
@@ -3033,7 +3097,7 @@ def compressible_pipe_segment(
                     f"compressible_pipe_segment: slice failed to converge after "
                     f"{_max_split_depth} recursive splits "
                     f"(dL={dL:.4g} m, P_in={P_in:.4g} Pa, T_in={T_in:.4g} K, "
-                    f"energy_error={energy_error:.3g} J/kg [tol={energy_tol:.3g}], "
+                    f"corrected_energy_error={corrected_energy_error:.3g} J/kg [tol={energy_tol:.3g}], "
                     f"dPdL_relchg={dPdL_relchg:.3g} [tol={dPdL_rel_tol:.3g}], "
                     f"Ma_change={Ma_chg:.3g} [tol={Ma_change_tol:.3g}]).  "
                     f"Reduce upstream profile slice length, loosen tolerances, "
@@ -3058,45 +3122,18 @@ def compressible_pipe_segment(
             compressible_pipe_segment(fs, dL=dL/2.0, **half_kwargs)
             return
 
-        # Converged: apply the Heun (trapezoidal) corrector.  The Euler
-        # predictor used inlet-only slopes; averaging the inlet and
-        # trial-outlet dP/dL upgrades the pressure step to second order in
-        # dL.  The trial-outlet slope was already computed for the splitter,
-        # and the flash to the corrected state below replaces the final
-        # flash the energy correction always required -- so the corrector
-        # costs no additional EOS update.
-        P_corr = P_in + dL * (dPdL_in + dPdL_out) / 2.0
-
-        # The outlet temperature comes from the stagnation-enthalpy balance
-        # (one Newton step from the trial state), not a dT slope average --
-        # energy conservation is the authoritative T equation.
-        # H_stagnation = H + v^2/2 + gz
-        # H_stagnation_in + q_in = H_stagnation_out
-        # error(P, T) = H_stagnation_out_target - [H(P,T) + v(P,T)^2/2]
-        # Differentiating the calculated stagnation enthalpy (q_in,
-        # H_stagnation_in, and the gz term are constants):
-        #   d(H_calc)/dT|_P = (∂H/∂T)_P + (1/2)(∂v^2/∂T)_P
-        #                   = Cp - mdot^2/(A^2*rho^3) * (∂ρ/∂T)_P
-        #   d(H_calc)/dP|_T = (∂H/∂P)_T + (1/2)(∂v^2/∂P)_T
-        #                   = (∂H/∂P)_T - v^2/rho * (∂ρ/∂P)_T
-        # The dP cross-term accounts for P moving from the Euler trial P_out
-        # to the Heun P_corr while the derivatives stay anchored at the
-        # already-flashed trial state.
-        Cp_out_state  = AS.cpmass()
-        drhodT_P_out  = AS.first_partial_deriv(CP.iDmass, CP.iT, CP.iP)
-        dHdP_T_out    = AS.first_partial_deriv(CP.iHmass, CP.iP, CP.iT)
-        drhodP_T_out  = AS.first_partial_deriv(CP.iDmass, CP.iP, CP.iT)
-        dHcalc_dT = Cp_out_state - mdot**2/(flow_area**2*rho_out_trial**3)*drhodT_P_out
-        dHcalc_dP = dHdP_T_out - v_out_trial**2/rho_out_trial*drhodP_T_out
-        error_at_corr = energy_error - dHcalc_dP * (P_corr - P_out)
-        T_corr = T_out + error_at_corr / dHcalc_dT
-
-        # Skip the corrected flash when the correction is negligible (e.g.
-        # near-stagnant slices during network solver probing); the trial
-        # state then stands as the outlet.
-        if (abs(P_corr - P_out) > correction_skip_rel_tol * P_in
-                or abs(T_corr - T_out) > correction_skip_rel_tol * T_in):
-            _safe_flowstate_update_PT(fs, P_corr, T_corr)
+        # Converged.  The Heun pressure corrector and the authoritative
+        # Newton-on-T energy step were already applied inside the splitter
+        # block above (so the energy criterion could be judged on the
+        # corrected state), and fs.AS already sits at that corrected outlet
+        # state -- nothing more to do here.  Derivation of the corrector:
+        #   P_corr = P_in + dL*(dPdL_in + dPdL_out)/2   (trapezoidal in dP/dL)
+        #   T_corr from H_stagnation conservation, one Newton step:
+        #     error(P,T) = H_stagnation_out_target - [H(P,T) + v(P,T)^2/2]
+        #     d(H_calc)/dT|_P = Cp - mdot^2/(A^2*rho^3)*(drho/dT)_P
+        #     d(H_calc)/dP|_T = (dH/dP)_T - v^2/rho*(drho/dP)_T
+        #   with the dP cross-term carrying P from the Euler trial P_out to the
+        #   Heun P_corr while the derivatives stay anchored at the trial state.
 
     else:
         #For the isothermal case, we know the outlet temperature but need to estimate the outlet pressure.
@@ -3402,40 +3439,74 @@ def _solve_mdot_for_outlet_P(
         # bracket failures; the log-spaced tail (0.1 -> 0.001) covers
         # long pipe segments whose true Fanno choke is orders of
         # magnitude below the ideal-gas G_max * A_min initial bound.
+        #
+        # Returns (mdot_feasible, residual, mdot_fail) where mdot_fail is
+        # the lowest mdot at which the kernel raised during the retreat
+        # (None if nothing failed).  Because the ladder descends, the last
+        # failure before the first success is the smallest failing mdot --
+        # a tight upper bound on the feasible region (~ the Fanno choke),
+        # used below to search the narrow feasible band the loose ideal-gas
+        # mdot_choked overshoots.
+        mdot_fail = None
         for shrink in (1.0, 0.9, 0.8, 0.6, 0.4, 0.2,
                        0.1, 0.03, 0.01, 0.003, 0.001):
             mdot_t = mdot_try * shrink
             if mdot_t <= mdot_lo:
                 break
             try:
-                return mdot_t, residual(mdot_t)
+                return mdot_t, residual(mdot_t), mdot_fail
             except (ChokedFlowError, RuntimeError, ValueError):
+                mdot_fail = mdot_t
                 continue
         raise RuntimeError(
             f"{caller_name}: kernel failed at every retreated upper bracket "
             f"between {mdot_lo:.4g} and {mdot_try:.4g} kg/s."
         )
 
-    mdot_hi, r_hi = _safe_residual_at(mdot_hi)
+    mdot_hi, r_hi, mdot_fail = _safe_residual_at(mdot_hi)
     r_lo = residual(mdot_lo)
     # If r_hi is still on the same side as r_lo (positive -- need more mdot
-    # to drive fs.P down to P2), the solution sits between mdot_hi and
-    # mdot_choked.  This happens whenever P2 is only slightly above the
-    # choke recovery pressure.  Progressively push the upper bracket
-    # toward mdot_choked until either the sign flips or the kernel
-    # consistently fails near choke.
+    # to drive fs.P down to P2), the solution sits above mdot_hi.  This
+    # happens whenever P2 is only slightly above the choke recovery
+    # pressure.  Push the upper bracket up until the sign flips or the
+    # kernel consistently fails near choke.
     if r_lo * r_hi > 0.0 and r_hi > 0.0:
-        for frac in (0.99, 0.999, 0.9999):
-            mdot_try = frac * mdot_choked
-            if mdot_try <= mdot_hi:
-                continue
-            try:
-                r_try = residual(mdot_try)
-            except (ChokedFlowError, RuntimeError, ValueError):
-                break
-            mdot_hi, r_hi = mdot_try, r_try
-            if r_lo * r_hi <= 0.0:
-                break
+        if mdot_fail is not None:
+            # The retreat above already found a feasibility boundary: the
+            # kernel chokes at mdot_fail but integrates at mdot_hi.  The
+            # loose ideal-gas mdot_choked sits *above* that boundary (the
+            # true Fanno choke under wall friction is well below G_max *
+            # A_min), so pushing toward mdot_choked only samples infeasible
+            # points.  Bisect the feasible band [mdot_hi, mdot_fail] instead
+            # to drive mdot_hi up to just below the choke; the root lives
+            # there whenever P2 is just above the choke recovery pressure.
+            mdot_fail_lo = mdot_fail
+            for _ in range(40):
+                if mdot_fail_lo - mdot_hi <= 1e-6 * mdot_fail_lo:
+                    break
+                mdot_mid = 0.5 * (mdot_hi + mdot_fail_lo)
+                try:
+                    r_mid = residual(mdot_mid)
+                except (ChokedFlowError, RuntimeError, ValueError):
+                    mdot_fail_lo = mdot_mid
+                    continue
+                mdot_hi, r_hi = mdot_mid, r_mid
+                if r_lo * r_hi <= 0.0:
+                    break
+        else:
+            # Kernel never failed during the retreat: the loose bound really
+            # is reachable, so push toward mdot_choked as before.
+            for frac in (0.99, 0.999, 0.9999):
+                mdot_try = frac * mdot_choked
+                if mdot_try <= mdot_hi:
+                    continue
+                try:
+                    r_try = residual(mdot_try)
+                except (ChokedFlowError, RuntimeError, ValueError):
+                    break
+                mdot_hi, r_hi = mdot_try, r_try
+                if r_lo * r_hi <= 0.0:
+                    break
     if r_lo * r_hi > 0.0:
         raise RuntimeError(
             f"{caller_name}: failed to bracket the non-choked solution "

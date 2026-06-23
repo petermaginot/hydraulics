@@ -1,0 +1,172 @@
+{
+  "format_version": 1,
+  "regime": "compressible",
+  "nodes": [
+    {
+      "name": "Source/Sink",
+      "elevation_m": 0.0,
+      "P_Pa": 234421.74796772437,
+      "Q_ext": null,
+      "T_K": 310.9277777777778
+    },
+    {
+      "name": "Source/Sink 1",
+      "elevation_m": 0.0,
+      "P_Pa": 101352.93220957494,
+      "Q_ext": null,
+      "T_K": 310.9277777777778
+    }
+  ],
+  "edges": [
+    {
+      "name": "Source/Sink->Source/Sink 1",
+      "from_node": "Source/Sink",
+      "to_node": "Source/Sink 1",
+      "components": [
+        {
+          "kind": "line_segment",
+          "name": "Pipe Segment",
+          "roughness_m": 4.571999999999999e-05,
+          "noncircular": false,
+          "k_wall": null,
+          "profile": [
+            [
+              0.0,
+              0.0,
+              0.013893800000000001,
+              0.0001516114381132832
+            ],
+            [
+              3.0479999999999996,
+              0.0,
+              0.013893800000000001,
+              0.0001516114381132832
+            ]
+          ]
+        },
+        {
+          "kind": "contraction_expansion",
+          "name": "Fitting",
+          "Di_US_m": 0.013893800000000001,
+          "Di_DS_m": 1.27
+        }
+      ]
+    }
+  ],
+  "gui_extras": {
+    "canvas_nodes": [
+      {
+        "id": "0x167ecaad7f0",
+        "name": "Source/Sink",
+        "pos": [
+          0.0,
+          0.0
+        ],
+        "spec": {
+          "type": "source_sink",
+          "P_str": "34",
+          "P_unit": "psi",
+          "Q_str": "",
+          "Q_unit": "mmscf/day",
+          "elev_str": "0",
+          "elev_unit": "ft",
+          "D_str": "",
+          "D_unit": "inch",
+          "T_str": "100",
+          "T_unit": "degF"
+        }
+      },
+      {
+        "id": "0x167ec9379d0",
+        "name": "Pipe Segment",
+        "pos": [
+          305.33803119666953,
+          10.438907049458788
+        ],
+        "spec": {
+          "type": "pipe",
+          "mode": "manual",
+          "ID_str": ".547",
+          "ID_unit": "inch",
+          "OD_str": "",
+          "OD_unit": "inch",
+          "WT_str": "",
+          "WT_unit": "inch",
+          "L_str": "10",
+          "L_unit": "ft",
+          "dz_str": "0",
+          "dz_unit": "ft",
+          "rough_str": "0.00015",
+          "rough_unit": "ft"
+        }
+      },
+      {
+        "id": "0x167ec937d90",
+        "name": "Fitting",
+        "pos": [
+          625.0295595863449,
+          11.287356230691309
+        ],
+        "spec": {
+          "type": "fitting",
+          "fitting_type": "contraction_expansion",
+          "Di_str": "4.026",
+          "Di_unit": "inch",
+          "angle_str": "90",
+          "bend_dias_str": "1.5",
+          "Di_US_str": ".547",
+          "Di_US_unit": "inch",
+          "Di_DS_str": "50",
+          "Di_DS_unit": "inch",
+          "orif_Di_str": "4.026",
+          "orif_Di_unit": "inch",
+          "orif_Do_str": "2.0",
+          "orif_Do_unit": "inch",
+          "orif_taps": "corner",
+          "orif_Cd_override_str": ""
+        }
+      },
+      {
+        "id": "0x167eca91810",
+        "name": "Source/Sink 1",
+        "pos": [
+          897.5820801233748,
+          11.219776001542185
+        ],
+        "spec": {
+          "type": "source_sink",
+          "P_str": "14.7",
+          "P_unit": "psi",
+          "Q_str": "",
+          "Q_unit": "mmscf/day",
+          "elev_str": "0",
+          "elev_unit": "ft",
+          "D_str": "",
+          "D_unit": "inch",
+          "T_str": "100",
+          "T_unit": "degF"
+        }
+      }
+    ],
+    "canvas_connections": [
+      {
+        "from_id": "0x167ecaad7f0",
+        "from_port": "out",
+        "to_id": "0x167ec9379d0",
+        "to_port": "in"
+      },
+      {
+        "from_id": "0x167ec9379d0",
+        "from_port": "out",
+        "to_id": "0x167ec937d90",
+        "to_port": "in"
+      },
+      {
+        "from_id": "0x167ec937d90",
+        "from_port": "out",
+        "to_id": "0x167eca91810",
+        "to_port": "in"
+      }
+    ]
+  }
+}

@@ -1,0 +1,21 @@
+{
+  "regime": "compressible",
+  "converged": true,
+  "nodes": {
+    "Source/Sink": {
+      "P_Pa": 234421.74796772437,
+      "T_K": 310.9277777777778,
+      "Q_ext_kgs": 0.03916490208181801
+    },
+    "Source/Sink 1": {
+      "P_Pa": 101352.93220957494,
+      "T_K": 310.9277777777778,
+      "Q_ext_kgs": -0.03916490208181801
+    }
+  },
+  "edges": {
+    "Source/Sink->Source/Sink 1": {
+      "mdot_kgs": 0.03916490208181801
+    }
+  }
+}
