@@ -127,6 +127,39 @@ flagged this; if it was dismissed, every Source/Sink needs a `T` set
 in the editor before the next solve.  The `_extra_kwargs_for_boundary`
 hook raises a clean error at solve time naming the offending node.
 
+### Compressible: `RuntimeError: ... slice failed to converge after N recursive splits`
+
+Raised by `compressible_pipe_segment` when a slice can't meet the split
+tolerances within `max_split_depth` (default 8).  The message now reports
+`corrected_energy_error` (the energy balance of the Heun+Newton **corrected**
+outlet — what the function returns — not the Euler predictor), alongside
+`dPdL_relchg` and `Ma_change`.  Read which metric is over tolerance:
+
+- **`Ma_change` large and/or the choke hint fires** ("likely choking
+  (Fanno)…"): the flow is genuinely at/near the choke inside that slice.
+  Reduce `mdot`, or accept that this is the segment's Fanno limit.
+- **`corrected_energy_error` and `dPdL_relchg` both just over tolerance, no
+  choke hint**: the slice is *under-resolved*, not choked — typically a coarse
+  single-segment profile (e.g. a 10 ft pipe entered as one ~3 m profile point
+  pair) driven to a strongly-accelerating subsonic regime (Ma ≳ 0.6).  The
+  near-exit slices want more than 8 splits.  Remedy: give the pipe a finer
+  initial `profile` (more points), or raise `max_split_depth`.
+- This is *not* the old spurious failure where the Euler predictor energy error
+  tripped the gate while the corrected state was fine — that false split was
+  fixed (improvements.md R12).  If you see a convergence failure now, treat it
+  as real per the above.
+
+### Compressible: `RuntimeError: ... could not bracket a subsonic root for A/A*=...`
+
+Raised by `compressible_changing_area`.  For a **large expansion** (or an area
+change probed at a tiny trial `mdot` by an inverse / mdot-solve, which makes
+`A/A*` enormous) this is fixed — the outlet is treated as stagnation via a
+deep-subsonic short-circuit (improvements.md R13), so a pipe→huge-expansion
+discharge chain solves headlessly just like the GUI network walk.  If you still
+see this, the `A/A*` in the message is **small (< 1)**, which means a
+**contraction** whose throat would have to go supersonic — i.e. a real choke at
+that area change.  Reduce `mdot` or open up the downstream area.
+
 ### Mass flow is orders of magnitude off expectation
 
 Almost always a unit error:

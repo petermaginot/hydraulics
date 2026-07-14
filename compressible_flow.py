@@ -1264,7 +1264,7 @@ class Orifice(Base_Orifice):
     handled by compressible_dA: isentropic acceleration to the vena-contracta
     throat (area = Cd * A_bore) followed by K-loss entropy recovery to the
     downstream pipe area.  The discharge coefficient Cd is computed via the
-    ISO 5167-2 / Reader-Harris-Gallagher correlation or taken from
+    fluids library's ISO 5167-2 / Reader-Harris-Gallagher correlation or taken from
     Cd_override; the K-factor is derived from Cd via
     fluids.flow_meter.discharge_coefficient_to_K.
 
@@ -1552,7 +1552,7 @@ def _build_phase_limits(AS, verbose=False):
     even though it is clearly in a single phase region. This process helps avoid that error from rearing its head.
 
     The increase in calculation speed is very helpful when you need to perform thousands of abstract state updates to iterate over a 
-    segment or solve a convergence problem. 
+    segment or iterate to solve for flow rate.
 
     This function builds the phase envelope on a temporary abstract state so the working abstract state's internal
     solver state is not corrupted.  CoolProp's build_phase_envelope leaves the AbstractState at the last envelope point it visited; subsequent update()
@@ -2495,7 +2495,7 @@ def compressible_changing_area_K(fs, A_out, K=0.0, e_loss=None,
     else:
         # Near the acceleration-feedback singularity (Ma -> 1, e.g. the
         # subsonic recovery from a sonic throat) the linearization
-        # over-shoots wildly; keep the historical crude correction there.
+        # over-shoots wildly; just use a crude correction in that case.
         dP_K = -e_loss * rho_in
         dT_K = e_loss / Cp_in
     P0 += dP_K
@@ -2947,7 +2947,6 @@ def compressible_pipe_segment(
 
         # We can use the Euler method to estimate the pressure at the end of a length slice dL
 
-
         #First, calculate those oddball partial derivatives
         A = AS.first_partial_deriv(CP.iDmass, CP.iP, CP.iHmass)
         B = AS.first_partial_deriv(CP.iDmass, CP.iHmass, CP.iP)
@@ -3157,7 +3156,7 @@ def compressible_pipe_segment(
         P_out = P_in + dP
         T_out = T_in
 
-        #Next, we will update the abstract state to the calculated outlet conditions. After that, we will evaluate all of the properties and recalculate what dP/dL and dT/dL
+        #Next, we will update the abstract state to the calculated outlet conditions. After that, we will evaluate all of the properties and recalculate what dP/dL
         #would be at the outlet conditions. If it is dramatically different (an energy balance error is greater than energy_tol and the difference in calculated 
         # dP/dL is greater than dPdL_rel_tol), we split the segment in half and re-run the Euler step on each, again checking against the tolerance specs at the end. This is 
         # done recursively as necessary until the errors are smaller than the tolerance and/or we reach the specified number of splits (up to 8 splits/256x reduction in segment length by default)

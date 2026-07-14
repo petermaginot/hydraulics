@@ -919,14 +919,25 @@ def test_Crane_4_22():
     # seg.dmdot_dT(fs, P2)
     # mdot_solved = fs.mdot
 
+    #Next, we need to re-run the solved flow rate to find the pipe exit conditions - we didn't record them the first time around as 
+    # we were solving for the flow rate to match the given outlet pressure.
+
+    _safe_flowstate_update_PT(fs, P0, T0)
+    fs.A    = A_pipe_si
+    fs.z    = 0.0
+    fs.mdot = mdot_solved
+    seg.dP_dT(fs)
+    Ma_pipe_exit = fs.Ma
+    P_pipe_exit  = fs.P
+    T_pipe_exit  = fs.T
+
     ndot = ureg.Quantity(mdot_solved / AS.molar_mass(), 'mol/s').to('scf/min')
     print(f'Calculated flow rate: {ndot:.4e}  '
-          f'(pipe exit P={ureg.Quantity(AS.p(), "Pa").to("psi").magnitude:.1f} psia, '
-          f'T={AS.T():.1f} K, Ma = {fs.Ma})')
+          f'(pipe exit P={ureg.Quantity(P_pipe_exit, "Pa").to("psi").magnitude:.1f} psia, '
+          f'T={T_pipe_exit:.1f} K, Ma = {Ma_pipe_exit:.4f})')
     print('Crane textbook solution: 62.7 scfm')
 
-     
-
+    
 
 if __name__ == "__main__":
 

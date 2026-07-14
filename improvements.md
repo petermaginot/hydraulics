@@ -793,6 +793,21 @@ conditional on demand.
 14. **[polish, tolerance calibration]** `energy_tol = 10 J/kg` is a fixed
     absolute value. Conservative for high-Cp fluids (water vapor), loose
     for low-Cp dense gases. Express as a fraction of v^2/2 or as DT*Cp_in.
+    *Largely defused by R12:* the energy criterion is now measured on the
+    Heun+Newton **corrected** state (O(dL^4) error), not the Euler predictor
+    (O(dL^2)), so the fixed 10 J/kg threshold is no longer the binding gate on
+    high-Mach slices — the dP/dL-change and Mach-change metrics size the slice
+    and the corrected energy error sits orders of magnitude under tol. Scaling
+    the absolute value is now cosmetic rather than load-bearing.
+
+20. **[bug, near-choke false splits] ✅ DONE (R12).** The energy split metric
+    was evaluated on the **Euler predictor** state but the function *returns*
+    the Heun+Newton **corrected** state. On a strongly-accelerating slice
+    (Ma~0.6) the predictor stagnation-enthalpy error (O(dL^2)) could exceed
+    `energy_tol` while the delivered corrected error (O(dL^4)) was ~4600x
+    smaller — forcing recursive splits that exhausted `max_split_depth` and
+    raised a spurious "slice failed to converge" (easily misread as a choke).
+    Fixed: the energy criterion is now judged on the corrected state. See R12.
 
 15. **[polish, perf]** Each split costs one extra CoolProp update to restore
     AS to inlet ([compressible_flow.py:1594](compressible_flow.py#L1594)).
@@ -895,6 +910,47 @@ conditional on demand.
 - **R11 [cheap].** Document the staircase-diameter assumption in
   `Line_Segment.dP_dT` docstring; warn when slices combine friction and
   diameter change.
+
+- **R12 [✅ DONE — corrected-state energy split gate].** `compressible_pipe_segment`
+  now judges the energy split criterion on the Heun+Newton **corrected** outlet
+  state (what it returns, energy-conserving to O(dL^4)) instead of the Euler
+  **predictor** (O(dL^2)). The dP/dL-change and Mach-change metrics still run on
+  the trial state — they gauge whether the inlet-property linearization holds
+  over the slice — but the energy gate is measured on the delivered state. The
+  corrector is hoisted above the split decision and computed only when the cheap
+  gates pass (so a slice that splits on dP/dL or Ma costs no extra flash), and
+  the depth-exceeded message reports `corrected_energy_error`. This removes the
+  spurious "slice failed to converge" raises on strongly-accelerating subsonic
+  slices documented in item 20 (a -10 J/kg predictor error whose corrected error
+  was ~-0.002 J/kg). Non-splitting slices are byte-identical to before (the
+  corrector math is unchanged — only *when* it runs and *what* is compared
+  moved); verified against the five forward/inverse compressible-network
+  self-tests and exercised end-to-end by `test_Crane_4_22` in
+  [textbook_test_functions.py](textbook_test_functions.py).
+
+  **Open follow-on:** near the Fanno choke with a *coarse single-segment*
+  profile (e.g. a 10 ft pipe as one 3 m profile slice), the near-exit slices
+  can still want depth > 8 on **both** the corrected energy and dP/dL gates —
+  i.e. genuinely under-resolved, not a false split. Remedy today is a finer
+  initial profile or a higher `max_split_depth`; auto-refining the initial slice
+  length from the choke diagnostic (R7) would close this.
+
+- **R13 [✅ DONE — large-expansion area-change bracket].** `compressible_changing_area`
+  no longer raises "could not bracket a subsonic root" for very large expansions.
+  Its subsonic Mach root is found by brentq on a fixed `Ma_lo = 1e-9` bracket,
+  which only reaches `A/A* ≲ C/1e-9 ≈ 5.8e8` (air, `C = (2/(γ+1))^((γ+1)/(2(γ-1)))`).
+  A huge expansion — or *any* area change evaluated at a vanishingly small `mdot`
+  (the sonic area `A* ∝ mdot`, so an inverse solver's tiny trial flow blows
+  `A/A*` past `1e13`) — puts the deeply-subsonic root below `Ma_lo`, so both
+  bracket ends shared a sign. Physically the outlet just decelerates to
+  stagnation, so a deep-subsonic short-circuit now returns stagnation-based
+  static conditions (`P_out ≈ P_total`, `T_out ≈ T_total`) when the asymptotic
+  outlet Mach `C/(A/A*) < 1e-6`, skipping the brentq dynamic-range problem at
+  `Ma ~ 1e-14`. The legitimate raise for a choking *contraction* (`A/A* < 1`,
+  small) is preserved. This is why a pipe → huge-expansion chain (the Crane 4-22
+  discharge-to-atmosphere) now solves headlessly exactly as it already did in
+  the GUI network walk, where the forward solve evaluates at a realistic `mdot`
+  and never sees the pathological `A/A*`.
 
 ---
 
