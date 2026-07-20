@@ -1022,3 +1022,27 @@ conditional on demand.
   returned the same value.  See
   `test_compressible_K_choke_roundtrip` in
   [textbook_test_functions.py](textbook_test_functions.py).
+
+- **[cross-cutting, model] Check valves: sealing-K model replaced by a
+  perfect seal. ✅ DONE (2026-07-14).**  The old reverse-flow model (a
+  `K = _SEALING_K ≈ 1e9` shadow via `_reversed_component`) leaked more
+  as reverse ΔP grew — backwards from real check valves, which seat
+  harder at higher reverse differential.  Both solvers now treat a
+  check-valved edge as a complementarity condition passing exactly zero
+  reverse flow: the incompressible solver replaces the edge's pipe
+  equation with a smoothed Fischer-Burmeister row
+  (`_CHECKVALVE_FB_EPS`), the compressible solver detects
+  "CV edge + reverse trial mdot" at walk time and swaps the pipe
+  equation for `mdot / mdot_ref`.  Sealed-edge flows are snapped to
+  exactly 0 in results; post-solve reporting shows the CV holding the
+  full held ΔP; dead-leg nodes isolated behind sealed seats are warned
+  as indeterminate.  Deleted: `_SEALING_K`, the tanh K-blend
+  (`_check_valve_signed_dP`), the two-shot `mdot_init=0` retry,
+  `_SEALED_K_THRESHOLD` / `_sealed_outlet_PT` /
+  `_is_sealed_check_valve` and the clamped sealed-outlet machinery.
+  The previously "over-determined sealed CV" warning case now
+  converges cleanly (see `_test_check_valve_sealed` in
+  [compressible_network.py](compressible_network.py)).  Historical
+  DONE entries above that mention the sealing-K short-circuit describe
+  the pre-2026-07 behavior.  `parallel.py` is out of scope (no CV
+  special-casing; a CV in a parallel branch acts as a plain K fitting).

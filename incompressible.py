@@ -751,8 +751,9 @@ class CheckValve(Base_CheckValve):
 
     Forward flow uses the K-factor stored on the instance (computed from a
     Crane check-valve correlation and passed at construction).  Reverse flow
-    is handled by network._reversed_component, which returns a shadow copy
-    with K = _SEALING_K (≈ 1e9), making the valve act as a near-perfect seal.
+    is a network-level concern: Network.solve treats a check valve as a
+    perfect seal and pins its edge to exactly zero reverse flow via a
+    complementarity residual, so dP()/dmdot() model forward passage only.
 
     Constructor arguments are identical to Base_CheckValve:
         Di : pint Quantity or float (m if float).  Pipe inner diameter.
@@ -764,8 +765,8 @@ class CheckValve(Base_CheckValve):
 
             dP = -K * (1/2) * rho * v^2
 
-        Only called for positive (forward) flow; the network solver invokes a
-        high-K shadow for reverse flow via network._reversed_component().
+        Only called for positive (forward) flow; the network solver seals
+        the edge at exactly zero flow under reverse conditions.
 
         Args:
             fluid     : Incompressible_Fluid instance.
@@ -797,9 +798,8 @@ class CheckValve(Base_CheckValve):
     def dmdot(self, fluid, P_inlet, P_outlet):
         """Forward mass flow rate [kg/s] producing the requested pressure change.
 
-        Analytic inverse of dP() since K is constant.  For the sealing-K
-        reverse-flow shadow (K ~ 1e9 from network._reversed_component),
-        the formula yields mdot ~ 0 gracefully.
+        Analytic inverse of dP() since K is constant.  Forward flow only;
+        reverse conditions are a network-level perfect seal (zero flow).
 
         Args:
             fluid    : Incompressible_Fluid instance.

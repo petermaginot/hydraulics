@@ -207,9 +207,9 @@ class ValveNode(BaseNode):
 class CheckValveNode(BaseNode):
     """Inline check valve that seals on reverse flow.
 
-    Single in + single out.  Forward K from Crane correlations;
-    reverse K = _SEALING_K (handled by _reversed_component in network.py).
-    Result widget set matches PipeSegmentNode.
+    Single in + single out.  Forward K from Crane correlations; reverse
+    flow is blocked exactly (zero flow) by the network solvers'
+    complementarity residual.  Result widget set matches PipeSegmentNode.
     """
     __identifier__ = "pipe"
     NODE_NAME = "Check Valve"

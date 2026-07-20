@@ -966,56 +966,16 @@ class Valve(Base_Valve):
             raise ChokedFlowError(*choke) from exc
 
 
-# When network._reversed_component substitutes K = _SEALING_K (~ 1e9) on a
-# check-valve copy for a reverse-flow walk, the inertial compressible_K()
-# formula drives P_out and T_out to nonsense values (~ -5e9 Pa) that
-# CoolProp can't update against.  CheckValve.dP_dT short-circuits to a
-# clamped sealed-state outlet whenever K >= _SEALED_K_THRESHOLD: P_out is
-# pulled to _SEALED_P_OUT_FRACTION * P_in (floored at _SEALED_P_FLOOR_PA so
-# downstream components on the same edge don't see a sub-triple-point
-# state), T_out is left at T_in.  The big walked_outlet_P - P_node residual
-# still drives the network solver back toward mdot >= 0.
-_SEALED_K_THRESHOLD     = 1.0e6   # K above this is taken to be the sealing shadow
-_SEALED_P_OUT_FRACTION  = 0.5     # outlet P as fraction of inlet P
-_SEALED_P_FLOOR_PA      = 1.0e5   # absolute floor on outlet P [Pa]
-
-
-def _is_sealed_check_valve(component):
-    """True if `component` is a check-valve shadow carrying the sealing K
-    (substituted by network._reversed_component for reverse flow).  Used by
-    the compressible network walk to short-circuit any edge whose path
-    contains a sealed CV: walking downstream components at the clamped
-    sealed-state outlet (P pulled to a fraction of inlet P) puts them into
-    a low-density / high-velocity regime where compressible_pipe_segment
-    can fail to converge.
-    """
-    return (
-        getattr(component, "check_valve", False)
-        and getattr(component, "K", 0.0) >= _SEALED_K_THRESHOLD
-    )
-
-
-def _sealed_outlet_PT(P_in, T_in):
-    """Return (P_out, T_out) for a sealed-edge clamped outlet state.
-
-    Used by both CheckValve.dP_dT and the compressible network walk so the
-    clamp formula lives in exactly one place.
-    """
-    return (max(_SEALED_P_OUT_FRACTION * P_in, _SEALED_P_FLOOR_PA), T_in)
-
-
 class CheckValve(Base_CheckValve):
     """Check valve with compressible pressure/temperature calculation.
 
     Forward flow uses the K-factor stored on the instance and dispatches to
     either compressible_changing_area_K() (no constriction) or
     compressible_dA() (constriction at the trim), mirroring Valve.dP_dT.
-    Reverse flow is handled upstream by network._reversed_component, which
-    returns a shallow copy with K replaced by _SEALING_K (~ 1e9); dP_dT()
-    detects that case (K >= _SEALED_K_THRESHOLD) and short-circuits to a
-    clamped sealed-state outlet instead of running the forward-flow path,
-    which would otherwise produce an unphysical negative P_out that crashes
-    CoolProp.
+    Reverse flow is a network-level concern: Compressible_Network treats a
+    check valve as a perfect seal and pins the edge's mass flow to exactly
+    zero, so dP_dT()/dmdot_dT() model forward passage only and are never
+    invoked under sustained reverse conditions.
 
     Constructor arguments are identical to Base_CheckValve:
         Di : pint Quantity or float (m if float).  Pipe inner diameter.
@@ -1026,12 +986,8 @@ class CheckValve(Base_CheckValve):
         """Outlet conditions for a compressible fluid passing through the
         check valve.
 
-        Reverse flow (sealing K substituted by _reversed_component) is
-        short-circuited to a clamped sealed-state outlet, see module-level
-        _SEALED_* constants.
-
-        Forward flow (physical K) absorbs any inlet-area discontinuity, then
-        dispatches on whether the check valve carries a geometric constriction:
+        Absorbs any inlet-area discontinuity, then dispatches on whether
+        the check valve carries a geometric constriction:
 
           * No constriction (``minimum_diameter`` is None or equal to ``Di``):
             delegates to compressible_changing_area_K() with A_out = A_pipe.
@@ -1049,11 +1005,6 @@ class CheckValve(Base_CheckValve):
         Returns:
             None.  fs is mutated in place.
         """
-        if self.K >= _SEALED_K_THRESHOLD:
-            P_out, T_out = _sealed_outlet_PT(fs.AS.p(), fs.AS.T())
-            _safe_flowstate_update_PT(fs, P_out, T_out)
-            return
-
         A_pipe = math.pi * self.Di_si ** 2 / 4.0
         _area_match(fs, A_pipe)
 
@@ -1067,12 +1018,9 @@ class CheckValve(Base_CheckValve):
         """Inverse of dP_dT for the check valve: solve for the mass flow
         rate that produces outlet pressure P2.
 
-        Mirrors Valve.dmdot_dT exactly on the forward-flow branches.  The
-        sealed-K short-circuit (used by network._reversed_component for
-        reverse flow) has no inverse -- a sealed valve passes no flow at
-        any P2 -- so this method raises ValueError when invoked on a
-        sealed shadow.  The network solver does not currently call
-        dmdot_dT on reversed shadows; the guard is defensive.
+        Mirrors Valve.dmdot_dT exactly.  Reverse conditions (P2 above the
+        inlet pressure) are a network-level concern -- the solver seals the
+        edge at zero flow before ever inverting the valve.
 
         Args:
             fs : FlowState at the upstream connection (static).  fs.AS
@@ -1084,16 +1032,9 @@ class CheckValve(Base_CheckValve):
             None.  fs is mutated in place.
 
         Raises:
-            ValueError      : on a sealed-K shadow, or for the same
-                              conditions as Valve.dmdot_dT.
+            ValueError      : for the same conditions as Valve.dmdot_dT.
             ChokedFlowError : if P2 is below the component's choke limit.
         """
-        if self.K >= _SEALED_K_THRESHOLD:
-            raise ValueError(
-                "CheckValve.dmdot_dT: undefined for sealed check valve "
-                "(K >= _SEALED_K_THRESHOLD); reverse-flow handling is "
-                "governed at the network level."
-            )
         # Forward-flow inversion is identical to Valve.dmdot_dT.
         Valve.dmdot_dT(self, fs, P2)
 

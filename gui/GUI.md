@@ -117,7 +117,7 @@ A P&ID-style canvas driven by `NodeGraphQt`. Six node families plus connecting e
 - **`PipeSegmentNode`** — inline pipe segment with geometry. Strict single-input + single-output ports (no branching) — branching happens at junction nodes.
 - **`FittingNode`** — inline bend or sudden contraction/expansion.
 - **`ValveNode`** — inline valve (globe / gate / plug / ball / butterfly), K-factor computed from Crane correlations at solve time.
-- **`CheckValveNode`** — inline check valve (swing / lift / tilting-disk / angle-stop / globe-stop), again K from Crane. Reverse flow is handled by `_reversed_component` in [network.py](network.py), which substitutes `K = _SEALING_K ≈ 1e9` so the valve seals.
+- **`CheckValveNode`** — inline check valve (swing / lift / tilting-disk / angle-stop / globe-stop), again K from Crane. Seals perfectly on reverse flow: the network solvers pin a check-valved edge to exactly zero reverse flow (complementarity residual — see [network.md](network.md) § "Reverse-flow handling").
 
 The four inline node types each carry the same set of result widgets, stacked top-to-bottom: a primary readout (`dP` for incompressible, outlet `P` for compressible — the field is reused rather than renamed to keep serialized graphs portable), `T` (compressible only), and signed flow.
 

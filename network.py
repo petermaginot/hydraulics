@@ -37,12 +37,17 @@ Equations:
            sum of (signed) edge flows entering the node + Q_ext_spec = 0.
        Q_ext_spec defaults to 0 for interior junctions.
 
+    -- Complementarity row per check-valve edge: an edge carrying a
+       component with check_valve = True replaces its pipe equation with a
+       smoothed Fischer-Burmeister function of (mdot, reverse driving
+       pressure), whose root is either "open, pressure balance holds" or
+       "sealed, mdot = 0".  A check valve therefore passes exactly zero
+       reverse flow.  See the comment at _CHECKVALVE_FB_EPS for the math.
+
 The system is solved with scipy.optimize.least_squares using the Trust
 Region Reflective method, with x_scale='jac' for automatic unknown-scale
-normalization.  TRF handles the ill-conditioning that comes from mixing
-tiny check-valve dP terms with much larger pipe dP terms on the same
-edge set -- something fsolve's Powell hybrid does not.  After convergence,
-the external flow at each P-spec node is recovered from its mass balance.
+normalization.  After convergence, the external flow at each P-spec node
+is recovered from its mass balance.
 
 Reverse-flow handling
 ---------------------
@@ -57,13 +62,10 @@ convention.  Reversing means:
        volume_m3) follow automatically from the new profile.
     -- Contraction_Expansion: Di_US and Di_DS are swapped, turning a
        contraction into an expansion and vice versa.
-    -- CheckValve: K is replaced with _SEALING_K, so a reversed valve
-       presents near-infinite resistance.  Inside the residual function
-       the K-factor is actually blended smoothly across Q=0 via tanh
-       (see _check_valve_signed_dP) so that fsolve can step across the
-       open<->sealed transition.  The discrete K_seal substitution is
-       still used by the post-solve ComponentResult walk, where there is
-       no Newton iteration to confuse.
+    -- CheckValve: treated as symmetric for dP evaluation (forward K at
+       |Q|).  Sealing is not modeled as a resistance at all: the edge's
+       complementarity residual forbids any negative-mdot solution, so a
+       check valve passes exactly zero reverse flow.
     -- Bend and Valve: symmetric, returned unchanged.
 This reverses the actual geometry rather than applying a sign(Q) flip on
 the friction term, so K-factor asymmetries (sharp contraction vs sharp
@@ -122,22 +124,25 @@ _G = 9.8066   # m/s^2
 # to avoid the friction_factor(Re=0) singularity and to keep the residual
 # function smooth for Newton's method.
 _Q_LIN_EPS  = 1e-9
-_SEALING_K  = 1e9   # K-factor for a check valve in its sealed (reverse) state
 
-# Two scales for the check-valve regularization (m^3/s):
-#   Q_SCALE -- width of the tanh blend that swings K(Q) between K_fwd and
-#              _SEALING_K.  Without it the K-factor steps by ~9 orders of
-#              magnitude at Q=0.
-#   Q_REG   -- regularization scale that turns |Q| into sqrt(Q^2 + Q_REG^2)
-#              in the velocity-head term.  Without it d(signed_dP)/dQ is
-#              zero at Q=0 (the Q*|Q| factor has zero slope there) and
-#              fsolve sees no gradient telling it which way to step across
-#              the open<->sealed transition.
-# Both are picked well below the converged sealed-flow magnitude for typical
-# pipe sizes / back-pressures, so the saturated regions match the discrete
-# reversed-shadow physics to within a few percent.
-_CHECKVALVE_Q_SCALE = 1e-7
-_CHECKVALVE_Q_REG   = 1e-7
+# Smoothing constant for the check-valve complementarity residual.  A
+# check-valve edge replaces its pipe equation with the smoothed
+# Fischer-Burmeister function
+#
+#     phi(a, b) = a + b - sqrt(a^2 + b^2 + eps^2)
+#
+# where a = mdot/mdot_ref (dimensionless flow) and b = -r_P/P_ref
+# (dimensionless reverse driving pressure, r_P being the ordinary
+# pipe-equation residual).  Its zero set is the hyperbola a*b = eps^2/2
+# with a, b > 0: either "open" (a > 0, pressure balance holds to
+# ~eps^2/(2a) * P_ref) or "sealed" (b > 0, residual leak ~eps^2/(2b)
+# * mdot_ref -- which SHRINKS as reverse dP grows, matching real valve
+# behavior).  phi < 0 strictly for any a < 0, so no backflow root exists.
+# eps must sit well above least_squares' relative FD step (~1.5e-8) so
+# the finite-difference Jacobian resolves the corner; 1e-6 leaves the
+# worst-case leak at ~7e-7 * mdot_ref, which is snapped to exactly 0 in
+# the results.
+_CHECKVALVE_FB_EPS = 1e-6
 
 
 # ---------------------------------------------------------------------------
@@ -204,11 +209,11 @@ def _reversed_component(component):
         -- `.Di_US_si` and `.Di_DS_si` attributes => Contraction_Expansion-like.
            The two diameters are swapped, so a contraction becomes an
            expansion and vice versa.
-        -- `.check_valve` attribute is True => check valve.  A shallow copy
-           is returned with K replaced by _SEALING_K so reverse flow sees
-           an effectively infinite resistance.
-        -- otherwise the component is taken to be symmetric (Bend, Valve)
-           and returned unchanged.
+        -- otherwise the component is taken to be symmetric (Bend, Valve,
+           CheckValve) and returned unchanged.  A check valve never sees
+           sustained reverse flow -- the edge's complementarity residual
+           pins mdot to zero -- so its forward K is fine for the trial
+           evaluations the solver makes at negative mdot.
 
     Uses copy.copy (shallow) so the reversed shadow shares everything other
     than the rebuilt geometry with the original.
@@ -227,44 +232,17 @@ def _reversed_component(component):
         rev.Di_US_si, rev.Di_DS_si = component.Di_DS_si, component.Di_US_si
         return rev
 
-    if getattr(component, "check_valve", False):
-        rev = copy.copy(component)
-        rev.K = _SEALING_K
-        return rev
-
-    return component   # symmetric -- Bend, Valve, anything else
+    return component   # symmetric -- Bend, Valve, CheckValve, anything else
 
 
-def _check_valve_signed_dP(cv, fluid, Q_si):
-    """Signed inlet-to-outlet dP for a check valve, regularized through Q=0.
+def _fischer_burmeister(a, b, eps=_CHECKVALVE_FB_EPS):
+    """Smoothed Fischer-Burmeister complementarity function.
 
-    Conceptually the check valve has two K-factors -- K_fwd in forward flow
-    and _SEALING_K in reverse -- realized in the rest of the code by the
-    reversed-geometry pattern that swaps in a high-K shadow under reverse
-    flow.  Used directly, that step at Q=0 spans nine orders of magnitude
-    and is paired with a v^2 velocity-head term whose slope is zero at v=0,
-    so fsolve's Newton iteration sees no gradient telling it how to step
-    across the open<->sealed transition.  Two regularizations fix this:
-
-        K(Q)   = K_fwd + (K_seal - K_fwd) * (1 - tanh(Q / Q_scale)) / 2
-        signed_dP(Q) = -K(Q) * 0.5 * rho * Q * sqrt(Q^2 + Q_reg^2) / A^2
-
-    For |Q| >> max(Q_scale, Q_reg) this saturates to the discrete model
-    (K_fwd*0.5*rho*v^2 forward, K_seal*0.5*rho*v^2 reverse), so converged
-    flows in the open or sealed regimes match it to a few percent.  At
-    Q=0 the slope is -K(0)*0.5*rho*Q_reg/A^2, finite and negative -- fsolve
-    can step into the reverse regime when the back-pressure demands it.
-
-    Returns the signed inlet-to-outlet dP in the same convention as
-    _component_signed_dP: negative for a forward friction loss, positive
-    when the valve is sealed against a reverse-flow pressure differential.
+    Zero iff (approximately) a >= 0, b >= 0 and a*b = eps^2/2.  Used as
+    the residual row for check-valve edges; see the _CHECKVALVE_FB_EPS
+    comment for the derivation and leak analysis.
     """
-    rho = fluid.density_si
-    A   = np.pi * cv.Di_si ** 2 / 4.0
-    K_fwd  = cv.K
-    K_seal = _SEALING_K
-    K = K_fwd + (K_seal - K_fwd) * 0.5 * (1.0 - np.tanh(Q_si / _CHECKVALVE_Q_SCALE))
-    return -K * 0.5 * rho * Q_si * np.sqrt(Q_si * Q_si + _CHECKVALVE_Q_REG ** 2) / (A * A)
+    return a + b - math.sqrt(a * a + b * b + eps * eps)
 
 
 def _component_signed_dP(component, fluid, Q_si, reversed_cache):
@@ -277,10 +255,9 @@ def _component_signed_dP(component, fluid, Q_si, reversed_cache):
     physical state.  Negating restores the answer to the forward
     inlet-to-outlet convention.
 
-    Check valves take a separate path (`_check_valve_signed_dP`) that
-    blends K_fwd and _SEALING_K smoothly across Q=0, because the discrete
-    step would otherwise put a 9-order-of-magnitude slope discontinuity in
-    front of fsolve.
+    Check valves are evaluated like any other symmetric component (forward
+    K at |Q|); their sealing is enforced by the edge-level complementarity
+    residual in solve(), not by a resistance here.
 
     For |Q| <= _Q_LIN_EPS, friction is linearized through zero to avoid the
     friction_factor(Re=0) singularity and to keep the residual smooth.  The
@@ -299,9 +276,6 @@ def _component_signed_dP(component, fluid, Q_si, reversed_cache):
     Returns:
         float, signed inlet-to-outlet dP [Pa].
     """
-    if getattr(component, "check_valve", False):
-        return _check_valve_signed_dP(component, fluid, Q_si)
-
     aQ = abs(Q_si)
 
     if aQ <= _Q_LIN_EPS:
@@ -320,9 +294,9 @@ def _component_signed_dP(component, fluid, Q_si, reversed_cache):
             return friction_probe * (aQ / Q_probe) + elev_part
         else:
             # Reverse probe -- use the reversed shadow so that asymmetric
-            # components (check valves) carry their reverse K even inside the
-            # linearization region.  This removes the derivative discontinuity
-            # at Q = -_Q_LIN_EPS that would otherwise confuse fsolve.
+            # components (contractions, sloped segments) carry their reverse
+            # geometry even inside the linearization region.  This removes
+            # the derivative discontinuity at Q = -_Q_LIN_EPS.
             #
             # For a reversed Line_Segment, net_elevation_change_m flips sign,
             # so rev_elev_part = -elev_part.  Therefore:
@@ -724,9 +698,9 @@ class Network:
         Trust the residual norm, not least_squares' status code: a status
         of 2 ("ftol below threshold") or 3 ("xtol below threshold") can
         fire when the trust region collapsed without driving the residual
-        toward zero (typically a check-valve edge stuck on the wrong side
-        of its sealed transition).  Conversely, status -1 / 0 with a tiny
-        residual still counts as success.
+        toward zero (an infeasible boundary-condition set, for example).
+        Conversely, status -1 / 0 with a tiny residual still counts as
+        success.
         """
         residual_norm = float(np.linalg.norm(result_obj.fun))
         converged = residual_norm < 1e-4
@@ -864,6 +838,18 @@ class Network:
         # Lazy cache of reversed shadow components keyed by id(original).
         reversed_cache = {}
 
+        # Check-valve edges swap their pipe equation for a complementarity
+        # row; see the _CHECKVALVE_FB_EPS comment.  Scales make both FB
+        # arguments O(1) around the solution.
+        edge_has_cv = [
+            any(getattr(c, "check_valve", False) for c in e.components)
+            for e in self._edges
+        ]
+        # Floored so an explicit mdot_init_kgs=0 (a legitimate starting
+        # guess) cannot degenerate the FB row scaling.
+        mdot_ref = max(abs(float(mdot_init_kgs)), 1e-3)
+        P_ref    = max(abs(float(P_init)), 1.0)
+
         def unpack(x):
             P = P_template.copy()
             P[free_indices] = x[:n_free]
@@ -889,58 +875,75 @@ class Network:
                     _component_signed_dP(c, fluid, Q_si, reversed_cache)
                     for c in edge.components
                 )
-                res[n_free + e_idx] = (P[i_from] - P[i_to]) + dP_io
+                r_P = (P[i_from] - P[i_to]) + dP_io
+                if edge_has_cv[e_idx]:
+                    # Complementarity: open (r_P = 0) or sealed (mdot = 0).
+                    res[n_free + e_idx] = _fischer_burmeister(
+                        mdot_e[e_idx] / mdot_ref, -r_P / P_ref,
+                    )
+                else:
+                    res[n_free + e_idx] = r_P
 
             return res
 
-        def _attempt(mdot_init_arr):
-            x0 = np.concatenate([
-                np.full(n_free, float(P_init)),
-                mdot_init_arr,
-            ])
-            # least_squares(method='trf') auto-scales unknowns via x_scale='jac'
-            # and handles the ill-conditioning that comes from mixing tiny
-            # check-valve dP with much larger pipe dP on the same edge set.
-            # fsolve's Powell hybrid handled the existing tests fine but
-            # stalled on any topology where the trust region needed to push a
-            # check valve from forward into its sealed-reverse regime.
-            return least_squares(
-                residuals, x0, method="trf", x_scale="jac",
-                xtol=xtol * 1e-4, ftol=xtol * 1e-4, gtol=xtol * 1e-4,
-                max_nfev=maxfev,
-            )
-
-        # First attempt: scale-matched initial flow on every edge.
-        mdot_init_default = np.full(n_edges, float(mdot_init_kgs))
-        result_obj = _attempt(mdot_init_default)
+        x0 = np.concatenate([
+            np.full(n_free, float(P_init)),
+            np.full(n_edges, float(mdot_init_kgs)),
+        ])
+        # least_squares(method='trf') auto-scales unknowns via x_scale='jac'.
+        # fsolve's Powell hybrid handled simple tests fine but stalls on
+        # mixed-scale systems (Pa pressure rows next to kg/s mass rows and
+        # O(1) check-valve complementarity rows).
+        result_obj = least_squares(
+            residuals, x0, method="trf", x_scale="jac",
+            xtol=xtol * 1e-4, ftol=xtol * 1e-4, gtol=xtol * 1e-4,
+            max_nfev=maxfev,
+        )
         sol = result_obj.x
-        fvec = result_obj.fun
-        residual_norm_first = float(np.linalg.norm(fvec))
-
-        # Fallback for check-valve networks: if the first attempt left a
-        # large residual (typical when the initial guess put a CV on the
-        # wrong side of its sealed transition), retry with mdot_init=0 on
-        # every CV-containing edge.  Inside the regularized
-        # _check_valve_signed_dP the Jacobian at mdot=0 sees a finite slope
-        # into the sealed regime, so the first TRF step picks the right
-        # sign of flow.  Other edges keep the scale-matched guess.
-        cv_edge_indices = [
-            i for i, e in enumerate(self._edges)
-            if any(getattr(c, "check_valve", False) for c in e.components)
-        ]
-        if cv_edge_indices and residual_norm_first > 1e-4:
-            mdot_init_cv = mdot_init_default.copy()
-            for i in cv_edge_indices:
-                mdot_init_cv[i] = 0.0
-            result_b = _attempt(mdot_init_cv)
-            if float(np.linalg.norm(result_b.fun)) < residual_norm_first:
-                result_obj = result_b
-                sol = result_obj.x
-                fvec = result_obj.fun
 
         converged = self._report_convergence(result_obj, verbose)
 
         P_arr, mdot_arr = unpack(sol)
+
+        # A sealed check-valve edge converges to the FB residual leak
+        # (~eps^2/2 * mdot_ref) rather than exactly zero; snap it so users
+        # see zero reverse flow, period.  Done before Q_ext recovery so the
+        # recovered externals stay consistent with the reported edge flows.
+        for e_idx in range(n_edges):
+            if edge_has_cv[e_idx] and mdot_arr[e_idx] < 1e-6 * mdot_ref:
+                mdot_arr[e_idx] = 0.0
+
+        # A sealed CV edge's FB row is satisfied for any pressure on its
+        # blocked side, so a free node connected to the P-spec'd part of
+        # the network only through sealed seats has no equation pinning
+        # its pressure -- the solver leaves whatever the iteration landed
+        # on.  Flag those nodes rather than reporting the number as real.
+        sealed_edges = {
+            e_idx for e_idx in range(n_edges)
+            if edge_has_cv[e_idx] and mdot_arr[e_idx] == 0.0
+        }
+        if sealed_edges:
+            reachable = set(p_spec_indices)
+            frontier = list(reachable)
+            while frontier:
+                i = frontier.pop()
+                for e_idx, _sign in adj[i]:
+                    if e_idx in sealed_edges:
+                        continue
+                    edge = self._edges[e_idx]
+                    for j in (idx_of[edge.from_node], idx_of[edge.to_node]):
+                        if j not in reachable:
+                            reachable.add(j)
+                            frontier.append(j)
+            for i in free_indices:
+                if i not in reachable:
+                    warnings.warn(
+                        f"Network.solve: node {node_names[i]!r} is isolated "
+                        f"behind sealed check valve(s); its reported "
+                        f"pressure is indeterminate.",
+                        stacklevel=2,
+                    )
+
         mdot_ext_out = self._recover_pspec_mdot_ext(
             mdot_arr, adj, mdot_ext_spec, node_names,
         )
@@ -1448,35 +1451,55 @@ class ComponentResult:
         self._compute_endpoint_pressures()
 
     def _compute_endpoint_pressures(self):
-        """Walk the edge's components in flow direction, accumulating P, and
-        record P_in / P_out for this component."""
+        """Walk the edge's components in nominal order, accumulating P, and
+        record flow-direction-aligned P_in / P_out for this component.
+
+        Uses _component_signed_dP (the residual's own evaluator), which
+        handles reversal and linearizes friction through Q=0, so a sealed
+        check-valve edge at mdot = 0 walks safely (elevation-only dP).
+
+        On an edge carrying a check valve, the chain of component dPs does
+        not land exactly on the solved to_node pressure: sealed, the valve
+        holds the whole imbalance; open, an eps-sized complementarity slack
+        remains.  The first check valve absorbs that imbalance, so a sealed
+        CV visibly carries the full held dP while every other component
+        shows its ordinary (at mdot = 0, elevation-only) dP.  With several
+        CVs in series the whole balance lands on the first one -- which one
+        holds it is indeterminate physics anyway.
+        """
         mdot = self._result["mdot_kgs"][self._edge.name]
         fluid = self._result.fluid
+        Q_si = mdot / fluid.density_si
+        P_from = self._result["P_Pa"][self._edge.from_node]
+        P_to   = self._result["P_Pa"][self._edge.to_node]
 
-        if mdot >= 0.0:
-            comps_in_flow_order = list(self._edge.components)
-            P_running = self._result["P_Pa"][self._edge.from_node]
-        else:
-            comps_in_flow_order = list(reversed(self._edge.components))
-            P_running = self._result["P_Pa"][self._edge.to_node]
+        cache = {}
+        dPs = [
+            _component_signed_dP(c, fluid, Q_si, cache)
+            for c in self._edge.components
+        ]
 
-        abs_mdot_qty = ureg.Quantity(abs(mdot), "kg/s")
-        for c in comps_in_flow_order:
-            P_in_c = P_running
-            if mdot >= 0.0:
-                dP = c.dP(fluid, flow_rate=abs_mdot_qty)
-            else:
-                # Reverse flow: evaluate the component's reversed shadow at
-                # +|mdot|, which gives the dP in flow direction directly.
-                rev = _reversed_component(c)
-                dP = rev.dP(fluid, flow_rate=abs_mdot_qty)
-            P_out_c = P_in_c + dP
+        cv_pos = next(
+            (i for i, c in enumerate(self._edge.components)
+             if getattr(c, "check_valve", False)),
+            None,
+        )
+        if cv_pos is not None:
+            r_P = (P_from - P_to) + sum(dPs)
+            dPs[cv_pos] -= r_P
 
+        P_running = P_from
+        for c, dP in zip(self._edge.components, dPs):
+            P_nom_in  = P_running
+            P_nom_out = P_running + dP
             if c is self._component:
-                self.P_in_Pa = P_in_c
-                self.P_out_Pa = P_out_c
+                # At mdot = 0 the direction is noise; treat as forward.
+                if mdot >= 0.0:
+                    self.P_in_Pa, self.P_out_Pa = P_nom_in, P_nom_out
+                else:
+                    self.P_in_Pa, self.P_out_Pa = P_nom_out, P_nom_in
                 return
-            P_running = P_out_c
+            P_running = P_nom_out
 
         raise RuntimeError(
             "ComponentResult: walked past every component without finding the "
@@ -1530,6 +1553,10 @@ class ComponentResult:
         distance_m runs from 0 at the flow inlet (= component's nominal
         outlet) to total_length_m at the flow outlet (= component's nominal
         inlet).
+
+        At (near-)zero flow -- a segment behind a sealed check valve --
+        the rows are synthesized as hydrostatic-only (v = 0), since the
+        friction-factor machinery is singular at Re = 0.
         """
         if not hasattr(self._component, "pressure_profile"):
             raise AttributeError(
@@ -1538,6 +1565,18 @@ class ComponentResult:
                 f"distance-resolved profiles."
             )
         mdot = self.mdot_kgs
+        rho = self._result.fluid.density_si
+        if abs(mdot) / rho < _Q_LIN_EPS:
+            z0 = self._component.profile[0][1]
+            return [
+                {
+                    "distance_m": dist,
+                    "elevation_m": elev,
+                    "P_Pa": self.P_in_Pa - rho * _G * (elev - z0),
+                    "v_ms": 0.0,
+                }
+                for (dist, elev, _dh, _area) in self._component.profile
+            ]
         abs_mdot_qty = ureg.Quantity(abs(mdot), "kg/s")
         target = self._component if mdot >= 0.0 else _reversed_component(self._component)
         return target.pressure_profile(
@@ -1944,15 +1983,13 @@ def _test_query_api():
 
 
 def _test_check_valve_forward_and_sealed():
-    """Check valve: forward flow uses K_fwd; back-pressure produces a sealed solve.
+    """Check valve: forward flow uses K_fwd; back-pressure seals exactly.
 
-    The sealed case is the scenario from the GUI screenshot -- both ends are
-    P-spec'd with P_to > P_from on the check-valve edge, so the natural
-    pressure drive is reverse, but the valve must block.  Without the
-    K-factor regularization + two-shot init fallback added for the check
-    valve, the TRF solver cannot cross from a positive initial guess into
-    the sealed-reverse regime (the K=1e9 wall produces a residual the
-    trust region rejects).  Tests both forward and sealed behaviour.
+    The sealed case is the scenario from the GUI screenshot -- both ends
+    are P-spec'd with P_to > P_from on the check-valve edge, so the natural
+    pressure drive is reverse, but the valve must block.  With the
+    perfect-seal complementarity residual the sealed edge reports exactly
+    zero flow (post-snap) and the solve converges with zero residual.
     """
     import fluids.fittings
     from incompressible import CheckValve, Incompressible_Fluid, Line_Segment
@@ -1988,27 +2025,63 @@ def _test_check_valve_forward_and_sealed():
     assert Q_f > 0.0
     assert abs(dP_psi - dP_direct) < 1e-4
 
-    # --- sealed: back-pressure with both ends P-spec'd (GUI screenshot scenario).
+    # --- open CV solved from mdot_init_kgs=0: the worst starting point for
+    #     the FB row (exactly on the open<->sealed corner).  The smoothing
+    #     eps must let TRF step onto the open branch.
+    res_f0 = net_f.solve(fluid, mdot_init_kgs=0.0)
+    Q_f0 = res_f0["Q_m3s"]["CV"]
+    print(f"[check-valve-fwd0] Q = {Q_f0 * bpd:+.2f} BPD (from mdot_init=0)")
+    assert res_f0.converged
+    assert abs(Q_f0 - Q_f) < 1e-9
+
+    # --- sealed: back-pressure with both ends P-spec'd (GUI screenshot
+    #     scenario).  Perfect seal: exactly zero flow.
     net_s = Network()
     net_s.add_node("A", P=ureg.Quantity(100.0, "psi"))
     net_s.add_node("B", P=ureg.Quantity(100.1, "psi"))
     net_s.add_edge("CV", "A", "B", cv)
     res_s = net_s.solve(fluid)
     Q_s = res_s["Q_m3s"]["CV"]
-    print(
-        f"[check-valve-seal] Q = {Q_s * bpd:+.4e} BPD  "
-        f"(sealed; |Q| should be << any open-valve flow)"
-    )
+    print(f"[check-valve-seal] Q = {Q_s * bpd:+.4e} BPD  (sealed; exact zero)")
     assert res_s.converged
-    assert Q_s < 0.0
-    assert abs(Q_s) < 1e-5, f"sealed CV leakage too high: |Q|={abs(Q_s):.2e} m^3/s"
+    assert Q_s == 0.0, f"sealed CV leaked: Q={Q_s:.2e} m^3/s"
+
+    # --- sealed ComponentResult semantics: on a [pipe, cv] edge held shut
+    #     by back-pressure, the pipe shows a zero (elevation-only) dP and
+    #     the check valve holds the entire imbalance; the pipe's pressure
+    #     profile is flat at zero flow.
+    pipe_s = Line_Segment(
+        roughness=ureg.Quantity(0.00015, "ft"),
+        id_val=D_q,
+        length=ureg.Quantity(500.0, "ft"),
+        elevation_change=ureg.Quantity(0.0, "ft"),
+        name="pipe_s",
+    )
+    cv_s = CheckValve(Di=D_q, K=K_fwd, name="CV_s")
+    net_pc = Network()
+    net_pc.add_node("A", P=ureg.Quantity(100.0, "psi"))
+    net_pc.add_node("B", P=ureg.Quantity(110.0, "psi"))
+    net_pc.add_edge("E", "A", "B", [pipe_s, cv_s])
+    res_pc = net_pc.solve(fluid)
+    assert res_pc.converged
+    assert res_pc["mdot_kgs"]["E"] == 0.0
+    cr_pipe = res_pc.component(pipe_s)
+    cr_cv   = res_pc.component(cv_s)
+    dP_held = res_pc["P_Pa"]["B"] - res_pc["P_Pa"]["A"]
+    print(
+        f"[check-valve-cres] pipe dP = {cr_pipe.dP_Pa:+.3e} Pa, "
+        f"CV dP = {cr_cv.dP_Pa:+.6g} Pa (held {dP_held:+.6g})"
+    )
+    assert abs(cr_pipe.dP_Pa) < 1e-6
+    assert abs(cr_cv.dP_Pa - dP_held) < 1e-6
+    prof = cr_pipe.pressure_profile()
+    assert all(abs(row["P_Pa"] - prof[0]["P_Pa"]) < 1e-9 for row in prof)
+    assert all(row["v_ms"] == 0.0 for row in prof)
 
     # --- junction topology: supply node feeds a junction, junction feeds a
     #     sealed check valve on one branch and a low-pressure outlet on the
-    #     other.  Reproduces the second GUI failure -- a multi-edge network
-    #     where the check valve must hold a back-pressure while the bulk
-    #     flow routes around it.  Sensitive to initial guesses; we test
-    #     both the default and a small-init fallback.
+    #     other.  With a perfect seal, mass balance forces the full supply
+    #     through the pipe branch.
     pipe = Line_Segment(
         roughness=ureg.Quantity(0.00015, "ft"),
         id_val=D_q,
@@ -2033,8 +2106,31 @@ def _test_check_valve_forward_and_sealed():
         f"Q_pipe = {Q_pipe:.2f} BBL/D, P_J = {res_j['P_Pa']['J']/6894.757:.3f} psi"
     )
     assert res_j.converged
-    assert Q_cv < 0.0 and abs(Q_cv) < 10.0   # sealed, tiny back-leakage
-    assert Q_pipe > 9000.0                   # most flow takes the pipe path
+    assert Q_cv == 0.0                       # sealed exactly
+    assert abs(Q_pipe - 10000.0) < 1.0       # full supply takes the pipe path
+
+    # --- dead leg: a free node whose only connections are sealed check
+    #     valves has an indeterminate pressure; solve() must warn.
+    cv_d1 = CheckValve(Di=D_q, K=K_fwd, name="CV_d1")
+    cv_d2 = CheckValve(Di=D_q, K=K_fwd, name="CV_d2")
+    net_d = Network()
+    net_d.add_node("A", P=ureg.Quantity(100.0, "psi"))
+    net_d.add_node("D")
+    net_d.add_node("B", P=ureg.Quantity(110.0, "psi"))
+    net_d.add_edge("A->D", "A", "D", cv_d1)
+    net_d.add_edge("D->B", "D", "B", cv_d2)
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        res_d = net_d.solve(fluid)
+    dead_leg_warned = any("indeterminate" in str(w.message) for w in caught)
+    print(
+        f"[check-valve-deadleg] mdot A->D = {res_d['mdot_kgs']['A->D']:+.3e}, "
+        f"D->B = {res_d['mdot_kgs']['D->B']:+.3e}, warned = {dead_leg_warned}"
+    )
+    assert res_d.converged
+    assert res_d["mdot_kgs"]["A->D"] == 0.0
+    assert res_d["mdot_kgs"]["D->B"] == 0.0
+    assert dead_leg_warned, "expected dead-leg indeterminate-pressure warning"
 
 
 def _test_three_modes():

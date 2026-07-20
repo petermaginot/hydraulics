@@ -61,7 +61,6 @@ from network import (
 )
 from compressible_flow import (
     _build_phase_limits, _safe_update_PT, _safe_flowstate_update_PT,
-    _is_sealed_check_valve, _sealed_outlet_PT,
     _solve_mdot_for_outlet_P, _ideal_gas_G_max,
     FlowState, ChokedFlowError,
 )
@@ -325,17 +324,23 @@ class Compressible_Network(Network):
                 "specified pressure to anchor the solution."
             )
 
-        # Auto-detect inverse-mode edges: any edge whose downstream node
-        # (to_node) is P-spec.  Inverse-mode edges replace the standard
-        # forward pipe-equation residual (walked_P_out - P_node) with a
-        # locally solved (mdot - mdot_solved) residual driven by
+        # Auto-detect inverse-mode edges: any edge with components whose
+        # downstream node (to_node) is P-spec.  Inverse-mode edges replace
+        # the standard forward pipe-equation residual (walked_P_out - P_node)
+        # with a locally solved (mdot - mdot_solved) residual driven by
         # _solve_mdot_for_outlet_P.  Advantages: analytic Jacobian column
         # for the edge's mdot (+1 / mdot_ref), brentq-bracketed local
         # solve robust near choke, and choke-aware via ChokedFlowError
         # clamp.  Edges feeding a junction keep the forward path
-        # unchanged.  See network.md "Compressible solver" section.
+        # unchanged.  A zero-component connector edge into a P-spec node is
+        # also kept forward: its pressure-form residual (walked_P_out - P_node
+        # == P_in - P_target) is exactly the P_from == P_to pin a connector
+        # exists to enforce, whereas the inverse (mdot - mdot_solved) residual
+        # is trivially satisfied and leaves the upstream pressure unanchored.
+        # See network.md "Compressible solver" section.
         inverse_of = [
             self._nodes[edge.to_node].P_spec_Pa is not None
+            and len(edge.components) > 0
             for edge in self._edges
         ]
 
@@ -442,6 +447,14 @@ class Compressible_Network(Network):
         # Cache reversed-shadow components, keyed by id(original).
         reversed_cache = {}
 
+        # Edges carrying a check valve: reverse trial flow through them is
+        # a perfect seal (exactly zero flow), handled by the sealed-edge
+        # residual swap below.
+        cv_edge_names = {
+            e.name for e in self._edges
+            if any(getattr(c, "check_valve", False) for c in e.components)
+        }
+
         def unpack(x):
             P = np.empty(n_nodes)
             T = np.empty(n_nodes)
@@ -460,13 +473,29 @@ class Compressible_Network(Network):
             """Walk the components on one edge in flow direction.
 
             Returns (P_outlet, T_outlet, h_outlet, inlet_i, outlet_i,
-            sealed).  `sealed` is True iff the walked path contains a
-            sealing-K check-valve shadow (i.e. mdot_e < 0 through a CV);
-            the caller uses this to switch the pipe residual from the
-            standard walked - P_outlet form to a mdot penalty, since a
-            sealed CV's pipe equation is over-determined (no flow is
-            permitted regardless of the pressure mismatch across it).
+            sealed).  `sealed` is True iff the edge contains a check valve
+            and the trial flow is reverse (mdot_e < 0): the valve seals
+            perfectly, so the caller swaps the pipe residual from the
+            standard walked - P_outlet form to mdot / mdot_ref, which is
+            zero iff mdot = 0 -- an exact complementarity condition
+            (either the edge is open with the pressure balance holding, or
+            it is sealed at exactly zero flow).
             """
+            # Perfect-seal check valve: no reverse walk is attempted at
+            # all.  Return the inlet-node state as a pass-through -- the
+            # walked P is unused for sealed edges and the walked h (which
+            # the energy balance weights by |mdot| ~ 0) just needs to be
+            # finite and physical.
+            if mdot_e < 0.0 and edge.name in cv_edge_names:
+                inlet_i  = idx_of[edge.to_node]
+                outlet_i = idx_of[edge.from_node]
+                _safe_update_PT(abstract_state, P[inlet_i], T[inlet_i],
+                                T_cric, P_bar, T_c, P_c)
+                return (abstract_state.p(),
+                        abstract_state.T(),
+                        abstract_state.hmass(),
+                        inlet_i, outlet_i, True)
+
             if mdot_e >= 0.0:
                 inlet_i  = idx_of[edge.from_node]
                 outlet_i = idx_of[edge.to_node]
@@ -486,22 +515,6 @@ class Compressible_Network(Network):
             T_in_e = T[inlet_i]
             z_in_e = self._nodes[node_names[inlet_i]].elevation_m
             abs_mdot = abs(mdot_e)
-
-            # If any component in the walked path is a sealed check-valve
-            # shadow, short-circuit the whole edge to the clamped sealed-state
-            # outlet AND flag the edge as sealed so the residual function can
-            # swap to a mdot-penalty form.  Walking downstream components
-            # from the CV's clamped outlet drops them into a low-P /
-            # high-velocity regime where compressible_pipe_segment can fail
-            # to converge.
-            if any(_is_sealed_check_valve(c) for c in comps):
-                P_out, T_out = _sealed_outlet_PT(P_in_e, T_in_e)
-                _safe_update_PT(abstract_state, P_out, T_out,
-                                T_cric, P_bar, T_c, P_c)
-                return (abstract_state.p(),
-                        abstract_state.T(),
-                        abstract_state.hmass(),
-                        inlet_i, outlet_i, True)
 
             # Wrap the walk in a try/except so that an LM trial step into a
             # numerically infeasible region (e.g. compressible_pipe_segment
@@ -595,14 +608,36 @@ class Compressible_Network(Network):
             magnitude.  Reverse flow (mdot_trial < 0) is not supported
             on inverse-mode edges; returns a penalty mdot_solved so the
             LM solver retreats to positive mdot.
+
+            Zero-component (connector) edges are never inverse-mode -- they
+            keep the forward pressure residual (see inverse_of above) -- so
+            every edge reaching this function has at least one component.
             """
             inlet_i  = idx_of[edge.from_node]
             outlet_i = idx_of[edge.to_node]
             P_in_e   = P[inlet_i]
             T_in_e   = T[inlet_i]
             z_in_e   = self._nodes[node_names[inlet_i]].elevation_m
+            P_target = P[outlet_i]
 
             mdot_penalty = _INVERSE_PENALTY_MDOT_SOLVED
+
+            # Perfect-seal check valve: a reverse trial (mdot < 0) or a
+            # reverse pressure drive (P_target >= P_in) across a CV edge
+            # means the valve seals.  That is the correct physical answer,
+            # not an infeasibility, so no warning is emitted; sealed=True
+            # swaps the pipe residual to mdot / mdot_ref, driving the edge
+            # to exactly zero flow.  Takes priority over the generic
+            # guards below, which would otherwise treat the same trial as
+            # an infeasible region and warn.
+            if edge.name in cv_edge_names:
+                if mdot_trial < 0.0 or P_target >= P_in_e:
+                    _safe_update_PT(abstract_state, P_in_e, T_in_e,
+                                    T_cric, P_bar, T_c, P_c)
+                    return (abstract_state.p(),
+                            abstract_state.T(),
+                            abstract_state.hmass(),
+                            inlet_i, outlet_i, True, 0.0)
 
             # Reverse-flow guard.  Inverse mode is forward-only by
             # design (relief valves, regulators); a trial mdot < 0 from
@@ -620,23 +655,6 @@ class Compressible_Network(Network):
                 return (_WALK_FAIL_P_PA, T_in_e, abstract_state.hmass(),
                         inlet_i, outlet_i, False, mdot_penalty)
 
-            # Sealed-CV short-circuit takes priority over inverse mode:
-            # a sealed CV blocks all flow regardless of the pressure
-            # mismatch across it.  Same clamped sealed-state outlet as
-            # walk_edge, and we still flag sealed=True so the
-            # residual-function dispatcher uses the sealed-edge
-            # mdot/mdot_ref residual.
-            if any(_is_sealed_check_valve(c) for c in edge.components):
-                P_out, T_out = _sealed_outlet_PT(P_in_e, T_in_e)
-                _safe_update_PT(abstract_state, P_out, T_out,
-                                T_cric, P_bar, T_c, P_c)
-                return (abstract_state.p(),
-                        abstract_state.T(),
-                        abstract_state.hmass(),
-                        inlet_i, outlet_i, True, 0.0)
-
-            P_target = P[outlet_i]
-
             # P_target >= P_in: subsonically impossible (would require
             # negative friction).  Penalty mdot so LM retreats; same
             # once-per-solve warning as reverse flow.
@@ -652,16 +670,6 @@ class Compressible_Network(Network):
                                 T_cric, P_bar, T_c, P_c)
                 return (_WALK_FAIL_P_PA, T_in_e, abstract_state.hmass(),
                         inlet_i, outlet_i, False, mdot_penalty)
-
-            # Zero-component edge: pure connector, no dP.  Trivially
-            # mdot_solved equals whatever satisfies mass balance; with
-            # no pressure drop, any mdot is consistent so we just match
-            # the LM trial.
-            if not edge.components:
-                _safe_update_PT(abstract_state, P_in_e, T_in_e,
-                                T_cric, P_bar, T_c, P_c)
-                return (P_in_e, T_in_e, abstract_state.hmass(),
-                        inlet_i, outlet_i, False, mdot_trial)
 
             # Single-component edge (the common relief-valve case):
             # delegate to component.dmdot_dT(fs, P2).  This is much
@@ -874,16 +882,14 @@ class Compressible_Network(Network):
                 res[n_p_free + j] = (sum_in - sum_out) / energy_ref
 
             # Pipe equation per edge: normally walked outlet P == node P at
-            # the flow-outlet end (normalized by P_ref).  When the walk
-            # crossed a sealed check valve, the standard form is
-            # over-determined (the CV blocks flow regardless of the
-            # pressure mismatch across it), and a clamp-based walked_P_out
-            # can collide with the natural P_outlet value, leaving zero
-            # residual and inviting the solver to accept a spurious
-            # backflow solution.  For sealed edges we therefore swap to a
-            # direct mdot penalty: residual = mdot / mdot_ref, which is
-            # zero iff mdot = 0 (the only physical solution through a
-            # sealed CV).
+            # the flow-outlet end (normalized by P_ref).  A check-valve
+            # edge under reverse trial flow (sealed=True) is different: a
+            # perfect seal passes no flow regardless of the pressure
+            # mismatch across it, so the pressure form doesn't apply.  We
+            # swap to residual = mdot / mdot_ref, which is zero iff
+            # mdot = 0 -- an exact complementarity condition, always
+            # satisfiable, so a sealed edge converges cleanly instead of
+            # leaving a leftover pressure residual.
             for e_idx in range(n_edges):
                 if sealed_of[e_idx]:
                     res[n_p_free + n_t_free + e_idx] = mdot[e_idx] / mdot_ref
@@ -973,6 +979,56 @@ class Compressible_Network(Network):
 
         P_arr, T_arr, mdot_arr = unpack(sol)
 
+        # Perfect seal: a check-valve edge cannot carry reverse flow.  A
+        # sealed edge converges to an xtol-sized remnant around zero
+        # rather than exactly zero; snap it before Q_ext recovery and
+        # reporting so users see zero reverse flow, period.
+        for e_idx, edge in enumerate(self._edges):
+            if (edge.name in cv_edge_names
+                    and mdot_arr[e_idx] < 1e-6 * mdot_ref_scalar):
+                mdot_arr[e_idx] = 0.0
+
+        # A sealed CV edge's residual row is satisfied for any (P, T) on
+        # its blocked side, so a node connected to the spec'd part of the
+        # network only through sealed seats has nothing pinning its free
+        # P and/or T -- the solver leaves whatever the iteration landed
+        # on.  Flag those nodes rather than reporting the numbers as real.
+        sealed_edge_idx = {
+            e_idx for e_idx, edge in enumerate(self._edges)
+            if edge.name in cv_edge_names and mdot_arr[e_idx] == 0.0
+        }
+        if sealed_edge_idx:
+            reachable = set(p_spec_idx)
+            frontier = list(reachable)
+            while frontier:
+                i = frontier.pop()
+                for e_idx, _sign in adj[i]:
+                    if e_idx in sealed_edge_idx:
+                        continue
+                    edge = self._edges[e_idx]
+                    for j in (idx_of[edge.from_node], idx_of[edge.to_node]):
+                        if j not in reachable:
+                            reachable.add(j)
+                            frontier.append(j)
+            for i in range(n_nodes):
+                if i in reachable:
+                    continue
+                node = self._nodes[node_names[i]]
+                indet = [
+                    label for label, spec in (
+                        ("pressure", node.P_spec_Pa),
+                        ("temperature", node.T_spec_K),
+                    ) if spec is None
+                ]
+                if indet:
+                    warnings.warn(
+                        f"Compressible_Network.solve: node "
+                        f"{node_names[i]!r} is isolated behind sealed "
+                        f"check valve(s); its reported "
+                        f"{' and '.join(indet)} is indeterminate.",
+                        stacklevel=2,
+                    )
+
         # Recover Q_ext at P-spec nodes from mass balance.
         Q_ext_out = {}
         for i, name in enumerate(node_names):
@@ -993,6 +1049,26 @@ class Compressible_Network(Network):
         component_outlet_PT = {}
         for e_idx, edge in enumerate(self._edges):
             mdot_e = float(mdot_arr[e_idx])
+
+            # Sealed check-valve edge (snapped to exactly zero flow above):
+            # no state change happens anywhere except across the seat.
+            # Components upstream of the CV (nominal order) sit at the
+            # from-node state, the CV's outlet and everything after it sit
+            # at the to-node state -- the valve visibly holds the full dP.
+            if edge.name in cv_edge_names and mdot_e == 0.0:
+                i_from = idx_of[edge.from_node]
+                i_to   = idx_of[edge.to_node]
+                cv_pos = next(
+                    k for k, c in enumerate(edge.components)
+                    if getattr(c, "check_valve", False)
+                )
+                component_outlet_PT[edge.name] = [
+                    (float(P_arr[i_from]), float(T_arr[i_from])) if k < cv_pos
+                    else (float(P_arr[i_to]), float(T_arr[i_to]))
+                    for k in range(len(edge.components))
+                ]
+                continue
+
             if mdot_e >= 0.0:
                 inlet_i  = idx_of[edge.from_node]
                 walk_comps = edge.components
@@ -1007,23 +1083,6 @@ class Compressible_Network(Network):
                     rev_list.append(reversed_cache[key])
                 walk_comps = list(reversed(rev_list))
                 walk_in_orig_order = False
-
-            # Sealed-edge short-circuit (mirrors walk_edge above): if any
-            # component on the walked path is a sealing-K check-valve shadow,
-            # report the clamped sealed-state outlet for every component
-            # rather than attempting the downstream walk, which would put
-            # subsequent components into a near-vacuum state and fail.
-            if any(_is_sealed_check_valve(c) for c in walk_comps):
-                P_clamp, T_clamp = _sealed_outlet_PT(
-                    float(P_arr[inlet_i]), float(T_arr[inlet_i])
-                )
-                _safe_update_PT(abstract_state, P_clamp, T_clamp,
-                                T_cric, P_bar, T_c, P_c)
-                walked_PT = [(P_clamp, T_clamp) for _ in walk_comps]
-                if not walk_in_orig_order:
-                    walked_PT = list(reversed(walked_PT))
-                component_outlet_PT[edge.name] = walked_PT
-                continue
 
             _safe_update_PT(abstract_state, P_arr[inlet_i], T_arr[inlet_i],
                             T_cric, P_bar, T_c, P_c)
@@ -1731,6 +1790,264 @@ def _test_inverse_relief_from_junction():
     assert 0.0 < mdot_relief < 5.0
 
 
+def _test_check_valve_forward():
+    """Forward flow through a single CheckValve edge matches a direct
+    CheckValve.dP_dT() walk.  Guards the forward path after the removal
+    of the sealed-K short-circuit from dP_dT/dmdot_dT.
+    """
+    from compressible_flow import CheckValve
+    import composition
+
+    AS = composition.define_composition(
+        y_Methane=0.9, y_Ethane=0.05, y_Propane=0.02,
+        y_n_Butane=0.01, y_CarbonDioxide=0.02, eos="PR",
+    )
+    T_cric, P_bar, T_c, P_c = _build_phase_limits(AS)
+
+    P_in = ureg.Quantity(500.0, "psi").to("Pa").magnitude
+    T_in = 300.0
+    mdot_kgs = 1.0
+    cv = CheckValve(Di=ureg.Quantity(3.068, "inch"), K=2.0, name="cv")
+
+    # ---- Direct reference walk.
+    _safe_update_PT(AS, P_in, T_in, T_cric, P_bar, T_c, P_c)
+    fs_ref = FlowState(
+        AS, mdot_kgs, A=cv.inlet_area_si, z=0.0,
+        T_cricondentherm=T_cric, P_cricondenbar=P_bar,
+        T_critical=T_c, P_critical=P_c,
+    )
+    cv.dP_dT(fs_ref)
+    P_out_ref = AS.p()
+    T_out_ref = AS.T()
+
+    # ---- Network solve.
+    net = Compressible_Network()
+    net.add_node("in",  P=P_in, T=T_in)
+    net.add_node("out", Q_ext=-mdot_kgs)
+    net.add_edge("cv", "in", "out", cv)
+
+    _safe_update_PT(AS, P_in, T_in, T_cric, P_bar, T_c, P_c)
+    result = net.solve(AS, mdot_init_kgs=mdot_kgs, verbose=True)
+
+    P_out_net = result["P_Pa"]["out"]
+    T_out_net = result["T_K"]["out"]
+    errP = abs(P_out_net - P_out_ref) / 6894.757
+    errT = abs(T_out_net - T_out_ref)
+    print(f"[cv-fwd]  direct P_out = {P_out_ref/6894.757:.4f} psi, "
+          f"network P_out = {P_out_net/6894.757:.4f} psi "
+          f"(err {errP:.2e} psi, T err {errT:.2e} K)")
+    assert result["converged"]
+    assert errP < 1e-2
+    assert errT < 1e-2
+    assert result["mdot_kgs"]["cv"] > 0.0
+
+
+def _test_check_valve_sealed():
+    """A CheckValve edge between two P-spec nodes with P_to > P_from: the
+    valve seals at exactly zero flow.
+
+    This is the configuration that under the old sealing-K model was
+    "over-determined" -- the sealed-edge residual left a leftover pressure
+    mismatch and solve() emitted a did-not-converge warning even though
+    the flows were right.  With the perfect-seal complementarity residual
+    the sealed state is an exact root: converged, warning-free, mdot == 0.
+    Also covers the dead-leg case (a free node isolated between two sealed
+    check valves must be flagged as indeterminate).
+    """
+    from compressible_flow import CheckValve
+    import composition
+
+    AS = composition.define_composition(
+        y_Methane=0.9, y_Ethane=0.05, y_Propane=0.02,
+        y_n_Butane=0.01, y_CarbonDioxide=0.02, eos="PR",
+    )
+
+    P_A = ureg.Quantity(300.0, "psi").to("Pa").magnitude
+    P_B = ureg.Quantity(310.0, "psi").to("Pa").magnitude
+    cv = CheckValve(Di=ureg.Quantity(3.068, "inch"), K=2.0, name="cv")
+
+    net = Compressible_Network()
+    net.add_node("A", P=P_A, T=300.0)
+    net.add_node("B", P=P_B, T=300.0)
+    net.add_edge("cv", "A", "B", cv)
+
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        result = net.solve(AS, mdot_init_kgs=0.5, verbose=True)
+    solve_warnings = [str(w.message) for w in caught]
+    print(f"[cv-sealed] mdot = {result['mdot_kgs']['cv']:+.4e} kg/s, "
+          f"warnings = {len(solve_warnings)}")
+    assert result["converged"]
+    assert not any("did not converge" in m for m in solve_warnings), \
+        solve_warnings
+    assert result["mdot_kgs"]["cv"] == 0.0
+    # The CV holds the full dP: its (zero-flow) outlet reports the
+    # downstream node state.
+    (P_cv_out, T_cv_out), = result["component_outlet_PT"]["cv"]
+    assert abs(P_cv_out - P_B) < 1.0
+    assert abs(T_cv_out - 300.0) < 1e-6
+
+    # ---- Dead leg: free node D isolated between two sealed CVs; its
+    #      pressure and temperature are indeterminate and must be flagged.
+    cv1 = CheckValve(Di=ureg.Quantity(3.068, "inch"), K=2.0, name="cv1")
+    cv2 = CheckValve(Di=ureg.Quantity(3.068, "inch"), K=2.0, name="cv2")
+    net_d = Compressible_Network()
+    net_d.add_node("A", P=P_A, T=300.0)
+    net_d.add_node("D")
+    net_d.add_node("B", P=P_B, T=300.0)
+    net_d.add_edge("d1", "A", "D", cv1)
+    net_d.add_edge("d2", "D", "B", cv2)
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        res_d = net_d.solve(AS, mdot_init_kgs=0.5, verbose=True)
+    dead_leg_warned = any(
+        "indeterminate" in str(w.message) for w in caught
+    )
+    print(f"[cv-deadleg] mdot d1 = {res_d['mdot_kgs']['d1']:+.4e}, "
+          f"d2 = {res_d['mdot_kgs']['d2']:+.4e}, warned = {dead_leg_warned}")
+    assert res_d["converged"]
+    assert res_d["mdot_kgs"]["d1"] == 0.0
+    assert res_d["mdot_kgs"]["d2"] == 0.0
+    assert dead_leg_warned, "expected dead-leg indeterminate warning"
+
+
+def _test_check_valve_junction_sealed():
+    """Supply feeds a junction that splits to a withdrawal and to a
+    check valve holding back a high-pressure region.
+
+    The CV edge terminates in an interior junction (J2) that connects
+    onward to the high-P spec node, so the CV edge is FORWARD mode (its
+    to_node is not P-spec) and the reverse trial flow exercises the
+    walk_edge sealed branch, not the inverse-mode one.  With a perfect
+    seal, mass balance forces the full supply through the withdrawal.
+    """
+    from compressible_flow import CheckValve, Line_Segment
+    import composition
+
+    AS = composition.define_composition(
+        y_Methane=0.9, y_Ethane=0.05, y_Propane=0.02,
+        y_n_Butane=0.01, y_CarbonDioxide=0.02, eos="PR",
+    )
+
+    P_S  = ureg.Quantity(500.0, "psi").to("Pa").magnitude
+    P_HP = ureg.Quantity(600.0, "psi").to("Pa").magnitude
+    mdot_supply = 1.0
+
+    rgh = ureg.Quantity(0.00015, "ft")
+    feed = Line_Segment(
+        roughness=rgh, id_val=ureg.Quantity(3.068, "inch"),
+        length=ureg.Quantity(100.0, "ft"),
+        elevation_change=ureg.Quantity(0.0, "ft"), name="feed",
+    )
+    out_pipe = Line_Segment(
+        roughness=rgh, id_val=ureg.Quantity(3.068, "inch"),
+        length=ureg.Quantity(200.0, "ft"),
+        elevation_change=ureg.Quantity(0.0, "ft"), name="out_pipe",
+    )
+    link = Line_Segment(
+        roughness=rgh, id_val=ureg.Quantity(3.068, "inch"),
+        length=ureg.Quantity(100.0, "ft"),
+        elevation_change=ureg.Quantity(0.0, "ft"), name="link",
+    )
+    cv = CheckValve(Di=ureg.Quantity(3.068, "inch"), K=2.0, name="cv")
+
+    net = Compressible_Network()
+    net.add_node("S",   P=P_S, T=300.0)
+    net.add_node("J")
+    net.add_node("OUT", Q_ext=-mdot_supply)
+    net.add_node("J2")
+    net.add_node("HP",  P=P_HP, T=305.0)
+    net.add_edge("feed",   "S",  "J",   feed)
+    net.add_edge("out",    "J",  "OUT", out_pipe)
+    net.add_edge("cvedge", "J",  "J2",  cv)
+    net.add_edge("link",   "HP", "J2",  link)
+
+    result = net.solve(
+        AS,
+        mdot_init_kgs={"feed": 1.0, "out": 1.0, "cvedge": 0.1, "link": 0.1},
+        verbose=True,
+    )
+    mdot_feed = result["mdot_kgs"]["feed"]
+    mdot_out  = result["mdot_kgs"]["out"]
+    mdot_cv   = result["mdot_kgs"]["cvedge"]
+    print(f"[cv-junction] mdot feed = {mdot_feed:.6f}, out = {mdot_out:.6f}, "
+          f"cv = {mdot_cv:+.4e} kg/s, "
+          f"P_J = {result['P_Pa']['J']/6894.757:.2f} psi, "
+          f"P_J2 = {result['P_Pa']['J2']/6894.757:.2f} psi")
+    assert result["converged"]
+    assert mdot_cv == 0.0                          # sealed exactly
+    assert abs(mdot_feed - mdot_supply) < 1e-6     # full supply routed
+    assert abs(mdot_out - mdot_supply) < 1e-6
+    assert result["P_Pa"]["J"] < result["P_Pa"]["J2"]   # reverse drive held
+
+
+def _test_inverse_connector_to_pspec():
+    """Zero-component connector edge into a P-spec node.
+
+    Topology: inlet (P-spec, high) -> pipe -> mid (junction) ->
+    connector (empty) -> outlet (P-spec, low).  The connector's downstream
+    node is P-spec, so the pre-fix auto-detector marked it inverse-mode,
+    which (a) emitted a spurious "subsonic flow is impossible" warning once
+    P[mid] converged toward P[outlet], and (b) left P[mid] unanchored to the
+    spec.  With the fix the connector stays forward: its pressure residual
+    pins P[mid] == P[outlet] and no warning is raised.
+    """
+    from compressible_flow import Line_Segment
+    import composition
+
+    AS = composition.define_composition(
+        y_Methane=0.9, y_Ethane=0.05, y_Propane=0.02,
+        y_n_Butane=0.01, y_CarbonDioxide=0.02, eos="PR",
+    )
+
+    P_in_Pa  = ureg.Quantity(300.0 + 14.7, "psi").to("Pa").magnitude
+    P_out_Pa = ureg.Quantity(100.0 + 14.7, "psi").to("Pa").magnitude
+
+    pipe = Line_Segment(
+        roughness=ureg.Quantity(0.00015, "ft"),
+        id_val=ureg.Quantity(3.068, "inch"),
+        length=ureg.Quantity(200.0, "ft"),
+        elevation_change=ureg.Quantity(0.0, "ft"),
+        name="pipe",
+    )
+
+    net = Compressible_Network()
+    net.add_node("inlet",  P=P_in_Pa, T=320.0)
+    net.add_node("mid")
+    net.add_node("outlet", P=P_out_Pa)
+    net.add_edge("pipe",      "inlet", "mid",    pipe)
+    net.add_edge("connector", "mid",   "outlet", [])  # empty -> zero-dP connector
+
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        result = net.solve(
+            AS,
+            mdot_init_kgs={"pipe": 1.0, "connector": 1.0},
+            verbose=True,
+        )
+    assert result["converged"]
+
+    P_mid    = result["P_Pa"]["mid"]
+    P_outlet = result["P_Pa"]["outlet"]
+    mdot_pipe      = result["mdot_kgs"]["pipe"]
+    mdot_connector = result["mdot_kgs"]["connector"]
+
+    pin_err  = abs(P_mid - P_outlet) / P_outlet
+    mass_err = abs(mdot_pipe - mdot_connector)
+    subsonic_warns = [
+        str(w.message) for w in caught
+        if "subsonic flow is impossible" in str(w.message)
+    ]
+    print(f"[inv-connector] P_mid = {P_mid/6894.757:.4f} psi, "
+          f"P_outlet = {P_outlet/6894.757:.4f} psi, pin err = {pin_err:.2e}")
+    print(f"[inv-connector] mdot_pipe = {mdot_pipe:.6f} kg/s, "
+          f"mdot_connector = {mdot_connector:.6f} kg/s")
+    print(f"[inv-connector] subsonic warnings: {len(subsonic_warns)}")
+    assert pin_err < 1e-6           # connector pins P[mid] == P[outlet]
+    assert mass_err < 1e-6          # mass balance through the connector
+    assert not subsonic_warns       # no spurious infeasibility warning
+
+
 if __name__ == "__main__":
     _test_single_segment_forward()
     print()
@@ -1744,4 +2061,12 @@ if __name__ == "__main__":
     print()
     _test_inverse_single_relief_valve()
     print()
+    _test_check_valve_forward()
+    print()
+    _test_check_valve_sealed()
+    print()
+    _test_check_valve_junction_sealed()
+    print()
     _test_inverse_relief_from_junction()
+    print()
+    _test_inverse_connector_to_pspec()

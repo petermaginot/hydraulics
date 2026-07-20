@@ -1,25 +1,37 @@
 """Compatibility shims that must run before NodeGraphQt is imported.
 
-NodeGraphQt 0.6.44 still uses distutils.version.LooseVersion, which was
-removed from the standard library in Python 3.12.  We inject a stub backed
-by packaging.version.Version (already in our transitive deps via Pint)
-*before* any NodeGraphQt import resolves the name.
+Two shims live here:
+
+1. NodeGraphQt 0.6.44 still uses distutils.version.LooseVersion, which was
+   removed from the standard library in Python 3.12.  We inject a stub backed
+   by packaging.version.Version (already in our transitive deps via Pint)
+   *before* any NodeGraphQt import resolves the name.
+2. NodeGraphQt's viewer calls QMouseEvent.pos(), deprecated in Qt 6 in favour
+   of QMouseEvent.position().  PySide6 reports that as a Python
+   DeprecationWarning (not a Qt log message), and the call sits inside
+   mouseMoveEvent, so it fires on every mouse move over the node canvas.  We
+   filter it out below.  Nothing in this repo calls the deprecated API — the
+   fix belongs upstream.
 
 Import this module exactly once, before importing NodeGraphQt.
 """
 
 import sys
 import types
+import warnings
 
 from PySide6.QtCore import QtMsgType, qInstallMessageHandler
 
+# Narrow on purpose: a blanket DeprecationWarning filter would also hide real
+# signals from our own dependencies.
+warnings.filterwarnings(
+    "ignore",
+    message=r".*QMouseEvent\.pos\(\).*",
+    category=DeprecationWarning,
+)
+
 
 def _qt_message_handler(msg_type, context, message):
-    # NodeGraphQt 0.6.44 uses QMouseEvent.pos() which Qt 6 deprecated in
-    # favour of QMouseEvent.position().  The method still works; suppress the
-    # noise until NodeGraphQt is updated upstream.
-    if "QMouseEvent.pos() const" in message and "deprecated" in message:
-        return
     if msg_type == QtMsgType.QtWarningMsg:
         print(f"Qt warning: {message}", file=sys.stderr)
     elif msg_type == QtMsgType.QtCriticalMsg:

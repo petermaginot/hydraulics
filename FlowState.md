@@ -153,24 +153,24 @@ for c in comps:
 ### Reverse flow
 
 `_reversed_component` returns a shallow-copied **shadow** of the original
-that has its geometry flipped (profile reversed, `Di_US`/`Di_DS` swapped,
-check-valve `K -> _SEALING_K`). Its `inlet_area_si` /
-`outlet_area_si` then reflect the swapped sides automatically — no
-extra logic needed at the FlowState layer. **Always feed reversed
-shadows through the same `dP_dT(fs)` interface; never write
-`sign(mdot) * forward_dp(|mdot|)` shortcuts.**
+that has its geometry flipped (profile reversed, `Di_US`/`Di_DS`
+swapped). Its `inlet_area_si` / `outlet_area_si` then reflect the
+swapped sides automatically — no extra logic needed at the FlowState
+layer. **Always feed reversed shadows through the same `dP_dT(fs)`
+interface; never write `sign(mdot) * forward_dp(|mdot|)` shortcuts.**
 
 ### Sealed check valves
 
-`CheckValve.dP_dT(fs)` detects the sealing K (≥ `_SEALED_K_THRESHOLD`,
-1e6) and short-circuits to a clamped sealed-state outlet `(0.5*P_in,
-T_in)` instead of running the inertial formula. The network walker also
-short-circuits the entire downstream chain via
-`_is_sealed_check_valve(c)` — see [network.md](network.md) §
-"Reverse-flow handling" for why. GUI code that walks a chain by hand
-must do the same check; otherwise a Line_Segment downstream of a sealed
-CV will be asked to integrate a high-velocity / low-density state and
-exhaust its split budget.
+Check valves seal perfectly: `Compressible_Network.walk_edge()` detects
+a reverse trial flow (`mdot < 0`) on any CV-carrying edge **before
+walking any component** and returns the inlet-node state as a
+pass-through, flagging the edge `sealed` so the residual pins its mdot
+to exactly zero — see [network.md](network.md) § "Reverse-flow
+handling".  `CheckValve.dP_dT(fs)` itself models forward passage only.
+GUI code that walks a chain by hand must apply the same rule: never
+walk components under reverse conditions through a check valve — the
+flow there is zero and the downstream side simply sits at its own
+node's state.
 
 ---
 
@@ -236,8 +236,6 @@ when returning `component_outlet_PT`.
   iff `fs.A` differs from `A_target` beyond a 1e-6 fractional tolerance.
   Component `dP_dT` methods already call this at entry; you'll rarely
   need it from GUI code.
-- `_is_sealed_check_valve(c)` / `_sealed_outlet_PT(P_in, T_in)` — see
-  the "Sealed check valves" note above.
 
 ---
 
@@ -259,7 +257,9 @@ when returning `component_outlet_PT`.
 - **Forwarding the four phase-envelope kwargs by hand.** Cache them
   on the FlowState at construction; nothing downstream needs them as
   explicit kwargs anymore.
-- **Walking a sealed-CV chain past the CV.** Check
-  `any(_is_sealed_check_valve(c) for c in comps)` first and short-circuit
-  to the clamped outlet for every downstream block — matching what
-  `Compressible_Network.walk_edge` does.
+- **Walking a check-valve chain under reverse conditions.** A check
+  valve seals perfectly: there is no reverse walk.  If the pressure
+  drive across a CV-carrying chain is reverse, the flow is exactly zero
+  — report the upstream blocks at the inlet state and the CV/downstream
+  blocks at the downstream node's state, matching what
+  `Compressible_Network` does for sealed edges.

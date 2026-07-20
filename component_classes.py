@@ -25,8 +25,8 @@ Base_Valve
 
 Base_CheckValve
     A check valve fitting.  Same layout as Base_Valve (Di + K_forward) but
-    carries check_valve=True so network._reversed_component can substitute a
-    very-high-K shadow, modelling a perfectly-sealing valve under reverse flow.
+    carries check_valve=True so the network solvers treat the edge as a
+    perfect seal under reverse flow (exactly zero backflow).
 
 Base_Contraction_Expansion
     An abrupt contraction or expansion between two pipe diameters.  Stores
@@ -1122,9 +1122,11 @@ class Base_CheckValve:
     """Geometry storage for a check valve fitting.
 
     Identical in layout to Base_Valve (Di + K) but carries a class-level
-    ``check_valve = True`` marker.  network._reversed_component detects this
-    and returns a copy with K replaced by a very large sealing value, so the
-    solver sees near-infinite resistance for reverse flow.
+    ``check_valve = True`` marker.  The network solvers detect this and
+    treat the valve as a perfect seal: an edge carrying a check valve is
+    pinned to exactly zero reverse flow by a complementarity residual
+    (see network.md, "Reverse-flow handling").  K applies to forward
+    flow only.
 
     Args:
         Di : pint Quantity or float (m if float).  Pipe inner diameter used
@@ -1132,9 +1134,8 @@ class Base_CheckValve:
         K  : float.  Forward-flow resistance coefficient.  Must be >= 0.
         minimum_diameter : pint Quantity or float (m if float), optional.
              Geometric minimum flow cross-section inside the trim.  See
-             Base_Valve docstring for details and caveats.  Used only on
-             the forward-flow path; the sealing-K reverse-flow shadow
-             ignores it.
+             Base_Valve docstring for details and caveats.  Forward flow
+             only (reverse flow through a check valve is zero).
         F_L : float, optional.  ISA-75.01 liquid pressure-recovery factor.
              See Base_Valve docstring.  Used only by the incompressible
              CheckValve cavitation check on the forward-flow path.

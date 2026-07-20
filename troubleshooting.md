@@ -42,14 +42,14 @@ A successful run looks like:
 The solver gave up before the residual fell below `1e-4` (normalized).
 Most common causes, in order:
 
-- **Sealed-check-valve over-determination.**  A check valve is being
-  forced to seal but the downstream pressure can't be satisfied at
-  `mdot = 0`.  The sealed-edge residual swap drives `mdot → 0` correctly
-  but leaves a non-zero residual elsewhere.  Cross-check: the offending
-  edge has `mdot_kgs ≈ 0` and contains a `CheckValve` component.  The
-  reported flows are still physically correct — the warning just reflects
-  that no exact equilibrium exists.  See `network.md` (the "sealed-edge
-  residual swap" subsection).
+- **All inflow paths to a demanded node are sealed.**  A `Q_ext`
+  withdrawal (or supply) can only be met through check valves that the
+  pressure field forces shut — genuinely infeasible, and the solver
+  correctly refuses.  Cross-check: every edge into the demanded node has
+  `mdot_kgs == 0` and contains a `CheckValve`.  Fix the specs or the
+  topology.  (A sealed CV by itself no longer causes non-convergence:
+  sealing is an exact complementarity condition in both solvers and a
+  sealed edge converges cleanly at `mdot = 0`.)
 - **Over- or under-specified boundary conditions.**  At least one node
   must have `P` spec'd to anchor pressures.  Conversely, an all-Q-spec
   network has no anchor and the solver has nothing to converge to.
@@ -91,9 +91,14 @@ than upstream).  If that's intentional, nothing to fix.  If not:
 
 - Check inlet/outlet P specs in `.hydnet.json` — is one wrong by an
   order of magnitude (psi/bar confusion)?
-- For check-valved edges, a backflow attempt should leave `mdot ≈ 0`
-  (sealed).  If it doesn't, the CV component is mis-built — its `K`
-  value or `check_valve = True` marker may be missing.
+- For check-valved edges, a backflow attempt must leave `mdot = 0`
+  exactly (perfect seal, snapped post-solve).  If the edge reports
+  negative flow, the CV component is mis-built — its
+  `check_valve = True` marker may be missing.
+- A node reported as "isolated behind sealed check valve(s)" carries an
+  indeterminate P (and T, compressible): nothing pins it once every path
+  to a P-spec node crosses a sealed seat.  The warning is informational —
+  flows are still correct — but don't trust that node's P/T values.
 
 ### A pipe profile CSV shows P *rising* in flow direction
 
@@ -284,8 +289,12 @@ These already live in [network.md](network.md) and aren't duplicated here:
 
 - Reverse-flow handling reverses the **geometry**, not the friction sign
   — relevant if you've added a custom component subclass.
-- Check valves use a tanh-blended K in the residual but the discrete
-  `_SEALING_K` substitution in post-solve walks.
+- Check valves seal perfectly: a CV edge's residual is a complementarity
+  condition (Fischer-Burmeister row in the incompressible solver, sealed
+  `mdot/mdot_ref` swap in the compressible one), sealed-edge flows are
+  snapped to exactly 0, and the post-solve `ComponentResult` walk bridges
+  the whole-edge pressure imbalance onto the first CV so it visibly
+  holds the ΔP.
 - `Q_ext` accepts pint Quantities with mass or volumetric dims; bare
   floats default to **kg/s** (not the units shown on the GUI dropdown).
 - Compressible solver: an inlet with positive `Q_ext` *must* spec `T`,
