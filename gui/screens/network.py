@@ -1153,6 +1153,11 @@ class NetworkScreen(QWidget):
                 # the GUI rather than letting them disappear into stderr.
                 with warnings.catch_warnings(record=True) as caught:
                     warnings.simplefilter("always")
+                    # simplefilter() shadows the _compat filters; re-apply so
+                    # NodeGraphQt's deprecation noise (emitted from mouse
+                    # handlers that dispatch during processEvents) stays out
+                    # of both stderr and the "Solve warnings" dialog.
+                    gui._compat.install_warning_filters()
                     fluid  = self._build_fluid()
                     net    = self._build_network()
                     result = self._solve_network(net, fluid)
