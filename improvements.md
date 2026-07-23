@@ -358,7 +358,7 @@ feedback in the denominator strengthens nonlinearly as the gas expands.
       real-gas call is now deferred to the bracket-failure branch
       where the structured `ChokedFlowError` payload is needed).
       Combined effect on a methane-mix benchmark (100 → 90 psi,
-      `benchmark_dmdot.py`):
+      `examples.py`'s `benchmark_dmdot_dT()`):
 
         * `Valve.dmdot_dT` (plain): 1697 ms → 11 ms (~150x)
         * `Bend.dmdot_dT`: 2922 ms → 18 ms (~160x)
@@ -467,7 +467,7 @@ feedback in the denominator strengthens nonlinearly as the gas expands.
   +0.1% boundary 6 -> 2, K=20 8 -> 3, choke march 154 -> 87,
   `compressible_dA` Mode 1 287 -> 169, Mode 2 295 -> 138.  Converged
   P_out/T_out unchanged to <= 1e-4 Pa / 1e-6 K on the kernel cases.
-  `benchmark_dmdot.py` single-edge inverse network solves: Valve
+  `examples.py`'s `benchmark_dmdot_dT()` single-edge inverse network solves: Valve
   constricted 8.6 s -> 3.1 s, Orifice 10.7 s -> 2.8 s, Valve plain
   3.7 s -> 2.8 s, Line_Segment 200 ft 8.9 s -> 7.8 s.  The "constricted
   components pay ~500-770 ms per forward dP_dT" bottleneck noted under

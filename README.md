@@ -263,9 +263,9 @@ Each iteration resets `AS` to the common inlet `(P0, T0)`, constructs one `FlowS
 
 End-to-end examples that check the program's calculations against textbook problems to validate its output.
 
-## Debugging test functions - [test.py](test.py)
+## Example / debugging test functions - [examples.py](examples.py)
 
-Debugging tests run to test new features
+A dumping ground for demo and debugging test functions used while developing features — component-level `dP_dT` / `dmdot_dT` round-trips, choke-detection checks, integrator convergence-order checks, and cavitation-gate exercises. Run directly (`python examples.py`); toggle individual functions in the `__main__` block.
 
 
 ## Utilities - [utilities.py](utilities.py)

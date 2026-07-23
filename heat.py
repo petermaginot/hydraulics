@@ -1,3 +1,7 @@
+"""
+Work in progress - rudimentary heat transfer calculation function
+"""
+
 import csv
 import math
 import os

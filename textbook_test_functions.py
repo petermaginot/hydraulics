@@ -639,6 +639,7 @@ def test_Crane_gas_pipeline():
             Q_mmscfd = (Q_low + Q_high) / 2
         else:
             Q_mmscfd = Q_mmscfd * (P_out / P_target)
+    print('The textbook solution is given using 3 methods --\n Isothermal equation: 107.8 mmscfd, Weymouth equation: 105. 1 mmscfd, Panhandle equation: 128.2 mmscfd')
 
 def test_Crane_choked_steam():
     #NOTE this problem is a dead end for this program, because it starts as saturated vapor and immediately goes two-phase upon expansion.
@@ -941,45 +942,45 @@ def test_Crane_4_22():
 
 if __name__ == "__main__":
 
-    # print('Zucker & Biblarz unnumbered example in section 5.7 (isentropic converging nozzle):')
-    # test_ZuckerBiblarz5_7()
+    print('Zucker & Biblarz unnumbered example in section 5.7 (isentropic converging nozzle):')
+    test_ZuckerBiblarz5_7()
 
-    # print('--------------------------------------------------------')
-    # print('Zucker & Biblarz example 9.3 (Fanno flow):')
-    # test_ZuckerBiblarz9_3()
+    print('--------------------------------------------------------')
+    print('Zucker & Biblarz example 9.3 (Fanno flow):')
+    test_ZuckerBiblarz9_3()
 
-    # print('--------------------------------------------------------')
-    # print('de Nevers example 8.10 (isentropic converging nozzle and Fanno flow):')
-    # test_deNevers8_10()
+    print('--------------------------------------------------------')
+    print('de Nevers example 8.10 (isentropic converging nozzle and Fanno flow):')
+    test_deNevers8_10()
 
-    # print('--------------------------------------------------------')
-    # print('Zucker & Biblarz example 10.3 (Rayleigh flow):')
-    # test_ZuckerBiblarz10_3()
+    print('--------------------------------------------------------')
+    print('Zucker & Biblarz example 10.3 (Rayleigh flow):')
+    test_ZuckerBiblarz10_3()
 
-    # print('--------------------------------------------------------')
-    # print('de Nevers example 6.11 and 6.12 (incompressible fluid friction with pipe and fittings):')
-    # test_deNevers6_11()
+    print('--------------------------------------------------------')
+    print('de Nevers example 6.11 and 6.12 (incompressible fluid friction with pipe and fittings):')
+    test_deNevers6_11()
 
-    # print('--------------------------------------------------------')
-    # print('de Nevers example 6.4 (incompressible fluid friction with pipe):')
-    # test_deNevers6_4()
+    print('--------------------------------------------------------')
+    print('de Nevers example 6.4 (incompressible fluid friction with pipe):')
+    test_deNevers6_4()
 
-    # print('--------------------------------------------------------')
-    # print('\nCrane TP410 example 4-18')
-    # test_Crane_gas_pipeline()
+    print('--------------------------------------------------------')
+    print('\nCrane TP410 example 4-18')
+    test_Crane_gas_pipeline()
 
-    # print('--------------------------------------------------------')
-    # print('\nCrane TP410 example 4-16')
-    # test_Crane_air_line()
+    print('--------------------------------------------------------')
+    print('\nCrane TP410 example 4-16')
+    test_Crane_air_line()
 
-    # print('--------------------------------------------------------')
-    # print('\nCrane TP410 example 4-10')
-    # test_Crane_4_10()
+    print('--------------------------------------------------------')
+    print('\nCrane TP410 example 4-10')
+    test_Crane_4_10()
 
 
-    # print('--------------------------------------------------------')
-    # print('\nCrane TP410 example 4-21')
-    # test_Crane_4_21()
+    print('--------------------------------------------------------')
+    print('\nCrane TP410 example 4-21')
+    test_Crane_4_21()
 
     print('--------------------------------------------------------')
     print('\nCrane TP410 example 4-22')
