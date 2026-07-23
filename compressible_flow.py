@@ -2866,7 +2866,7 @@ def compressible_pipe_segment(
         # 1/mdot * dq/dL = dH/dL - v^2/rho * drho/dL + g * dz/dL
         # We will need to use an equation of state to relate pressure and density. If rho = f(H, P):
         # drho/dL = (∂rho/∂P)_H * dP/dL + (∂rho/∂H)_P * dH/dL [chain rule for partial derivatives]
-        # We'll call (∂rho/∂P)_H  = A and (∂rho/∂H)_P = B and assume they are relatively constant over the length slice.
+        # We'll call (∂rho/∂P)_H  = A and (∂rho/∂H)_P = B and assume they are relatively constant over the length slice. I realize in hindsight that choosing A for this variable is a bad choice, as we might confuse it for area.
 
         # Accounting for entropy, from "Fundamentals of Gas Dynamics, 2nd Ed." by Zucker and Biblarz", equation 3.1
         # dS = dSe + dSi
@@ -2889,7 +2889,7 @@ def compressible_pipe_segment(
         # We can use the Euler method to estimate the pressure at the end of a length slice dL
 
         #First, calculate those oddball partial derivatives
-        A = AS.first_partial_deriv(CP.iDmass, CP.iP, CP.iHmass)
+        A = AS.first_partial_deriv(CP.iDmass, CP.iP, CP.iHmass) #Note again, 'A' was a bad choice for this variable name, don't want to be confused for area
         B = AS.first_partial_deriv(CP.iDmass, CP.iHmass, CP.iP)
         #Now, calculate each contributing component of the dP/dL.
         dP_dL_denominator_factor = v_in**2*A + v_in**2*B/rho_in - 1
