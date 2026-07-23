@@ -6,6 +6,7 @@ owns a reference to a single AppState; navigation signals are wired here.
 
 import sys
 
+from PySide6.QtGui import QFont
 from PySide6.QtWidgets import QApplication, QMainWindow, QStackedWidget
 
 from gui.state import AppState
@@ -129,6 +130,13 @@ class MainWindow(QMainWindow):
 
 def run():
     app = QApplication(sys.argv)
+    # Consolas on Windows; monospace fallbacks for macOS / Linux so the app
+    # stays monospaced everywhere and never errors on a missing family.  Only
+    # the family changes -- the platform default point size is preserved.
+    f = app.font()
+    f.setFamilies(["Consolas", "Menlo", "DejaVu Sans Mono", "Courier New"])
+    f.setStyleHint(QFont.StyleHint.Monospace)
+    app.setFont(f)
     win = MainWindow()
     win.show()
     sys.exit(app.exec())

@@ -33,8 +33,10 @@ import os
 import traceback
 import warnings
 
-from PySide6.QtCore import Qt, Signal
+from PySide6.QtCore import Qt, QRectF, Signal
+from PySide6.QtGui import QColor
 from PySide6.QtWidgets import (
+    QApplication,
     QButtonGroup,
     QCheckBox,
     QComboBox,
@@ -57,6 +59,7 @@ import gui.dialogs as dialogs
 from gui.dialogs import NodeResultsDialog, PipeProfileWindow
 
 from NodeGraphQt import BaseNode, NodeGraph
+from NodeGraphQt.qgraphics.node_base import NodeItem
 
 from component_classes import ureg
 from gui import units as U
@@ -92,6 +95,37 @@ _VOL_FLOW_DIM  = ureg.Quantity(1.0, "m^3/s").dimensionality
 # NodeGraphQt node subclasses
 # ---------------------------------------------------------------------------
 
+class _LightTitleNodeItem(NodeItem):
+    """NodeItem whose title bar is a very light grey instead of NodeGraphQt's
+    hardcoded semi-transparent-black overlay (which reads mid-grey on our
+    white node boxes).
+
+    We let the stock paint run, then overpaint just the title rectangle.  The
+    title text is a child QGraphicsItem, painted after us, so it stays visible
+    on top of the overpaint.  When selected we skip it so NodeGraphQt's normal
+    selection highlight is preserved.  The margin/padding constants mirror
+    NodeItem._paint_horizontal so the light band lines up with the stock title.
+    """
+    TITLE_COLOR = (230, 230, 230)   # tune here for a lighter/darker band
+
+    def paint(self, painter, option, widget):
+        super().paint(painter, option, widget)
+        if self.selected:
+            return
+        painter.save()
+        painter.setPen(Qt.NoPen)
+        margin = 1.0
+        rect = self.boundingRect()
+        rect = QRectF(rect.left() + margin, rect.top() + margin,
+                      rect.width() - 2 * margin, rect.height() - 2 * margin)
+        tr = self._text_item.boundingRect()
+        title_rect = QRectF(tr.x() + 3.0, rect.y() + 2.0,
+                            rect.width() - 3.0 - margin, tr.height() - 4.0)
+        painter.setBrush(QColor(*self.TITLE_COLOR))
+        painter.drawRoundedRect(title_rect, 3.0, 3.0)
+        painter.restore()
+
+
 class SourceSinkNode(BaseNode):
     """Boundary node carrying a P or Q_ext spec.
 
@@ -104,7 +138,7 @@ class SourceSinkNode(BaseNode):
     NODE_NAME = "Source/Sink"
 
     def __init__(self):
-        super().__init__()
+        super().__init__(qgraphics_item=_LightTitleNodeItem)
         self.add_input("in",   multi_input=True)
         self.add_output("out", multi_output=True)
         self.add_text_input(
@@ -126,7 +160,7 @@ class JunctionNode(BaseNode):
     NODE_NAME = "Junction"
 
     def __init__(self):
-        super().__init__()
+        super().__init__(qgraphics_item=_LightTitleNodeItem)
         self.add_input("in",   multi_input=True)
         self.add_output("out", multi_output=True)
         self.add_text_input(
@@ -149,7 +183,7 @@ class PipeSegmentNode(BaseNode):
     NODE_NAME = "Pipe Segment"
 
     def __init__(self):
-        super().__init__()
+        super().__init__(qgraphics_item=_LightTitleNodeItem)
         self.add_input("in",   multi_input=False)
         self.add_output("out", multi_output=False)
         self.add_text_input(
@@ -171,7 +205,7 @@ class FittingNode(BaseNode):
     NODE_NAME = "Fitting"
 
     def __init__(self):
-        super().__init__()
+        super().__init__(qgraphics_item=_LightTitleNodeItem)
         self.add_input("in",   multi_input=False)
         self.add_output("out", multi_output=False)
         self.add_text_input(
@@ -193,7 +227,7 @@ class ValveNode(BaseNode):
     NODE_NAME = "Valve"
 
     def __init__(self):
-        super().__init__()
+        super().__init__(qgraphics_item=_LightTitleNodeItem)
         self.add_input("in",   multi_input=False)
         self.add_output("out", multi_output=False)
         self.add_text_input(
@@ -215,7 +249,7 @@ class CheckValveNode(BaseNode):
     NODE_NAME = "Check Valve"
 
     def __init__(self):
-        super().__init__()
+        super().__init__(qgraphics_item=_LightTitleNodeItem)
         self.add_input("in",   multi_input=False)
         self.add_output("out", multi_output=False)
         self.add_text_input(
@@ -247,6 +281,13 @@ class NetworkScreen(QWidget):
     DISPLAY_FLOW_UNITS   = U.FLOW_RATE_INCOMPRESSIBLE
     DISPLAY_FLOW_DEFAULT = "BBL/D"
     FLUID_BOX_TITLE      = "Fluid (incompressible)"
+    # Point size for the canvas node title / port / result-field text.
+    # NodeGraphQt's default is 9, which reads small; bump it a little.
+    NODE_FONT_SIZE       = 11
+    # Minimum width (px) for the result fields inside a node.  NodeGraphQt
+    # hard-caps its line-edit widgets at 140 px, which clips longer values
+    # such as "+16.334 mmscf/day"; widen them so the numbers fit.
+    NODE_RESULT_WIDTH    = 180
 
     def __init__(self, state, parent=None):
         super().__init__(parent)
@@ -291,6 +332,16 @@ class NetworkScreen(QWidget):
         self.graph.register_node(CheckValveNode)
         self.graph.node_selected.connect(self._on_node_selected)
         self.graph.nodes_deleted.connect(self._on_nodes_deleted)
+        # Restyle every node box (white fill, black text, larger font) as it's
+        # created.  node_created is the shared creation path for both toolbar
+        # adds and load, so this one connection covers everything.
+        self.graph.node_created.connect(self._apply_node_style)
+
+        # White canvas with a faint grid (NodeGraphQt defaults to a dark
+        # background).  Node fill/text colors are per-node and independent of
+        # the canvas, so the boxes stay legible on white.
+        self.graph.set_background_color(255, 255, 255)
+        self.graph.set_grid_color(220, 220, 220)
 
         # ---- Toolbar ----
         add_src_btn   = QPushButton("+ Source/Sink")
@@ -790,6 +841,65 @@ class NetworkScreen(QWidget):
     def _add_check_valve(self):
         n = self.graph.create_node(CHECKVALVE_NODE_TYPE_ID)
         self.node_specs[n.id] = self._default_check_valve_fields()
+
+    def _apply_node_style(self, node):
+        """Restyle a freshly-created canvas node: white fill, black text, and
+        a larger font so the boxes read clearly on the white canvas.  Wired to
+        the graph's node_created signal, so it fires for both toolbar adds and
+        nodes recreated on load.
+        """
+        view = node.view
+        size = self.NODE_FONT_SIZE
+        # NodeGraphQt sets the canvas font family explicitly, so it doesn't
+        # inherit the app font set in main.py; copy the family list across so
+        # the canvas matches the rest of the GUI.
+        families = QApplication.instance().font().families()
+
+        def _bump(item):
+            if item is None:
+                return
+            f = item.font()
+            f.setPointSize(size)
+            if families:
+                f.setFamilies(families)
+            item.setFont(f)
+
+        # White node box with black title text and a light-grey border
+        # (NodeGraphQt defaults to a near-black fill with light text).
+        node.set_color(255, 255, 255)
+        view.text_color = (0, 0, 0, 255)
+        view.border_color = (180, 180, 180, 255)
+
+        # Node title.
+        _bump(getattr(view, "text_item", None))
+        # Port labels: darken to black and enlarge.
+        for port in list(view.inputs) + list(view.outputs):
+            item = (view.get_input_text_item(port) if port in view.inputs
+                    else view.get_output_text_item(port))
+            if item is not None:
+                item.setDefaultTextColor(QColor(0, 0, 0))
+                _bump(item)
+        # Embedded result / text-input widgets: white field, black text, and
+        # widened past NodeGraphQt's built-in 140 px cap so long result
+        # numbers aren't clipped.
+        for widget in view.widgets.values():
+            inner = widget.get_custom_widget()
+            if inner is None:
+                continue
+            inner.setStyleSheet(
+                "QLineEdit {"
+                " background: white;"
+                " border: 1px solid rgb(180, 180, 180);"
+                " border-radius: 3px;"
+                " color: black;"
+                " }"
+            )
+            widget.setMaximumWidth(self.NODE_RESULT_WIDTH + 40)
+            inner.setMinimumWidth(self.NODE_RESULT_WIDTH)
+            _bump(inner)
+
+        # Recompute the box geometry so the larger text isn't clipped.
+        view.draw_node()
 
     def _delete_selected(self):
         nodes = self.graph.selected_nodes()
@@ -2006,7 +2116,7 @@ class NetworkScreen(QWidget):
         Q_str     = self._fmt_flow_for_details(cr.mdot_kgs, cr.Q_m3s)
 
         rows = [
-            ("Mass flow:",    Q_str),
+            ("Flow:",         Q_str),
             ("Inlet P:",      P_in_str),
             ("Outlet P:",     P_out_str),
             ("dP:",           dP_str),
@@ -2024,7 +2134,7 @@ class NetworkScreen(QWidget):
 
         P_unit = self.d_pressure.currentText()
         rows = [
-            ("Mass flow:", self._fmt_flow_for_details(cr.mdot_kgs, cr.Q_m3s)),
+            ("Flow:",      self._fmt_flow_for_details(cr.mdot_kgs, cr.Q_m3s)),
             ("dP:",        _fmt_pressure_signed(cr.dP_Pa, P_unit)),
             ("Velocity:",  _fmt_velocity_at_D(v, D)),
         ]
@@ -2040,7 +2150,7 @@ class NetworkScreen(QWidget):
         P_unit = self.d_pressure.currentText()
         rows = [
             ("K-factor:",   f"{comp.K:.3f}"),
-            ("Mass flow:",  self._fmt_flow_for_details(cr.mdot_kgs, cr.Q_m3s)),
+            ("Flow:",       self._fmt_flow_for_details(cr.mdot_kgs, cr.Q_m3s)),
             ("dP:",         _fmt_pressure_signed(cr.dP_Pa, P_unit)),
             ("Velocity:",   _fmt_velocity_at_D(v, D)),
         ]

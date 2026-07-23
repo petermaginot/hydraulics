@@ -98,14 +98,14 @@
             [
               0.0,
               0.0,
-              0.15191739999999998,
-              0.01812612286367564
+              0.154051,
+              0.018638841920305155
             ],
             [
               4267.2,
               30.479999999999997,
-              0.15191739999999998,
-              0.01812612286367564
+              0.154051,
+              0.018638841920305155
             ]
           ]
         }
@@ -183,11 +183,11 @@
   "gui_extras": {
     "canvas_nodes": [
       {
-        "id": "0x14c4e445be0",
+        "id": "0x2ab71949be0",
         "name": "Source/Sink",
         "pos": [
-          -307.70180834022904,
-          475.70304249943973
+          -299.8087368967872,
+          353.36043512609035
         ],
         "spec": {
           "type": "source_sink",
@@ -204,11 +204,11 @@
         }
       },
       {
-        "id": "0x14c4e2c3890",
+        "id": "0x2ab717c7d90",
         "name": "Source/Sink 1",
         "pos": [
-          920.9279167893502,
-          438.2252160600497
+          897.2487024590246,
+          290.8878824491344
         ],
         "spec": {
           "type": "source_sink",
@@ -225,11 +225,11 @@
         }
       },
       {
-        "id": "0x14c4e2c3ed0",
+        "id": "0x2ab717c7ed0",
         "name": "Pipe Segment",
         "pos": [
-          258.1293314683287,
-          308.55254069150914
+          279.17752198417384,
+          254.61655249465628
         ],
         "spec": {
           "type": "pipe",
@@ -249,11 +249,11 @@
         }
       },
       {
-        "id": "0x14c4e3bde00",
+        "id": "0x2ab718c9810",
         "name": "Junction",
         "pos": [
           -15.938022817252914,
-          471.6542209043191
+          366.4132683250939
         ],
         "spec": {
           "type": "junction",
@@ -264,11 +264,11 @@
         }
       },
       {
-        "id": "0x14c4e3bdf30",
+        "id": "0x2ab718c9e00",
         "name": "Junction 1",
         "pos": [
-          640.7407031433654,
-          455.3114452136236
+          622.323536442001,
+          339.54639737647574
         ],
         "spec": {
           "type": "junction",
@@ -279,11 +279,11 @@
         }
       },
       {
-        "id": "0x14c4e3be060",
+        "id": "0x2ab718c9f30",
         "name": "Pipe Segment 1",
         "pos": [
-          299.93671485079193,
-          590.6648463509017
+          272.3109647987453,
+          467.0067270703122
         ],
         "spec": {
           "type": "pipe",
@@ -292,7 +292,7 @@
           "ID_unit": "inch",
           "OD_str": "6.625",
           "OD_unit": "inch",
-          "WT_str": "0.322",
+          "WT_str": "0.280",
           "WT_unit": "inch",
           "L_str": "14000",
           "L_unit": "ft",
@@ -303,7 +303,7 @@
         }
       },
       {
-        "id": "0x14c4e3be650",
+        "id": "0x2ab718ca060",
         "name": "Junction 2",
         "pos": [
           381.16867657207763,
@@ -318,7 +318,7 @@
         }
       },
       {
-        "id": "0x14c4e3be520",
+        "id": "0x2ab718ca190",
         "name": "Pipe Segment 2",
         "pos": [
           109.75284850713527,
@@ -342,7 +342,7 @@
         }
       },
       {
-        "id": "0x14c4e3be9e0",
+        "id": "0x2ab718ca2c0",
         "name": "Source/Sink 2",
         "pos": [
           -120.13487471726965,
@@ -363,7 +363,7 @@
         }
       },
       {
-        "id": "0x14c4e3bec40",
+        "id": "0x2ab718ca520",
         "name": "Pipe Segment 3",
         "pos": [
           625.8878658109604,
@@ -389,69 +389,69 @@
     ],
     "canvas_connections": [
       {
-        "from_id": "0x14c4e445be0",
+        "from_id": "0x2ab71949be0",
         "from_port": "out",
-        "to_id": "0x14c4e3bde00",
+        "to_id": "0x2ab718c9810",
         "to_port": "in"
       },
       {
-        "from_id": "0x14c4e2c3ed0",
+        "from_id": "0x2ab717c7ed0",
         "from_port": "out",
-        "to_id": "0x14c4e3bdf30",
+        "to_id": "0x2ab718c9e00",
         "to_port": "in"
       },
       {
-        "from_id": "0x14c4e3bde00",
+        "from_id": "0x2ab718c9810",
         "from_port": "out",
-        "to_id": "0x14c4e2c3ed0",
+        "to_id": "0x2ab717c7ed0",
         "to_port": "in"
       },
       {
-        "from_id": "0x14c4e3bde00",
+        "from_id": "0x2ab718c9810",
         "from_port": "out",
-        "to_id": "0x14c4e3be060",
+        "to_id": "0x2ab718c9f30",
         "to_port": "in"
       },
       {
-        "from_id": "0x14c4e3bde00",
+        "from_id": "0x2ab718c9810",
         "from_port": "out",
-        "to_id": "0x14c4e3be520",
+        "to_id": "0x2ab718ca190",
         "to_port": "in"
       },
       {
-        "from_id": "0x14c4e3bdf30",
+        "from_id": "0x2ab718c9e00",
         "from_port": "out",
-        "to_id": "0x14c4e2c3890",
+        "to_id": "0x2ab717c7d90",
         "to_port": "in"
       },
       {
-        "from_id": "0x14c4e3be060",
+        "from_id": "0x2ab718c9f30",
         "from_port": "out",
-        "to_id": "0x14c4e3bdf30",
+        "to_id": "0x2ab718c9e00",
         "to_port": "in"
       },
       {
-        "from_id": "0x14c4e3be650",
+        "from_id": "0x2ab718ca060",
         "from_port": "out",
-        "to_id": "0x14c4e3bec40",
+        "to_id": "0x2ab718ca520",
         "to_port": "in"
       },
       {
-        "from_id": "0x14c4e3be520",
+        "from_id": "0x2ab718ca190",
         "from_port": "out",
-        "to_id": "0x14c4e3be650",
+        "to_id": "0x2ab718ca060",
         "to_port": "in"
       },
       {
-        "from_id": "0x14c4e3be9e0",
+        "from_id": "0x2ab718ca2c0",
         "from_port": "out",
-        "to_id": "0x14c4e3be650",
+        "to_id": "0x2ab718ca060",
         "to_port": "in"
       },
       {
-        "from_id": "0x14c4e3bec40",
+        "from_id": "0x2ab718ca520",
         "from_port": "out",
-        "to_id": "0x14c4e3bdf30",
+        "to_id": "0x2ab718c9e00",
         "to_port": "in"
       }
     ]

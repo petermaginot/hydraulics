@@ -491,7 +491,7 @@ class CompressibleNetworkScreen(NetworkScreen):
         v_unit = "ft/s"
 
         rows = [
-            ("Mass flow:",   f"{self._convert_mass_flow(abs(mdot), Q_unit):+.4g} {Q_unit}"),
+            ("Flow:",        f"{self._convert_mass_flow(abs(mdot), Q_unit):+.4g} {Q_unit}"),
             ("Inlet P:",     _fmt_pressure(P_in,  P_unit)),
             ("Outlet P:",    _fmt_pressure(P_out, P_unit)),
             ("dP:",          _fmt_pressure_signed(P_out - P_in, P_unit)),
@@ -570,7 +570,7 @@ class CompressibleNetworkScreen(NetworkScreen):
         T_unit = self.d_temperature.currentText()
         Q_unit = self.d_flow.currentText()
         rows = [
-            ("Mass flow:", f"{self._convert_mass_flow(abs(mdot), Q_unit):+.4g} {Q_unit}"),
+            ("Flow:", f"{self._convert_mass_flow(abs(mdot), Q_unit):+.4g} {Q_unit}"),
             ("Inlet P:",   _fmt_pressure(P_in,  P_unit)),
             ("Outlet P:",  _fmt_pressure(P_out, P_unit)),
             ("dP:",        _fmt_pressure_signed(P_out - P_in, P_unit)),
@@ -592,7 +592,7 @@ class CompressibleNetworkScreen(NetworkScreen):
         Q_unit = self.d_flow.currentText()
         rows = [
             ("K-factor:",  f"{comp.K:.3f}"),
-            ("Mass flow:", f"{self._convert_mass_flow(abs(mdot), Q_unit):+.4g} {Q_unit}"),
+            ("Flow:", f"{self._convert_mass_flow(abs(mdot), Q_unit):+.4g} {Q_unit}"),
             ("Inlet P:",   _fmt_pressure(P_in,  P_unit)),
             ("Outlet P:",  _fmt_pressure(P_out, P_unit)),
             ("dP:",        _fmt_pressure_signed(P_out - P_in, P_unit)),
