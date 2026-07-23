@@ -16,7 +16,7 @@ def test_deNevers8_10():
         compressible_pipe_segment, FlowState,
     )
     #Example 8.10 on pages 315-317 in "Fluid Mechanics for Chemical Engineers, 3rd Ed" by Noel de Nevers
-    #Adiabadic flow with friction (Fanno flow)
+    #Adiabatic flow with friction (Fanno flow)
     #Given P0 (stagnation) = 30 psia, T0 (stagnation) = 200 F find flow rate if receiving reservoir P3 = 18 psia
     #Flow accelerates through a frictionless nozzle into an 8 ft long section of 1" Schedule 40 pipe
     #Example uses a two-iteration Fanno flow calculation and finds mass flow rate to be 0.317 lb/s. 
@@ -194,7 +194,7 @@ def test_ZuckerBiblarz9_3():
         compressible_pipe_segment, FlowState,
     )
     #Example 9.3 on pages 259-260 in "Fundamentals of Gas Dynamics, 2nd Ed" by Robert Zucker and Oscar Biblarz
-    #Adiabadic flow with friction (Fanno flow)
+    #Adiabatic flow with friction (Fanno flow)
     #Air flowing at P1 = 20 psia, T1 = 70 F , v1 = 406 ft/s in a 6" diameter galvanized iron duct (absolute roughness = 0.0005 ft)
     #Find final Mach number, temperature, pressure after 70 feet
     

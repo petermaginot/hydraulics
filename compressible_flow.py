@@ -3495,7 +3495,7 @@ def compressible_dA(fs, A_throat, K = 0.0, A2 = None, P2 = None):
     flow rate, the function raises an error.
 
     If no choking occurs, the fluid is assumed to isentropically accelerate to the throat condition, also satisfying
-    an energy balance (adiabadic, no elevation change - no change in stagnation enthalpy):
+    an energy balance (adiabatic, no elevation change - no change in stagnation enthalpy):
 
         H_th + 0.5*v_th^2 = H1 + 0.5*v1^2
         S_th = S1
@@ -3697,7 +3697,7 @@ def compressible_dA(fs, A_throat, K = 0.0, A2 = None, P2 = None):
 
 def adiabatic_expansion_solver(fs, P2, T_ITER_MAX = 8, H_ABS_TOL = 1.0, H_REL_TOL = 1.0e-9):
     """
-    Perform an adiabadic expansion to P2 at area fs.A with stagnation enthalpy conserved. Iterate the outlet temperature until the energy conservation is satisfied.
+    Perform an adiabatic expansion to P2 at area fs.A with stagnation enthalpy conserved. Iterate the outlet temperature until the energy conservation is satisfied.
     
     v_out is recomputed each iteration from the current rho_out so the
     residual is on full h_stagnation. 
