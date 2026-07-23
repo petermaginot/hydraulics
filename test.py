@@ -1,4 +1,6 @@
-
+"""
+Self test functions run to make sure nothing is broken when developing 
+"""
 import CoolProp.CoolProp as CP
 from CoolProp.CoolProp import AbstractState
 import composition

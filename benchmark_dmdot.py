@@ -1,4 +1,6 @@
-"""Benchmark the cost of dmdot_dT vs dP_dT at three levels per component:
+"""
+This benchmark is used when optimizing the various solvers used by dP_dT, dmdot_dT, and the network solver.
+Benchmark the cost of dmdot_dT vs dP_dT at three levels per component:
 
   1. Forward dP_dT call (baseline cost of one walk).
   2. Component-level dmdot_dT call (brentq + forward closure).
@@ -7,6 +9,8 @@
 
 For each level we record wall-clock time and the number of times the
 component's dP_dT was actually invoked (instrumented via a monkeypatch).
+
+
 
 Run: `python benchmark_dmdot.py`
 """
