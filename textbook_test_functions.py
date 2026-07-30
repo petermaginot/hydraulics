@@ -116,7 +116,7 @@ def test_ZuckerBiblarz5_7():
     )
     #Example on pages 124-126 in "Fundamentals of Gas Dynamics, 2nd Ed" by Robert Zucker and Oscar Biblarz
     #Isentropic changing area flow
-    #Air at stagnation conditions of 100 psia and 600 deg Rflows through a nozzle into a receiver at 80.2 psia
+    #Air at stagnation conditions of 100 psia and 600 deg R flows through a nozzle into a receiver at 80.2 psia
     #Find final Mach number, temperature and velocity
     #Assume an arbitrary large area initially for stagnation conditions, and a significantly smaller area for final conditions
     A0 = 1000
@@ -188,9 +188,7 @@ def test_ZuckerBiblarz5_7():
     print('Textbook solution: outlet velocity = 663 ft/s, outlet temperature = 563 deg R, Mach #=0.57')
 
 def test_ZuckerBiblarz9_3():
-    from compressible_flow import (
-        Line_Segment, Bend, Contraction_Expansion, _build_phase_limits,
-        _safe_update_PT, compressible_changing_area_K,
+    from compressible_flow import (_build_phase_limits, _safe_update_PT, compressible_changing_area_K,
         compressible_pipe_segment, FlowState,
     )
     #Example 9.3 on pages 259-260 in "Fundamentals of Gas Dynamics, 2nd Ed" by Robert Zucker and Oscar Biblarz
@@ -205,6 +203,8 @@ def test_ZuckerBiblarz9_3():
     v_1   = ureg.Quantity(406.0,    "ft/s").to("m/s").magnitude
     dL_gas   = ureg.Quantity(70.0,    "feet").to("m").magnitude
     dz_gas   = ureg.Quantity(0.0,    "feet").to("m").magnitude
+
+    #Create abstract state object with fluid composition
     AS = composition.define_composition(
         y_Nitrogen = 0.79,
         y_Oxygen = 0.21,
@@ -212,6 +212,8 @@ def test_ZuckerBiblarz9_3():
         )
     phase_limits = _build_phase_limits(AS)
     T_cricondentherm, P_cricondenbar, T_critical, P_critical = phase_limits
+
+    #Update abstract state with pressure and temperature
     _safe_update_PT(AS, P0, T0, *phase_limits)
 
     A_1 = math.pi * ID_pipe**2/4
@@ -223,17 +225,20 @@ def test_ZuckerBiblarz9_3():
 
     print(f'\nInputs: P0 = {ureg.Quantity(P0,"Pa").to("psi"):.3f}, T0 = {ureg.Quantity(T0,"degK").to("degF"):.3f}')
 
+    #Create a flow state object to contain the fluid properties and flow rate
     fs = FlowState(
         AS, mdot, A=A_1, z=0.0,
         T_cricondentherm=T_cricondentherm, P_cricondenbar=P_cricondenbar,
         T_critical=T_critical, P_critical=P_critical,
     )
+    #Call function to calculate dP and dT and apply to abstract state/flow state object. Could alternatively create a line segment object and call dP_dT function.
     compressible_pipe_segment(
         fs,
         dL=dL_gas, dz=dz_gas, D_h=ID_pipe, roughness=eps_gas,
         isothermal=False,
     )
 
+    #Extract results from updated abstract state object.
     P_2 = AS.p()
     T_2 = AS.T()
     v_2 = mdot / AS.rhomass() / A_1
@@ -452,7 +457,7 @@ def test_Crane_air_line():
 
 def test_Crane_4_10():
     #Crane example 4-10 - pressure drop of 600 psig, 850F steam through 400 ft of 6" S/80 pipe at 90,000 lb/hr rate. 
-    # The problem statement doesn't say what sequence the fittings are in, so we willjust evaluate pipe -> elbows -> valves
+    # The problem statement doesn't say what sequence the fittings are in, so we will just evaluate pipe -> elbows -> valves
     from compressible_flow import (
         Line_Segment, Bend, Contraction_Expansion, Valve,
         _build_phase_limits, _safe_update_PT, compressible_changing_area_K,

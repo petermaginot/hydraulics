@@ -2866,7 +2866,7 @@ def compressible_pipe_segment(
         # 1/mdot * dq/dL = dH/dL - v^2/rho * drho/dL + g * dz/dL
         # We will need to use an equation of state to relate pressure and density. If rho = f(H, P):
         # drho/dL = (∂rho/∂P)_H * dP/dL + (∂rho/∂H)_P * dH/dL [chain rule for partial derivatives]
-        # We'll call (∂rho/∂P)_H  = A and (∂rho/∂H)_P = B and assume they are relatively constant over the length slice. I realize in hindsight that choosing A for this variable is a bad choice, as we might confuse it for area.
+        # We'll call (∂rho/∂P)_H  = C and (∂rho/∂H)_P = B and assume they are relatively constant over the length slice.
 
         # Accounting for entropy, from "Fundamentals of Gas Dynamics, 2nd Ed." by Zucker and Biblarz", equation 3.1
         # dS = dSe + dSi
@@ -2881,7 +2881,7 @@ def compressible_pipe_segment(
 
         # Then, taking the dH/dL from the partial derivatives chain rule above and plugging it in to eliminate drho/dL and eliminating dH/dL with the two equations for DH/dL,
         # after MUCH REARRANGING, you get:
-        # dP/dL = (f * rho * v^2/(2*D_h) * (1-v^2 * B / rho) + rho * g * dz/dL - v^2 * B/mdot * dq/dL)/(v^2*A + v^2 * B/rho - 1)
+        # dP/dL = (f * rho * v^2/(2*D_h) * (1-v^2 * B / rho) + rho * g * dz/dL - v^2 * B/mdot * dq/dL)/(v^2*C + v^2 * B/rho - 1)
         # where     ^friction contribution                     ^elevation change contrib      ^heat transfer contribution
 
         # For full details, see a hand-derivation in the /Derivation_images/dP_dL folder in the repo
@@ -2889,10 +2889,10 @@ def compressible_pipe_segment(
         # We can use the Euler method to estimate the pressure at the end of a length slice dL
 
         #First, calculate those oddball partial derivatives
-        A = AS.first_partial_deriv(CP.iDmass, CP.iP, CP.iHmass) #Note again, 'A' was a bad choice for this variable name, don't want to be confused for area
+        C = AS.first_partial_deriv(CP.iDmass, CP.iP, CP.iHmass)
         B = AS.first_partial_deriv(CP.iDmass, CP.iHmass, CP.iP)
         #Now, calculate each contributing component of the dP/dL.
-        dP_dL_denominator_factor = v_in**2*A + v_in**2*B/rho_in - 1
+        dP_dL_denominator_factor = v_in**2*C + v_in**2*B/rho_in - 1
         dP_dL_friction = (f_darcy*rho_in*v_in**2/(2*D_h)*(1-v_in**2*B/rho_in))/dP_dL_denominator_factor
         dP_dL_gravity = (rho_in * grav_constant * dz/dL)/dP_dL_denominator_factor
         dP_dL_heatxfr = (-v_in**2*B*q_wall/(mdot * dL))/dP_dL_denominator_factor
