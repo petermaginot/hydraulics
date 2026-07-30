@@ -32,6 +32,11 @@ Base_Contraction_Expansion
     An abrupt contraction or expansion between two pipe diameters.  Stores
     upstream and downstream inner diameters.
 
+Base_Orifice
+    A sharp-edge orifice fitting. Stores the pipe inner diameter, orifice bore diameter, and tap type.
+    Calculates the discharge coefficeint Cd from the fluids library. Alternatively, a discharge
+    coefficient can be manually supplied.
+
 Module-level helpers
 --------------------
 _to_si(val, unit)

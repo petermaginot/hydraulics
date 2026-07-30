@@ -139,10 +139,24 @@ Returns a list of `(distance_m, P_Pa, T_K, v_ms)` tuples — one per profile poi
 Modeled as adiabatic. Adds **`dP_dT(fs, mu=None)`** which absorbs any inlet-area discontinuity, then uses `fluids.fittings.bend_rounded()` to obtain the K-factor and delegates to `compressible_K()`. `fs.A` is unchanged on return (equal inlet/outlet area).
 
 ### `Valve` (inherits `Base_Valve`)
-Modeled as adiabatic. Adds **`dP_dT(fs)`** which absorbs any inlet-area discontinuity, then passes the pre-computed K-factor stored on the instance directly to `compressible_K()` — no viscosity, Reynolds-number, or correlation lookup is performed.
+Modeled as adiabatic. Adds **`dP_dT(fs)`** which absorbs any inlet-area discontinuity, then dispatches on whether the valve carries a geometric constriction. With no constriction (`minimum_diameter` is `None` or equal to `Di`) it delegates to `compressible_changing_area_K(fs, A_pipe, K=self.K)`, applying the K-loss across the pipe-area control volume. With a constriction (`minimum_diameter < Di`) it delegates to `compressible_dA()` with `A_throat = π·D_min²/4` and `A2 = A_pipe`, so acceleration to the trim is isentropic and the K-loss recovery uses the rigorous coupled (P, T) solve — internal choking at the trim is caught even when the body outlet is comfortably subsonic. `fs.A` is the pipe area on return in both branches. No viscosity, Reynolds-number, or correlation lookup is performed; the K-factor stored on the instance is used as-is.
+
+Adds **`dmdot_dT(fs, P2)`**, the inverse: it drives the same two-branch forward solve to the target outlet pressure `P2` and leaves `fs.mdot` at the solved value.
+
+### `CheckValve` (inherits `Base_CheckValve`)
+Modeled as adiabatic. Same geometry as `Base_Valve` (`Di` + forward-flow `K`, optional `minimum_diameter`) plus a class-level `check_valve = True` marker. **`dP_dT(fs)`** uses the identical constriction dispatch as `Valve.dP_dT`, and **`dmdot_dT(fs, P2)`** delegates straight to `Valve.dmdot_dT`.
+
+Both methods model forward passage only: reverse flow is blocked exactly by the network solvers, which treat a check valve as a perfect seal and pin its edge to zero flow via a complementarity residual (see [network.md](network.md) § "Reverse-flow handling"). The forward inversion is therefore never invoked under sustained reverse conditions.
 
 ### `Contraction_Expansion` (inherits `Base_Contraction_Expansion`)
 Modeled as adiabatic. Adds **`dP_dT(fs)`** which absorbs any inlet-area discontinuity to land at `A_US`, obtains the K-factor from `fluids.fittings.contraction_sharp()` (for contractions; the result is converted from a downstream- to an upstream-velocity reference) or `diffuser_sharp()` (for expansions), then delegates to `compressible_changing_area_K()`. On return `fs.A == A_DS`.
+
+### `Orifice` (inherits `Base_Orifice`)
+Square-edged concentric orifice plate, modeled as adiabatic. Geometry is the pipe inner diameter `Di`, bore diameter `Do`, tap type (`'corner'`, `'D and D/2'`, or `'flange'`), and an optional `Cd_override`; a `UserWarning` fires when `beta = Do/Di` falls outside the ISO 5167-2 correlation range 0.10–0.75.
+
+Adds **`dP_dT(fs)`**, which absorbs any inlet-area discontinuity to land at the pipe area, resolves the discharge coefficient at the current flow conditions via `fluids.flow_meter.C_Reader_Harris_Gallagher()` (or takes `Cd_override`), converts it to a K-factor with `fluids.flow_meter.discharge_coefficient_to_K()`, and hands both to `compressible_dA()` with `A_throat = Cd·A_bore` and `A2 = A_pipe` — i.e. isentropic acceleration to the vena contracta followed by K-loss recovery to the pipe area (see the `compressible_dA` bullet below). `fs.A` is restored to the pipe area on return.
+
+Adds **`dmdot_dT(fs, P2)`**, the inverse. With `Cd_override` set it is a single `compressible_dA` Mode-2 call. With the RHG correlation in effect Cd depends on Reynolds number, which depends on `mdot`, so a Cd ↔ mdot fixed point wraps the Mode-2 call; Cd is only weakly Re-sensitive, so 2–3 passes typically suffice (capped at 8). Raises `ValueError` if `P2 >= fs.P` and `ChokedFlowError` if `P2` is below the orifice choke limit.
 
 ### Core functions
 
@@ -273,9 +287,8 @@ A dumping ground for demo and debugging test functions used while developing fea
 File for containing utility functions.
 
 ## To do's
--Add orifice plates (`Orifice` class exists; rebuild its `dP_dT` on top of `compressible_dA` for the throat-then-K-recovery split, and expose a `.K` property derived from `Cd`)
--Switch `Valve.dP_dT` to `compressible_dA` so the throat / K-recovery split replaces the inlet-linearized `compressible_K` path for high-dP service
--Wire the downstream-pressure-dictated mode of `compressible_dA` into the network solver (today only the flow-rate-dictated path is exercised)
--Handle flow choking due to pipe area, friction, or heat transfer on pipe segments
--Surface the incompressible Valve/CheckValve cavitation check at the network level — thread `P_inlet` through `_component_signed_dP` so the ISA-75.01 three-regime gate fires automatically during a network solve (today it fires only on direct `dP(..., P_inlet=...)` / `dmdot(...)` calls). See R5 in [improvements.md](improvements.md).
 -Add heat transfer calculation to pipe segments
+
+-Handling of flow choking due to pipe area, friction, or heat transfer on pipe segments is still rather clunky. Need to do a full review so it behaves better in the network solver.
+
+-Surface the incompressible Valve/CheckValve cavitation check at the network level — thread `P_inlet` through `_component_signed_dP` so the ISA-75.01 three-regime gate fires automatically during a network solve (today it fires only on direct `dP(..., P_inlet=...)` / `dmdot(...)` calls). See R5 in [improvements.md](improvements.md).
