@@ -32,6 +32,46 @@ def phase_env():
     plt.savefig('methane-ethane.png')
 
 
+def gas_properties():
+    """Calculates basic gas properties for gas at a given pressure, temperature, and composition. Optionally can also take a line ID and flow rate to calculate velocity and Mach number"""
+    P    = ureg.Quantity(10, "psi")   #Absoulute pressure, NOT GAUGE
+    T    = ureg.Quantity(300, "K")   
+
+    AS = composition.define_composition(
+        y_Methane = 0.9,
+        y_Ethane = 0.05,
+        y_Propane=0.02,
+        y_n_Butane = 0.01,
+        y_CarbonDioxide= 0.02,
+        eos = "HEOS"
+        )
+
+    ID    = ureg.Quantity(8.125, "inch")
+    A    = math.pi * ID**2 / 4.0
+    flow_rate = ureg.Quantity(1000, "mscf/day")
+
+    AS.update(CP.PT_INPUTS, P.to("Pa").magnitude, T.to("K").magnitude)
+    rho_mass = ureg.Quantity(AS.rhomass(), "kg/m^3")
+    rho_molar = ureg.Quantity(AS.rhomolar(), "mol/m^3")
+    molar_mass = ureg.Quantity(AS.molar_mass(), "kg/mol")
+    velocity = flow_rate/(rho_molar * A)
+    speed_of_sound = ureg.Quantity(AS.speed_sound(), "m/s")
+
+    print('\n')
+    print(f'Inputs: P = {P.to('psi')}, T = {T.to('degF')}')
+    print('\n')
+    print(f'Outputs: \n'
+        f'Molar mass of gas = {molar_mass.to("g/mol")}\n'
+        f'Mass Density = {rho_mass.to("lb/ft^3")}\n'
+        f'Molar density = {rho_molar.to("mol/ft^3")}\n'
+        f'Compressibility = {AS.compressibility_factor()}\n'
+        f'Flowing velocity = {velocity.to("ft/s")}\n'
+        f'Speed of sound = {speed_of_sound.to("ft/s")}\n'
+        f'Mach number = {(velocity/speed_of_sound).to("")}' #converts to dimensionless
+
+        )
+
+
 def amount_of_gas_static_line():
     """
     Calculates the amount of gas (molar/standard volume and mass) in a pipeline at a given pressure and temperature at static conditions. 
@@ -39,7 +79,7 @@ def amount_of_gas_static_line():
     Note that this calculation does not account for density changes due to elevation change or flowing pressure drop.
     """
 
-    P    = ureg.Quantity(1000, "psi")   
+    P    = ureg.Quantity(1000, "psi")    #Absoulute pressure, NOT GAUGE
     T    = ureg.Quantity(300, "K")   
     ID    = ureg.Quantity(8.125, "inch")
     A    = math.pi * ID**2 / 4.0
@@ -69,4 +109,5 @@ def amount_of_gas_static_line():
     
 
 if __name__ == "__main__":
-    amount_of_gas_static_line()
+    #amount_of_gas_static_line()
+    gas_properties()
