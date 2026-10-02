@@ -34,14 +34,14 @@ def phase_env():
 
 def gas_properties():
     """Calculates basic gas properties for gas at a given pressure, temperature, and composition. Optionally can also take a line ID and flow rate to calculate velocity and Mach number"""
-    P    = ureg.Quantity(10, "psi")   #Absoulute pressure, NOT GAUGE
+    P    = ureg.Quantity(3000, "psi")   #Absoulute pressure, NOT GAUGE
     T    = ureg.Quantity(300, "K")   
 
     AS = composition.define_composition(
-        y_Methane = 0.9,
-        y_Ethane = 0.05,
-        y_Propane=0.02,
-        y_n_Butane = 0.01,
+        y_Methane = 0.8,
+        y_Ethane = 0.11,
+        y_Propane=0.05,
+        y_n_Butane = 0.02,
         y_CarbonDioxide= 0.02,
         eos = "HEOS"
         )

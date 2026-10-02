@@ -1724,7 +1724,13 @@ def _test_inverse_relief_from_junction():
     main outlet (P-spec) and a relief vent (P-spec, lower).  Both
     outgoing edges are auto-detected as inverse-mode; the inlet edge
     stays forward.  Sanity: mass balance closes at the junction.
-    NOTE: This test seems to be broken and never converges. Need to troubleshoot.
+
+    Historically this never converged (LM stalled at residual ~0.69 after
+    20+ min).  Root cause was compressible_changing_area_K's Newton step
+    guard letting trial T fall to 0.3*T_in (~95 K), where CoolProp's
+    mixture stability search takes ~15 s per flash and derails the walk.
+    With the 0.7*T_in floor it converges in ~30 s (see improvements.md
+    "Self-test runtime").
     """
     from compressible_flow import Line_Segment, Valve
     import composition

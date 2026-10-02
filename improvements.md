@@ -840,6 +840,37 @@ conditional on demand.
     asymptotically, not linearly. Today the user must manually chunk and
     tune q per chunk. Feature gap for serious pipeline modeling.
 
+21. **[bug, step loss] ✅ DONE.** In-profile diameter steps were applied
+    as *isentropic* area changes (`compressible_changing_area_K(K=0)`),
+    while the incompressible `Line_Segment` applies the sharp
+    contraction/expansion K at the same boundary. At low Ma, the
+    compressible model under-predicted a 2"→4" step-expansion profile's dP
+    by ~36% relative to incompressible (missing Borda–Carnot loss). Now the boundary
+    uses `_sharp_area_change_K` (shared with `Contraction_Expansion.dP_dT`),
+    K=0 only for `noncircular` profiles, matching incompressible. Covered by
+    `test_line_segment_step_loss_vs_incompressible` in
+    [examples.py](examples.py) (agreement within 0.2%). Note: a taper as many
+    small steps now picks up a non-vanishing `contraction_sharp` loss per
+    step (both models) — another reason item 16 matters.
+
+22. **[note, isothermal]** In `isothermal=True` mode the diameter steps are
+    still adiabatic fittings, so T shifts slightly at each step and the
+    following slices hold the new T. Small at low Ma; documented in the
+    `isothermal` kwarg docstring rather than re-pinning T.
+
+23. **[bug, reverse flow] OPEN.** `network._reversed_component` rebuilds a
+    reversed profile by reversing the point list, but the slice convention
+    is "slice i uses the geometry of point i" (upstream end). Reversing the
+    list moves each diameter step by one slice. Example: forward
+    `[(0,2"),(5,4"),(10,4")]` reverses to `[(0,4"),(5,4"),(10,2")]`, i.e.
+    10 m of 4" then a step, instead of 5 m of 4" then 5 m of 2". Incompressible
+    dP for that case: shadow −1138 Pa vs physical reverse −3074 Pa. Affects both
+    network solvers. Fix: the reversed slice j should take the geometry of
+    original point n−2−j (the original slice's upstream end). A step at the
+    original outlet (point n−1 ≠ n−2) becomes a step at the reversed inlet.
+    Zero-length slices are rejected, so that step would need the entry
+    `_area_match` (compressible) or an equivalent (incompressible) instead.
+
 19. **[polish, UX]** Mach check happens per slice but `Line_Segment.dP_dT`
     does not summarize max Ma along the segment. The user must compute v/a
     over the returned profile_points themselves. Return a `max_Ma_along_segment`
@@ -871,9 +902,21 @@ conditional on demand.
 
     so a real `P2` requires `Σ f·dL/(D·A^2) < P1^2 · M / (mdot^2 RT)`.
 
-  Both branches integrate along the profile, so stepped/tapered
-  geometries are handled exactly under their respective ideal-gas
-  assumptions. Inlet `ρ`/`μ` and constant `mdot` keep the per-slice
+  **Correction (later review):** the claim originally here — that both
+  branches handle stepped/tapered geometries exactly — was wrong for the
+  Fanno branch: `fLmax/D` holds only for a constant-area duct, so summing
+  `f·L/D` across diameters against the inlet-Ma limit is meaningless. The
+  isothermal "no real P2" test was also looser than the true isothermal
+  choke (Ma_T = 1). Now: the diagnostic **skips multi-diameter profiles**
+  (the reactive Ma gate still catches them), and the isothermal branch uses
+  the ideal-gas isothermal choke length
+  `fLmax/D = (1 − kM²)/(kM²) + ln(kM²)` (Darcy f; de Nevers §8.4.2 —
+  equation number still to be confirmed against the book — with a short
+  derivation from the momentum balance in the
+  `_line_segment_choke_diagnostic` docstring). Cross-checked against the repo's own isothermal integrator (N₂, 2 bar,
+  300 K): the formula-predicted length to reach Ma_T = 0.7 from
+  Ma_T,in = 0.4 / 0.2 / 0.1 gives integrated Ma_T,out = 0.6997 / 0.6983 /
+  0.6927. The diagnostic compares it against the same `Σ f·dL/D`. Inlet `ρ`/`μ` and constant `mdot` keep the per-slice
   Reynolds computation to a single `4·mdot/(π·D·μ)` evaluation; one
   `fluids.friction.friction_factor` call per profile slice — orders of
   magnitude lighter than a single `compressible_pipe_segment`
@@ -953,6 +996,40 @@ conditional on demand.
   and never sees the pathological `A/A*`.
 
 ---
+
+## 4. Self-test runtime ✅ DONE
+
+`python compressible_network.py` took 10+ minutes (the junction test alone
+never finished in 20+ min). Per-test benchmark + cProfile showed the time
+was almost entirely CoolProp PT flashes at **unphysical trial states**,
+where the PR/HEOS mixture phase-stability search takes ~15–20 s before
+failing, plus repeated phase-envelope traces (~12 s each). Three fixes:
+
+1. **`_safe_update_PT` rejects P ≤ 0 or T ≤ 0 immediately**, raising the same
+   `RuntimeError` a failed flash does. `compressible_changing_area_K`'s
+   linearized K-loss initial guess overshoots to P ≈ −5.9 MPa when the
+   Valve inverse probes near-choke mdots, once per outer LM residual.
+   `_test_inverse_single_relief_valve`: 327 s → 14 s.
+2. **Newton T floor in `compressible_changing_area_K` raised from 0.3·T_in
+   to 0.7·T_in.** A subsonic adiabatic outlet cannot be colder than
+   T* = T0·2/(γ+1) ≥ 0.75·T_in (γ ≤ 5/3), so the floor clips no physical
+   root; the hybr fallback still covers any real-gas exception. The old
+   floor let Newton probe ~95 K states. This also **fixed the long-standing
+   `_test_inverse_relief_from_junction` failure**: it now converges
+   (residual 2e-10, mass balance 1e-16) in ~30 s.
+3. **`_build_phase_limits` is memoized** on (component names, mole
+   fractions). The envelope depends on nothing else. Also speeds up GUI
+   re-runs and repeated `solve()` calls on a fixed composition.
+
+Result: full `compressible_network.py` suite 80 s (all 11 tests pass);
+the compressible tests in examples.py run in ~9 s together. Remaining
+heaviest: `_test_mixing_junction` (~36 s, traces envelopes for multiple
+compositions) and `_test_inverse_relief_from_junction` (~29 s).
+
+Possible follow-up: the phase hint is unavailable below the
+cricondentherm, so any other solver path that probes cold states will hit
+the same ~15 s flashes. Storing the envelope's dew curve and hinting
+"gas" when P < P_dew(T) would close that gap generally.
 
 ## Cross-cutting themes
 

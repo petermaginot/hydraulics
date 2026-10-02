@@ -1,3 +1,7 @@
+Copyright (c) 2026 Peter Maginot
+MIT License
+This software is not validated for use for design work. No professional engineering services are provided by this software.
+
 # Hydraulics
 
 This software performs hydraulic analysis of piping systems for both incompressible and compressible fluids. The general workflow is:
@@ -124,7 +128,7 @@ bend.dP_dT(fs)                                       # mutates AS to outlet stat
 Convention: AS is always at the **static** state. `v` and stagnation properties are derived. Functions that change geometry (`compressible_changing_area_K`, `compressible_pipe_segment`) mutate `fs.A` and/or `fs.z` so the FlowState stays self-consistent with its current location.
 
 ### `Line_Segment` (inherits `Base_Line_Segment`)
-Adds **`dP_dT(fs, isothermal=False, q_wall=0.0, mu=None, energy_tol=10.0, dPdL_rel_tol=0.05, Ma_change_tol=0.1, correction_skip_rel_tol=1e-9, max_split_depth=8, verbose=False)`**. On entry it absorbs any inlet-area discontinuity with the upstream component via an isentropic area-change (`_area_match` → `compressible_changing_area_K(K=0)`), then walks consecutive profile slices via `compressible_pipe_segment()`, applying another isentropic area-change correction at every inter-slice boundary where the flow area changes.
+Adds **`dP_dT(fs, isothermal=False, q_wall=0.0, mu=None, energy_tol=10.0, dPdL_rel_tol=0.05, Ma_change_tol=0.1, correction_skip_rel_tol=1e-9, max_split_depth=8, verbose=False)`**. On entry it absorbs any inlet-area discontinuity with the upstream component via an isentropic area-change (`_area_match` → `compressible_changing_area_K(K=0)`), then walks consecutive profile slices via `compressible_pipe_segment()`. Every inter-slice boundary where the flow area changes is treated as an abrupt contraction/expansion: `compressible_changing_area_K` with the sharp-edge K from `_sharp_area_change_K` (the same `contraction_sharp` / `diffuser_sharp` K the incompressible `Line_Segment` applies, so both models agree at low Mach). Noncircular profiles have no K correlation and step isentropically. In `isothermal=True` mode these steps are still adiabatic, so T shifts slightly at each diameter change.
 
 Optional arguments:
 - `isothermal` — hold temperature constant per slice (solves a simpler one-equation form).

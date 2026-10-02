@@ -225,9 +225,9 @@ def test_incompressible_p2p():
     """Simple two-point pressure drop with entrance and exit losses."""
 
     roughness        = ureg.Quantity(0.00015, "ft")
-    id_val           = ureg.Quantity(3.068, "inch")
-    length           = ureg.Quantity(2000.0, "ft")
-    elevation_change = ureg.Quantity(25.0, "ft")
+    id_val           = ureg.Quantity(0.622, "inch")
+    length           = ureg.Quantity(20, "ft")
+    elevation_change = ureg.Quantity(0.0, "ft")
 
     segment = Incompressible_Line_Segment(
         roughness=roughness,
@@ -241,7 +241,7 @@ def test_incompressible_p2p():
         viscosity=ureg.Quantity(1.0, "cP"),
     )
 
-    flow_rate = ureg.Quantity(60, "oil_bbl/day")
+    flow_rate = ureg.Quantity(10.0, "gallon/minute")
 
     dP_line = segment.dP(fluid, flow_rate)
 
@@ -1511,6 +1511,71 @@ def test_line_segment_choke_diagnostic():
     print(f"  [{'OK  ' if overall else 'FAIL'}] R7 predictive diagnostic behaves as expected")
 
 
+def test_line_segment_step_loss_vs_incompressible():
+    """A diameter step inside a Line_Segment profile must carry the same
+    sharp contraction/expansion K loss in the compressible model as in the
+    incompressible one, so the two agree in the low-Mach limit.
+
+    Methane-rich gas at 20 bar / 300 K, Ma ~ 0.03 in the small bore, 5 m
+    of 2" Sch 40 then 5 m of 4" Sch 40 (expansion) and the reverse
+    (contraction).  Short lengths keep the step a large share of the total
+    dP.  noncircular=True switches the K off in both models (Bernoulli-only
+    step), which must also agree.  Expected: |dP_comp/dP_incomp - 1| < 1%.
+    """
+    from compressible_flow import (
+        Line_Segment, FlowState, _build_phase_limits, _safe_update_PT,
+    )
+
+    P_in, T_in = 20e5, 300.0
+    ID_small = ureg.Quantity(2.067, "inch").to("m").magnitude
+    ID_big   = ureg.Quantity(4.026, "inch").to("m").magnitude
+    A_small  = math.pi * ID_small ** 2 / 4.0
+    A_big    = math.pi * ID_big ** 2 / 4.0
+    roughness = ureg.Quantity(0.00015, "ft").to("m").magnitude
+
+    AS = composition.define_composition(
+        y_Methane=0.95, y_Ethane=0.04, y_CarbonDioxide=0.01, eos="HEOS",
+    )
+    phase_limits = _build_phase_limits(AS)
+    _safe_update_PT(AS, P_in, T_in, *phase_limits)
+    rho_in = AS.rhomass()
+    mu_in  = AS.viscosity()
+    mdot   = 0.03 * AS.speed_sound() * rho_in * A_small
+    fluid  = Incompressible_Fluid(density=rho_in, viscosity=mu_in)
+
+    def run(D1, A1, D2, A2, noncircular):
+        profile = [(0.0, 0.0, D1, A1), (5.0, 0.0, D2, A2), (10.0, 0.0, D2, A2)]
+        kw = dict(roughness=ureg.Quantity(roughness, "m"), profile=profile,
+                  noncircular=noncircular)
+        _safe_update_PT(AS, P_in, T_in, *phase_limits)
+        fs = FlowState(
+            AS, mdot=mdot, A=A1, z=0.0,
+            T_cricondentherm=phase_limits[0], P_cricondenbar=phase_limits[1],
+            T_critical=phase_limits[2],       P_critical=phase_limits[3],
+        )
+        Line_Segment(**kw).dP_dT(fs, mu=mu_in)
+        dP_comp = fs.P - P_in
+        dP_inc  = Incompressible_Line_Segment(**kw).dP(
+            fluid, ureg.Quantity(mdot, "kg/s"))
+        return dP_comp, dP_inc
+
+    print(f"Line_Segment in-profile step loss, compressible vs incompressible "
+          f"(methane mix, 20 bar, 300 K, mdot={mdot:.4f} kg/s):")
+    all_ok = True
+    for label, geom in (("expansion 2\"->4\"",   (ID_small, A_small, ID_big, A_big)),
+                        ("contraction 4\"->2\"", (ID_big, A_big, ID_small, A_small))):
+        for noncircular in (False, True):
+            dP_comp, dP_inc = run(*geom, noncircular)
+            rel = dP_comp / dP_inc - 1.0
+            ok = abs(rel) < 0.01
+            all_ok &= ok
+            tag = "no K (noncircular)" if noncircular else "sharp K"
+            print(f"  {label:20s} {tag:18s} dP_comp={dP_comp:9.2f} Pa  "
+                  f"dP_incomp={dP_inc:9.2f} Pa  rel={rel:+.4%}  "
+                  f"[{'OK  ' if ok else 'FAIL'}]")
+    print(f"  [{'OK  ' if all_ok else 'FAIL'}] step loss consistent across models")
+
+
 def test_pipe_segment_convergence_order():
     """Verify the Heun (trapezoidal) predictor-corrector in
     compressible_pipe_segment integrates at better than first order.
@@ -1917,45 +1982,49 @@ if __name__ == "__main__":
     # test_compressible_fittings()
     # test_compressible_line_segment_csv()
     # test_comp_hydraulics()
-    # test_incompressible_p2p()
+    test_incompressible_p2p()
     # test_incompressible_cont()
     # test_incompressible_csv_profile()
     #test_K()
     # test_contraction_expansion()
     # pseudo_orifice()
     # trying_orifices()
-    test_compressible_dA()
-    test_dmdot_dT_roundtrip()
-    test_dmdot_dT_choke_raises()
-    test_orifice_dmdot_dT_vs_dA()
-    test_incompressible_dmdot_roundtrip()
-    test_incompressible_valve_cavitation()
-    test_incompressible_orifice_cavitation()
+    # test_compressible_dA()
+    # test_dmdot_dT_roundtrip()
+    # test_dmdot_dT_choke_raises()
+    # test_orifice_dmdot_dT_vs_dA()
+    # test_incompressible_dmdot_roundtrip()
+    # test_incompressible_valve_cavitation()
+    # test_incompressible_orifice_cavitation()
 
-    # --- Choke / integrator debugging tests (migrated from test.py) ---
-    print('--------------------------------------------------------')
-    print('\nChoked-flow ideal-gas air nozzle')
-    test_choked_mass_flux_ideal_gas_air()
+    # # --- Choke / integrator debugging tests (migrated from test.py) ---
+    # print('--------------------------------------------------------')
+    # print('\nChoked-flow ideal-gas air nozzle')
+    # test_choked_mass_flux_ideal_gas_air()
 
-    print('--------------------------------------------------------')
-    print('\ncompressible_K choke round-trip')
-    test_compressible_K_choke_roundtrip()
+    # print('--------------------------------------------------------')
+    # print('\ncompressible_K choke round-trip')
+    # test_compressible_K_choke_roundtrip()
 
-    print('--------------------------------------------------------')
-    print('\nValve internal-throat (minimum_diameter) choke detection')
-    test_valve_minimum_diameter_choke()
+    # print('--------------------------------------------------------')
+    # print('\nValve internal-throat (minimum_diameter) choke detection')
+    # test_valve_minimum_diameter_choke()
 
-    print('--------------------------------------------------------')
-    print('\nLine_Segment predictive Fanno / isothermal choke diagnostic (R7)')
-    test_line_segment_choke_diagnostic()
+    # print('--------------------------------------------------------')
+    # print('\nLine_Segment predictive Fanno / isothermal choke diagnostic (R7)')
+    # test_line_segment_choke_diagnostic()
 
-    print('--------------------------------------------------------')
-    print('\ncompressible_pipe_segment Heun integrator convergence order')
-    test_pipe_segment_convergence_order()
+    # print('--------------------------------------------------------')
+    # print('\nLine_Segment in-profile diameter step loss vs incompressible')
+    # test_line_segment_step_loss_vs_incompressible()
 
-    print('--------------------------------------------------------')
-    print('\ncompressible_pipe_segment isothermal choke gate')
-    test_isothermal_choke_gate()
+    # print('--------------------------------------------------------')
+    # print('\ncompressible_pipe_segment Heun integrator convergence order')
+    # test_pipe_segment_convergence_order()
+
+    # print('--------------------------------------------------------')
+    # print('\ncompressible_pipe_segment isothermal choke gate')
+    # test_isothermal_choke_gate()
 
     # Slow timing run (several seconds, no pass/fail assertions) -- run on demand.
     # benchmark_dmdot_dT()

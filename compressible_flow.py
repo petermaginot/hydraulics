@@ -16,8 +16,9 @@ Classes
 -------
 Line_Segment  (inherits Base_Line_Segment)
     Adds dP_dT() for compressible flow.  Steps through consecutive profile
-    point pairs via compressible_pipe_segment(), applying isentropic
-    area-change corrections at inter-slice boundaries.  Updates the
+    point pairs via compressible_pipe_segment(), applying an abrupt
+    contraction/expansion (sharp-edge K loss) at inter-slice diameter
+    changes.  Updates the
     AbstractState in place and returns a list of (distance, pressure,
     temperature, velocity) tuples for profile plotting.
 
@@ -250,6 +251,27 @@ def _area_match(fs, A_target, tol=1e-6):
         compressible_changing_area_K(fs, A_target, K=0.0)
 
 
+def _sharp_area_change_K(A_in, A_out):
+    """Loss coefficient for an abrupt contraction or expansion, referenced to
+    the UPSTREAM velocity head (the convention compressible_changing_area_K
+    expects).  Circular cross-sections assumed: diameters are recovered from
+    the areas.
+
+    Contraction: fluids.fittings.contraction_sharp() returns K w.r.t. the
+    downstream velocity, so it is rescaled by (A_out/A_in)^2.
+    Expansion: fluids.fittings.diffuser_sharp() is already w.r.t. upstream.
+
+    Same K the incompressible Line_Segment applies at profile diameter steps
+    (incompressible.py), so the two models agree in the low-Mach limit.
+    """
+    Di_in  = math.sqrt(4.0 * A_in  / math.pi)
+    Di_out = math.sqrt(4.0 * A_out / math.pi)
+    if Di_in > Di_out:
+        K_ds = fluids.fittings.contraction_sharp(Di1=Di_in, Di2=Di_out)
+        return K_ds * (A_out / A_in) ** 2
+    return fluids.fittings.diffuser_sharp(Di1=Di_in, Di2=Di_out)
+
+
 def _line_segment_choke_diagnostic(fs, profile, roughness, isothermal, mu, name):
     """Cheap ideal-gas predictive choke check at the start of
     Line_Segment.dP_dT.  Emits a UserWarning if the segment is predicted
@@ -265,21 +287,45 @@ def _line_segment_choke_diagnostic(fs, profile, roughness, isothermal, mu, name)
     compared against the cumulative geometric integral
     Σ f_i * dL_i / D_h_i along the profile.
 
-    Isothermal branch: simplified long-pipeline form ("Fluid Mechanics
-    for Chemical Engineers, 2nd ed" by Noel de Nevers §8.4.2 eq. 8.33, kinetic-energy
-    term dropped per the textbook's "long pipeline" assumption).
-    Integrating P*dP at constant T and ideal-gas rho gives
+    Isothermal branch: ideal-gas isothermal choke length, which chokes at
+    the isothermal Mach number Ma_T = sqrt(k)*Ma = 1 (the same singularity
+    compressible_pipe_segment's isothermal gate tests).  See "Fluid
+    Mechanics for Chemical Engineers, 2nd ed" by Noel de Nevers §8.4.2
+    (isothermal flow; TODO: confirm equation number against the book):
 
-        P1^2 - P2^2 = mdot^2 * (R_univ T / M_molar)
-                      * Σ f_i * dL_i / (D_h_i * A_i^2)
+        fLmax/D = (1 - k*M^2)/(k*M^2) + ln(k*M^2)      [Darcy f]
 
-    so a real P2 requires cum_fL_over_DA2 < P1^2 * M_molar /
-    (mdot^2 * R_univ * T).
+    Derivation (ideal gas, constant T and area, horizontal), starting from
+    the same momentum balance compressible_pipe_segment's isothermal branch
+    uses:  dP + rho*v*dv + rho*f*v^2/(2*D)*dx = 0.
+      - Isothermal ideal gas: P = rho*a_T^2 with a_T^2 = RT/M constant;
+        continuity rho*v = const, so dP/P = drho/rho = -dv/v.
+      - Divide by P and let m = v^2/a_T^2 = k*M^2 = Ma_T^2 (dm/m = 2 dv/v):
+            -dv/v + m*dv/v + m*f*dx/(2D) = 0
+            =>  f*dx/D = (1 - m)/m^2 * dm
+      - Integrate from the inlet m to the choke m = 1:
+            f*Lmax/D = (1 - m)/m + ln(m)
+    Cross-checked numerically against compressible_pipe_segment (N2,
+    2 bar, 300 K): the length this predicts to reach Ma_T = 0.7 from
+    Ma_T = 0.4 / 0.2 / 0.1 integrates to Ma_T = 0.6997 / 0.6983 / 0.6927.
+
+    compared against the same Σ f_i * dL_i / D_h_i.
+
+    Both closed forms hold only for a CONSTANT-AREA duct: Ma evolves
+    differently in each diameter section, so summing f*L/D across a
+    diameter change and comparing to the inlet-Ma limit is meaningless.
+    Stepped profiles are therefore skipped (no warning); the reactive
+    Ma gate in compressible_pipe_segment still catches their chokes.
 
     Best-effort: any internal failure is swallowed (the diagnostic must
     never block a real evaluation).
     """
     try:
+        # Constant-area profiles only -- see docstring.
+        areas = [p[3] for p in profile]
+        if (max(areas) - min(areas)) / max(areas) > 1e-6:
+            return
+
         Ma_in = fs.Ma
         # Skip stagnant or already-choked: the existing reactive gate
         # in compressible_pipe_segment handles Ma >= 0.98 with a clear
@@ -288,7 +334,6 @@ def _line_segment_choke_diagnostic(fs, profile, roughness, isothermal, mu, name)
             return
 
         AS    = fs.AS
-        P_in  = AS.p()
         T_in  = AS.T()
         rho_in = AS.rhomass()
         mdot  = fs.mdot
@@ -307,11 +352,10 @@ def _line_segment_choke_diagnostic(fs, profile, roughness, isothermal, mu, name)
         # compressible_pipe_segment's contract), else CoolProp/LGE.
         mu_in = mu if mu is not None else _viscosity_or_LGE(AS, T_in, rho_in)
 
-        # Cumulative geometric integrals along the profile.  Inlet
-        # rho/mu held constant for the Re computation -- Re_i depends
-        # only on D_h_i since mdot is constant.
-        cum_fL_over_D    = 0.0
-        cum_fL_over_DA2  = 0.0
+        # Cumulative f*L/D along the profile.  Inlet rho/mu held constant
+        # for the Re computation -- Re_i depends only on D_h_i since mdot
+        # is constant.
+        cum_fL_over_D = 0.0
         for i in range(len(profile) - 1):
             dist_in,  _e_in,  D_h_in,  area_in  = profile[i]
             dist_out, _e_out, _D_h_out, _a_out  = profile[i + 1]
@@ -321,21 +365,22 @@ def _line_segment_choke_diagnostic(fs, profile, roughness, isothermal, mu, name)
             v_i  = mdot / (rho_in * area_in)
             Re_i = fluids_Reynolds(V=v_i, D=D_h_in, rho=rho_in, mu=mu_in)
             f_i  = fluids_friction_factor(Re=Re_i, eD=roughness / D_h_in)
-            cum_fL_over_D   += f_i * dL_i / D_h_in
-            cum_fL_over_DA2 += f_i * dL_i / (D_h_in * area_in * area_in)
+            cum_fL_over_D += f_i * dL_i / D_h_in
 
         if isothermal:
-            threshold = (P_in * P_in * M_molar
-                         / (mdot * mdot * R_univ * T_in))   # [m^-5]
-            if cum_fL_over_DA2 >= threshold:
+            kM2 = k * Ma_in * Ma_in   # = Ma_T^2
+            if kM2 >= 1.0:
+                return   # already past the isothermal choke; reactive gate fires
+            fLmax_over_D = (1.0 - kM2) / kM2 + math.log(kM2)
+            if cum_fL_over_D >= fLmax_over_D:
                 warnings.warn(
-                    f"Line_Segment {name!r}: simplified isothermal "
-                    f"pipeline equation predicts no real outlet pressure "
-                    f"(cumulative f*dL/(D*A^2) = {cum_fL_over_DA2:.4g} m^-5 "
-                    f">= inlet-conditions limit {threshold:.4g} m^-5 at "
-                    f"P_in={P_in:.4g} Pa, T={T_in:.4g} K, mdot={mdot:.4g} "
-                    f"kg/s).  Real-gas behavior may differ; if integration "
-                    f"fails, isothermal-flow choking is the likely cause.",
+                    f"Line_Segment {name!r}: ideal-gas isothermal flow "
+                    f"predicts choke (Ma_T = 1) before segment end "
+                    f"(cumulative f*dL/D = {cum_fL_over_D:.4g} >= "
+                    f"inlet-Mach limit {fLmax_over_D:.4g} at "
+                    f"Ma_in={Ma_in:.4f}, gamma={k:.4f}).  Real-gas "
+                    f"behavior may differ; if integration fails, "
+                    f"isothermal-flow choking is the likely cause.",
                     UserWarning, stacklevel=3,
                 )
         else:
@@ -366,8 +411,12 @@ class Line_Segment(Base_Line_Segment):
 
     Inherits geometry storage, CSV loading, and convenience properties from
     Base_Line_Segment.  Adds dP_dT() for compressible flow, stepping through
-    consecutive profile slices via compressible_pipe_segment() and applying
-    isentropic area-change corrections at inter-slice boundaries.
+    consecutive profile slices via compressible_pipe_segment() and treating
+    each inter-slice diameter change as an abrupt contraction/expansion with
+    its sharp-edge K loss (same K as the incompressible Line_Segment;
+    isentropic for noncircular profiles, which have no K correlation).
+    A taper represented as many small steps therefore accumulates a small
+    contraction loss per step -- see improvements.md item 16.
 
     Constructor arguments and behavior are identical to Base_Line_Segment.
     See Base_Line_Segment for full argument documentation.
@@ -390,8 +439,10 @@ class Line_Segment(Base_Line_Segment):
         through the segment.
 
         Steps through consecutive profile point pairs, calling
-        compressible_pipe_segment() for each slice and applying isentropic
-        area-change corrections at boundaries where the flow area changes.
+        compressible_pipe_segment() for each slice and applying an abrupt
+        contraction/expansion (compressible_changing_area_K with the
+        sharp-edge K from _sharp_area_change_K) at boundaries where the
+        flow area changes.
 
         Heat input q_wall is distributed uniformly per unit pipe length across
         all slices.
@@ -406,7 +457,11 @@ class Line_Segment(Base_Line_Segment):
             fs              : FlowState.  fs.AS must be at the segment
                               inlet (P, T) when called; mutated in place.
             isothermal      : bool, if True temperature is held constant
-                              through each slice.  Default False.
+                              through each slice.  Diameter steps between
+                              slices are still adiabatic fittings, so T
+                              shifts slightly at each step (small at low
+                              Ma) and later slices hold the new T.
+                              Default False.
             q_wall          : float, total heat input to the fluid over the
                               entire segment [W].  Distributed uniformly per
                               unit length.  Ignored when isothermal=True.
@@ -500,10 +555,15 @@ class Line_Segment(Base_Line_Segment):
                 _max_split_depth=max_split_depth,
             )
 
-            # Area-change correction at the boundary to the next slice.
+            # Area-change correction at the boundary to the next slice: an
+            # abrupt contraction/expansion with its sharp-edge K loss, matching
+            # the incompressible Line_Segment.  Non-circular profiles have no
+            # K correlation, so their steps stay isentropic (as incompressible).
             area_ratio = abs(area_out - area_in) / max(area_in, area_out)
             if area_ratio > _AREA_TOL:
-                compressible_changing_area_K(fs, area_out, K=0.0)
+                K_step = (0.0 if self.noncircular
+                          else _sharp_area_change_K(area_in, area_out))
+                compressible_changing_area_K(fs, area_out, K=K_step)
 
             # Record conditions at this profile point after all corrections.
             P_cur   = fs.AS.p()
@@ -1079,14 +1139,7 @@ class Contraction_Expansion(Base_Contraction_Expansion):
 
         _area_match(fs, A_US)
 
-        if Di_US > Di_DS:
-            # Contraction: fluids returns K w.r.t. downstream; convert to upstream.
-            K_ds = fluids.fittings.contraction_sharp(Di1=Di_US, Di2=Di_DS)
-            K    = K_ds * (A_DS / A_US) ** 2
-        else:
-            # Expansion: fluids returns K w.r.t. upstream velocity directly.
-            K = fluids.fittings.diffuser_sharp(Di1=Di_US, Di2=Di_DS)
-
+        K = _sharp_area_change_K(A_US, A_DS)
         compressible_changing_area_K(fs, A_DS, K)
 
     def dmdot_dT(self, fs, P2):
@@ -1506,7 +1559,18 @@ def _build_phase_limits(AS, verbose=False):
     point as a coarser phase hint via _safe_update_PT.
 
     Returns (None, None, None, None) only when both queries fail.
+
+    Results are memoized on (component names, mole fractions): the envelope
+    depends on nothing else (it is always traced on a scratch HEOS state,
+    whatever AS's backend), and a trace costs ~10+ s for a typical
+    multicomponent gas.  Without the cache every Network.solve(), GUI
+    re-run, and self-test rebuilt the same envelope from scratch.
     """
+    key = (tuple(AS.fluid_names()),
+           tuple(round(x, 12) for x in AS.get_mole_fractions()))
+    if key in _PHASE_LIMITS_CACHE:
+        return _PHASE_LIMITS_CACHE[key]
+
     AS_tmp = AbstractState("HEOS", "&".join(AS.fluid_names()))
     AS_tmp.set_mole_fractions(list(AS.get_mole_fractions()))
     if verbose:
@@ -1529,7 +1593,12 @@ def _build_phase_limits(AS, verbose=False):
     if verbose:
         print(f" "*len(msg), end="\r")
 
+    _PHASE_LIMITS_CACHE[key] = (T_cric, P_bar, T_c, P_c)
     return T_cric, P_bar, T_c, P_c
+
+
+# Memo for _build_phase_limits, keyed on (component names, mole fractions).
+_PHASE_LIMITS_CACHE = {}
 
 
 def _safe_update_PT(AS, P, T, T_cricondentherm=None, P_cricondenbar=None,
@@ -1558,7 +1627,19 @@ def _safe_update_PT(AS, P, T, T_cricondentherm=None, P_cricondenbar=None,
     but below T_cricondentherm where a multicomponent mixture can still be
     two-phase -- so callers near the envelope should still prefer the full
     cricondentherm/cricondenbar limits when available.
+
+    Non-positive P or T is rejected up front with the same RuntimeError the
+    failed-flash path raises.  CoolProp does eventually reject such a state,
+    but for mixtures its unhinted phase-stability search can take ~15-20 s
+    per call first.  Solver trial states (e.g. the linearized K-loss guess in
+    compressible_changing_area_K near choke) do land there, so without this
+    guard one self-test spent ~270 s of ~300 s inside these doomed flashes.
     """
+    if not (P > 0.0 and T > 0.0):   # also catches NaN
+        raise RuntimeError(
+            f"CoolProp PT update refused at unphysical state "
+            f"P={P:.4g} Pa, T={T:.4g} K"
+        )
     phase = None
     if T_cricondentherm is not None and T > T_cricondentherm:
         if P_critical is not None and P > P_critical:
@@ -2458,7 +2539,14 @@ def compressible_changing_area_K(fs, A_out, K=0.0, e_loss=None,
     NEWTON_RES_TOL  = 1e-9
     NEWTON_STEP_TOL = 1e-9
     NEWTON_MAX_ITER = 10
-    T_floor = 0.3 * T_in   # step guard only, not a physical bound
+    # Step guard only.  A subsonic adiabatic outlet cannot be colder than
+    # the sonic state, T* = T0*2/(gamma+1) >= 0.75*T_in for gamma <= 5/3
+    # (ideal gas), so 0.7*T_in never clips a physical root.  The old 0.3*T_in
+    # let Newton probe cryogenic states (~95 K for a 317 K gas) where
+    # CoolProp's mixture stability search takes ~15 s per flash.  If a
+    # real-gas root ever did sit below the floor, Newton would just fail to
+    # converge and the unbounded hybr fallback below takes over.
+    T_floor = 0.7 * T_in
 
     x_P, x_T = P0, T0
     converged = False
@@ -2773,7 +2861,7 @@ def compressible_pipe_segment(
     Returns:
         None.  fs is mutated in place.
     """
-    grav_constant    = 9.8066
+    grav_constant    = _GRAVITY_MS2
     choke_mach_limit = 0.98
 
     AS        = fs.AS
